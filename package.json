@@ -67,6 +67,7 @@
     "audit": "node scripts/audit-inventory.mjs",
     "check:coherence": "node scripts/check-coherence.mjs",
     "check:secrets": "node scripts/check-secrets.mjs",
+    "check:secrets:history": "node scripts/check-secrets.mjs --history",
     "check:audit": "node scripts/check-npm-audit.mjs",
     "check:hooks": "node scripts/check-hook-gate.mjs",
     "check:compose": "node scripts/check-compose-exposure.mjs",
