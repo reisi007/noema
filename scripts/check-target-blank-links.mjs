@@ -43,6 +43,11 @@
  *     `noreferrer`. The order of the tokens does not matter (`rel` is a set),
  *     and a third token (`nofollow`) is allowed.
  *
+ * The second channel of the same convention is the `window.open` call: it
+ * opens a new tab without a `rel` attribute, so the tokens have to travel in
+ * the feature string (`"noopener,noreferrer"`). The gate reads those calls as
+ * well — a channel that the gate does not read is a channel that can drift.
+ *
  * What the gate does **not** see — it is a text scan, not a parser:
  *
  *   - a `rel` written through a name (`rel={REL}`) has no literal to read;
@@ -51,7 +56,9 @@
  *   - an expression that picks a weaker `rel` in one of its branches
  *     (`rel={cond ? "noreferrer noopener" : "noreferrer"}`) is read as the
  *     union of the literals it can see;
- *   - a link built at runtime (`document.createElement("a")`) is invisible.
+ *   - a link built at runtime (`document.createElement("a")`) is invisible;
+ *   - a feature string that is not a literal (the features are held in a
+ *     constant) has no literal to read either — the gate fails it closed.
  */
 import { readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
@@ -120,10 +127,7 @@ function matchBrace(text, start) {
  */
 function scanTags(source) {
   const tags = [];
-  const lineStarts = [0];
-  for (let i = 0; i < source.length; i += 1) {
-    if (source[i] === "\n") lineStarts.push(i + 1);
-  }
+  const lineStarts = lineStartsOf(source);
   let i = 0;
   while (i < source.length) {
     const lt = source.indexOf("<", i);
@@ -240,6 +244,15 @@ function relTokens(rel) {
   return tokens;
 }
 
+/** The offsets every line of the source starts at. */
+function lineStartsOf(source) {
+  const lineStarts = [0];
+  for (let i = 0; i < source.length; i += 1) {
+    if (source[i] === "\n") lineStarts.push(i + 1);
+  }
+  return lineStarts;
+}
+
 /** The line an offset of the source is on. */
 function lineAt(lineStarts, offset) {
   let line = 0;
@@ -252,102 +265,107 @@ function matchParen(text, start) {
   let depth = 0;
   let quote = null;
   for (let i = start; i < text.length; i += 1) {
-    const char = text[i];
-    if (quote) {
-      if (char === "\\") i += 1;
-      else if (char === quote) quote = null;
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = null;
       continue;
     }
-    if (char === '"' || char === "'" || char === "`") {
-      quote = char;
-    } else if (char === "(") {
-      depth += 1;
-    } else if (char === ")") {
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
       depth -= 1;
-      if (depth === 0) return i;
+      if (depth === 0) return i + 1;
     }
   }
-  return -1;
+  return text.length;
 }
 
-/** Split a call's argument list on top-level commas. */
+/** The arguments of a call: the text between the parentheses, split at the commas. */
 function splitArguments(text) {
   const args = [];
-  let start = 0;
   let depth = 0;
   let quote = null;
+  let start = 0;
   for (let i = 0; i < text.length; i += 1) {
-    const char = text[i];
-    if (quote) {
-      if (char === "\\") i += 1;
-      else if (char === quote) quote = null;
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = null;
       continue;
     }
-    if (char === '"' || char === "'" || char === "`") quote = char;
-    else if (char === "(" || char === "{" || char === "[") depth += 1;
-    else if (char === ")" || char === "}" || char === "]") depth -= 1;
-    else if (char === "," && depth === 0) {
-      args.push(text.slice(start, i).trim());
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+    else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+    else if (ch === "," && depth === 0) {
+      args.push(text.slice(start, i));
       start = i + 1;
     }
   }
-  args.push(text.slice(start).trim());
-  return args;
+  args.push(text.slice(start));
+  return args.map((argument) => argument.trim());
+}
+
+/** The literal a quoted argument holds — `null` when the argument is an expression. */
+function literalOf(argument) {
+  const match = /^([\"'`])([\s\S]*)\1$/.exec(argument ?? "");
+  return match ? match[2] : null;
 }
 
 /**
- * `window.open` calls that open a new tab. The feature string is the third
- * argument; the second argument names `_blank`. The gate reads the same two
- * tokens as a `rel`, because `window.open` is the one new-tab path a JSX tag
- * scanner cannot see.
+ * The `window.open` calls of a source: the arguments of the call and the text
+ * of the call itself. The scan reads the literal text, so the call it finds
+ * is the call the browser would run.
  */
-function scanWindowOpen(source, lineStarts) {
+function scanOpenCalls(source) {
   const calls = [];
-  const needle = "window.open(";
-  let index = 0;
-  while ((index = source.indexOf(needle, index)) !== -1) {
-    const start = index + needle.length;
-    const end = matchParen(source, start - 1);
-    if (end === -1) break;
-    const args = splitArguments(source.slice(start, end));
-    const target = args[1] ?? "";
-    if (!/["'`]_blank["'`]/.test(target)) {
-      index = end + 1;
-      continue;
-    }
-    const features = args[2] ?? "";
-    const tokens = new Set((features.match(/[A-Za-z]+/g) ?? []).map((token) => token.toLowerCase()));
+  const pattern = /window\s*\.\s*open\s*\(/g;
+  let match;
+  while ((match = pattern.exec(source)) !== null) {
+    const start = match.index;
+    const end = matchParen(source, start + match[0].length - 1);
     calls.push({
-      line: lineAt(lineStarts, index),
-      missing: REQUIRED.filter((token) => !tokens.has(token)),
-      features,
+      args: splitArguments(source.slice(start + match[0].length, end - 1)),
+      text: source.slice(start, end).replace(/\s+/g, " "),
+      start,
     });
-    index = end + 1;
+    pattern.lastIndex = end;
   }
   return calls;
+}
+
+/** Does the target of the call open a new browsing context? */
+function opensBlankTarget(target) {
+  if (!target) return false;
+  const literal = literalOf(target);
+  if (literal !== null) return literal.trim() === "_blank";
+  return /["']_blank["']/.test(target);
+}
+
+/** The tokens of the feature string — the literal, split at the commas. */
+function featureTokens(features) {
+  const tokens = new Set();
+  const literal = literalOf(features);
+  if (literal === null) return tokens;
+  for (const token of literal.split(/[,\s]+/)) {
+    if (token) tokens.add(token.toLowerCase());
+  }
+  return tokens;
 }
 
 const files = collectFiles(ROOT);
 const violations = [];
 let links = 0;
-let windowOpenCalls = 0;
+let opens = 0;
 
 for (const file of files) {
   const source = readFileSync(file, "utf8");
-  const lineStarts = [0];
-  for (let i = 0; i < source.length; i += 1) if (source[i] === "\n") lineStarts.push(i + 1);
-  for (const call of scanWindowOpen(source, lineStarts)) {
-    windowOpenCalls += 1;
-    if (call.missing.length === 0) continue;
-    violations.push({
-      file: relative(ROOT, file).replace(/\\/g, "/"),
-      line: call.line,
-      missing: call.missing,
-      rel: null,
-      kind: "window.open",
-      features: call.features,
-    });
-  }
   for (const tag of scanTags(source)) {
     const attributes = parseAttributes(tag.blob);
     const target = attributes.find((attribute) => attribute.name === "target");
@@ -367,12 +385,26 @@ for (const file of files) {
       rel,
     });
   }
+  // The second channel of the convention: a `window.open` call opens a new tab
+  // without a `rel`, so the tokens have to travel in the feature string.
+  const lineStarts = lineStartsOf(source);
+  for (const call of scanOpenCalls(source)) {
+    if (!opensBlankTarget(call.args[1])) continue;
+    opens += 1;
+    const tokens = featureTokens(call.args[2]);
+    const missing = REQUIRED.filter((token) => !tokens.has(token));
+    if (missing.length === 0) continue;
+    violations.push({
+      file: relative(ROOT, file).replace(/\\/g, "/"),
+      line: lineAt(lineStarts, call.start),
+      missing,
+      call: call.text,
+    });
+  }
 }
 
 const relText = (violation) => {
-  if (violation.kind === "window.open") {
-    return `window.open(..., ${violation.features || "no features"}) is missing ${violation.missing.join(" and ")}`;
-  }
+  if (violation.call) return `${violation.call} is missing ${violation.missing.join(" and ")}`;
   const rel = violation.rel;
   if (!rel) return "no rel attribute";
   const value = rel.expression ? `{${rel.value}}` : `"${rel.value}"`;
@@ -381,7 +413,7 @@ const relText = (violation) => {
 
 if (violations.length > 0) {
   console.error(
-    `FAIL  every link that opens a new tab must carry rel="noreferrer noopener" (${violations.length} violation(s))`,
+    `FAIL  every link that opens a new tab must carry rel="noreferrer noopener" and every window.open must carry the features "noopener,noreferrer" (${violations.length} violation(s))`,
   );
   for (const violation of violations) {
     console.error(`      ${violation.file}:${violation.line}  ${relText(violation)}`);
@@ -390,11 +422,11 @@ if (violations.length > 0) {
   console.error("A link without `noopener` hands the opened document a `window.opener`,");
   console.error("and the opened document can navigate the tab that opened it.");
   console.error("");
-  console.error('Fix: write rel="noreferrer noopener" on the link.');
+  console.error('Fix: write rel="noreferrer noopener" on the link, and pass');
+  console.error('"noopener,noreferrer" as the feature string of a window.open call.');
   process.exit(1);
 }
 
 console.log(
-  `PASS  ${links} link(s) open a new tab and every one of them carries noreferrer noopener, ` +
-    `${windowOpenCalls} window.open call(s) carry noopener,noreferrer (${files.length} file(s) scanned)`,
+  `PASS  ${links} link(s) open a new tab and every one of them carries noreferrer noopener, ${opens} window.open call(s) carry noopener,noreferrer (${files.length} file(s) scanned)`,
 );

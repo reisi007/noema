@@ -84,18 +84,6 @@ authenticated users* with a live budget in the same window — a real
 installation, not a flood. Because the stores are separate, a flood of forged
 client addresses can never reset an exhausted per-user budget.
 
-**Deployment topology (important):** the limiter is **per process**. It is not
-a shared store, so a deployment with more than one app instance gives each
-instance its own 120/min budget — an attacker who reaches a load balancer can
-multiply the allowance by the number of instances. The shipped
-`docker-compose` setup runs **one** app instance and is the supported topology.
-If you scale the app horizontally, put a shared limiter (Redis or an equivalent
-atomic store) in front of these calls **before** adding the second instance;
-until then, keep the replica count at one. The same restriction applies to the
-JSON session registry (`SESSION_STORE_PATH`): its on-disk lock serializes
-writers on one host, but it is not a multi-host database. For a multi-host
-deployment, move both the limiter and the session registry to shared storage.
-
 > **Edge runtime:** `src/middleware.ts` runs in the Edge runtime, where
 > `process.env` is frozen at **build** time. `TRUSTED_PROXY_HOPS` therefore
 > has to be set for the **build** (`npm run build` / `docker compose build`),
@@ -728,7 +716,7 @@ write is released all the same. The holes that are known
 | Invites never arrive | settings “Email & invitations” → status shows `environment SMTP` / `not configured`; run `npm run check:mail`; delivery log error text (10 s connect / 20 s socket timeouts) |
 | Collaborative editing refuses everything (4401) | `AUTH_SECRET` missing/short in the relay’s env; wrong `NEXT_PUBLIC_COLLAB_URL`; 4403 = page scope/permission, not a secret problem |
 | Backup exits 1 | the script says why: no `BACKUP_ENCRYPTION_KEY` (then **nothing** is written), no `pg_dump`, dump < 1 KiB, or missing core tables — a dump that fails the checks is never kept. `npm run backup -- --dry-run` shows what a run would do |
-| Collaborative socket closed 4400 | the client’s `Origin` is not accepted (checked pre-auth): with `APP_ORIGINS` set it must be on the list (— add the origin), without it only the loopback origin is accepted (— see §5.4) |
+| Collaborative socket closed 4400 | `APP_ORIGINS` is set and the client’s `Origin` isn’t on the list (checked pre-auth) — add the origin or unset `APP_ORIGINS` |
 | Collaborative socket closed 4429 | per-user connection cap (5) or message rate (30 / 10 s) exceeded |
 | `EADDRINUSE` / weird build output | dev and prod share `.next` and the ports — exactly one writer at a time |
 
@@ -747,10 +735,9 @@ nothing was executed against live servers):
 | 4.1 | SMTP env names/defaults, precedence, fail-soft, `EmailDelivery`, TLS self-signed switch | `src/lib/mailer.ts` · `src/server/actions/email.ts` · `.env.example:35-44` |
 | 4.2 | “Email & invitations” / “Verify & send test” labels, `testEmailAction` → `verifyMail` | `src/components/email-settings.tsx` · `src/lib/i18n.ts` (`emailHeading`, `verifySendTest`, `smtpVerified`, `recentEmail`) |
 | 4.3 | `npm run check:mail`, mock on 2525, `MOCK_SMTP_PORT`, assertions, cleanup | `package.json` · `scripts/check-mail.mjs` |
-| 5.1 | `npm run collab`, `PORT`/`HOST` (default `127.0.0.1`), `loadEnvFile`, `AUTH_SECRET` warn, `DATABASE_URL`, `NEXT_PUBLIC_COLLAB_URL` | `package.json` · `scripts/collab-server.mjs` (PORT/HOST, `resolveHost`, `ensureEnv`, `start()`) · `.env.example:11-12` |
-| 5.2 | 4401/4403 table, read-only drop, no oracle; B75: 4400 Origin (`APP_ORIGINS`), 4429 rate limits (5 conns / 30 msg per 10 s), presence identity binding, current known-gaps list; B64: fail-closed origin rule (loopback only without `APP_ORIGINS`), 4 MiB message cap (1009) | `scripts/collab-server.mjs` header contract (B53/B64) |
-| 5.3 | collab test count (53 `it()` lines), `check-collab.mjs` → 4401 not a gate | `scripts/collab-server.test.mjs` |
-| 5.4 | default bind `127.0.0.1` (`resolveHost`, empty/blank `HOST` included), `HOST=0.0.0.0` as the explicit opt-in, `APP_ORIGINS` as the operating rule for a networked deployment, 4 MiB `maxPayload` (1009) | `scripts/collab-server.mjs` (`resolveHost`, `DEFAULT_HOST`, `MAX_PAYLOAD_BYTES`, `isOriginAllowed`) · `scripts/collab-server.test.mjs` |
+| 5.1 | `npm run collab`, `PORT`/`HOST`, `loadEnvFile`, `AUTH_SECRET` warn, `DATABASE_URL`, `NEXT_PUBLIC_COLLAB_URL` | `package.json` · `scripts/collab-server.mjs` (PORT/HOST, `ensureEnv`, `start()`) · `.env.example:11-12` |
+| 5.2 | 4401/4403 table, read-only drop, no oracle; B75: 4400 Origin (`APP_ORIGINS`), 4429 rate limits (5 conns / 30 msg per 10 s), presence identity binding, current known-gaps list | `scripts/collab-server.mjs` header contract (B53) |
+| 5.3 | collab test count (38 `it()` lines), `check-collab.mjs` → 4401 not a gate | `scripts/collab-server.test.mjs` |
 | 6 | `--profile app`, service names/ports/env/healthchecks, volume behaviour | `docker-compose.yml` |
 | 7 | `/api/health` 200/503 shapes, 2 s ping, `no-store`, no auth/disclosure, compose healthcheck | `src/app/api/health/route.ts` · `docker-compose.yml` |
 | 8 | `db:push` / `db:migrate` / `db:seed`, `migrate deploy/status/diff` + `db push --accept-data-loss/--force-reset` | `package.json` · `npx prisma migrate --help` · `npx prisma db push --help` (both executed) |
@@ -1138,7 +1125,7 @@ migrations the database never saw — §8.4 has the commands).
 | Two-factor codes are rejected after the upgrade | the seed is stored sealed (B05): a `v1:` envelope that does not open means a **different `AUTH_SECRET`** than the one the seed was sealed with, or a tampered row. `npm run backfill:2fa` lists those rows as `UNREADABLE`; the account owner re-enrols, or the operator restores the matching `AUTH_SECRET` |
 | A two-factor code that was already used is refused | a code may be used **once** (B25): the sign-in spends the time step it accepted (`User.twoFactorCounter`), so a second use of the same code — also inside the ±1 step window — opens no second session. The next code of the authenticator app (the next 30 s) works again |
 | A user lost their authenticator and cannot sign in | there are **no recovery codes** — the sign-in checks a six- to eight-digit TOTP code and nothing else, so a lost device locks the account until someone resets it. Reset it deliberately, after a database backup: `UPDATE "User" SET "twoFactorEnabled" = false, "twoFactorSecret" = NULL WHERE email = '…'` — the user then re-enrols under **Settings → Two-factor authentication** |
-| Collaborative socket closed 4400 | the client’s `Origin` is not accepted (checked pre-auth): with `APP_ORIGINS` set it must be on the list (— add the origin), without it only the loopback origin is accepted (— see §5.4) |
+| Collaborative socket closed 4400 | `APP_ORIGINS` is set and the client’s `Origin` isn’t on the list (checked pre-auth) — add the origin or unset `APP_ORIGINS` |
 | Collaborative socket closed 4429 | per-user connection cap (5) or message rate (30 / 10 s) exceeded |
 | Sign-in answers "Too many attempts" / "This account is temporarily locked" | a budget is spent (30/min per client address, 10/min per account, 5 2FA guesses / 15 min) or the account is locked (5 consecutive failures); wait for the quoted time — an operator can release the lock with `UPDATE "User" SET "failedLoginCount" = 0, "lockedUntil" = NULL WHERE email = '…'` |
 | Everyone hits the rate limit at once (429) | no `TRUSTED_PROXY_HOPS` → all clients of a scope share the `scope:local` budget; declare the proxy hops (see §1.1) |
@@ -1155,19 +1142,20 @@ nothing was executed against live servers):
 | Section | Command / fact | Source of truth |
 | --- | --- | --- |
 | 1.1 | `TRUSTED_PROXY_HOPS`, the hop arithmetic (last / Nth-from-last), the `X-Real-IP` fallback for a chain shorter than N and the `scope:local` fallback, the rejected hop counts above 16, the `ADMIN_IP_ALLOWLIST` fail-closed gate, the Edge-runtime build-time freeze | `src/lib/tenant-guard.ts` (`parseTrustedProxyHops`, `resolveClientIp`) · `src/lib/rate-limit.ts` (`clientKey`, `userKey`) · `src/lib/api-guard.ts` (`rateLimit`) · `src/middleware.ts` (`ipGate`) · `.env.example` |
-| 1.2 | `HSTS_MAX_AGE` / `HSTS_INCLUDE_SUBDOMAINS`, the default (one year), the way out (`0`), the refused values, the build-time freeze of the header list | `src/lib/security-headers.ts` (`parseHstsMaxAge`, `hstsHeader`) · `next.config.ts` (`headers()`) · `scripts/check-hsts.mjs` · `.env.example` |
 | 2.1 | `npm run backup`, `--keep N` (default 5), `--dry-run`, manifest, retention “never the newest”, verification rules, `pg_dump` docker/path choice, “local DATABASE_URL”, the seal (AES-256-GCM, `BACKUP_ENCRYPTION_KEY`, fail closed) and the 0600/0700 modes | `package.json` scripts · `scripts/backup.mjs` · `scripts/backup-lib.mjs` (+ `backup-lib.test.mjs`, 37 tests · `backup.test.mjs`, 8 tests) |
 | 2.2 | `npm run backup:restore -- backups/<file>.sql.enc \| psql "$DATABASE_URL"` + `createdb noema-restore-check` row-count verification hook | printed by `scripts/backup.mjs` (header + exit output) · `scripts/backup-restore.mjs` |
+| 1.2 | `HSTS_MAX_AGE` / `HSTS_INCLUDE_SUBDOMAINS`, the default (one year), the way out (`0`), the refused values, the build-time freeze of the header list | `src/lib/security-headers.ts` (`parseHstsMaxAge`, `hstsHeader`) · `next.config.ts` (`headers()`) · `scripts/check-hsts.mjs` · `.env.example` |
+| 2.1 | `npm run backup`, `--keep N` (default 5), `--dry-run`, manifest, retention “never the newest”, verification rules, `pg_dump` docker/path choice, “local DATABASE_URL” | `package.json` scripts · `scripts/backup.mjs` · `scripts/backup-lib.mjs` (+ `backup-lib.test.mjs`, 23 tests) |
+| 2.2 | `psql "$DATABASE_URL" < backups/<file>.sql` + `createdb noema-restore-check` row-count verification hook | printed by `scripts/backup.mjs` (header + exit output) |
 | 3 | `POST /api/cron/templates`, `x-cron-secret`, 503/401, `12/60_000` limit, `{due,created,skipped,failed}`, fail-closed order | `src/app/api/cron/templates/route.ts` |
 | 3.1 | `CRON_SECRET` key + secret generator one-liner | `.env.example:8,50` |
 | 3.4 | `node --env-file=.env scripts/check-share-cron.mjs [baseUrl]` (no npm alias) | `scripts/check-share-cron.mjs:2` · absent from `package.json` |
 | 4.1 | SMTP env names/defaults, precedence, fail-soft, `EmailDelivery`, TLS self-signed switch | `src/lib/mailer.ts` · `src/server/actions/email.ts` · `.env.example:35-44` |
 | 4.2 | “Email & invitations” / “Verify & send test” labels, `testEmailAction` → `verifyMail` | `src/components/email-settings.tsx` · `src/lib/i18n.ts` (`emailHeading`, `verifySendTest`, `smtpVerified`, `recentEmail`) |
 | 4.3 | `npm run check:mail`, mock on 2525, `MOCK_SMTP_PORT`, assertions, cleanup | `package.json` · `scripts/check-mail.mjs` |
-| 5.1 | `npm run collab`, `PORT`/`HOST` (default `127.0.0.1`), `loadEnvFile`, `AUTH_SECRET` warn, `DATABASE_URL`, `NEXT_PUBLIC_COLLAB_URL` | `package.json` · `scripts/collab-server.mjs` (PORT/HOST, `resolveHost`, `ensureEnv`, `start()`) · `.env.example:11-12` |
-| 5.2 | 4401/4403 table, read-only drop, no oracle; B75: 4400 Origin (`APP_ORIGINS`), 4429 rate limits (5 conns / 30 msg per 10 s), presence identity binding, current known-gaps list; B64: fail-closed origin rule (loopback only without `APP_ORIGINS`), 4 MiB message cap (1009) | `scripts/collab-server.mjs` header contract (B53/B64) |
-| 5.3 | collab test count (53 `it()` lines), `check-collab.mjs` → 4401 not a gate | `scripts/collab-server.test.mjs` |
-| 5.4 | default bind `127.0.0.1` (`resolveHost`, empty/blank `HOST` included), `HOST=0.0.0.0` as the explicit opt-in, `APP_ORIGINS` as the operating rule for a networked deployment, 4 MiB `maxPayload` (1009) | `scripts/collab-server.mjs` (`resolveHost`, `DEFAULT_HOST`, `MAX_PAYLOAD_BYTES`, `isOriginAllowed`) · `scripts/collab-server.test.mjs` |
+| 5.1 | `npm run collab`, `PORT`/`HOST`, `loadEnvFile`, `AUTH_SECRET` warn, `DATABASE_URL`, `NEXT_PUBLIC_COLLAB_URL` | `package.json` · `scripts/collab-server.mjs` (PORT/HOST, `ensureEnv`, `start()`) · `.env.example:11-12` |
+| 5.2 | 4401/4403 table, read-only drop, no oracle; B75: 4400 Origin (`APP_ORIGINS`), 4429 rate limits (5 conns / 30 msg per 10 s), presence identity binding, current known-gaps list | `scripts/collab-server.mjs` header contract (B53) |
+| 5.3 | collab test count (38 `it()` lines), `check-collab.mjs` → 4401 not a gate | `scripts/collab-server.test.mjs` |
 | 6 | `--profile app`, service names/ports/env/healthchecks, volume behaviour | `docker-compose.yml` |
 | 7 | `/api/health` 200/503 shapes, 2 s ping, `no-store`, no auth/disclosure, compose healthcheck | `src/app/api/health/route.ts` · `docker-compose.yml` |
 | 8 | `db:push` / `db:migrate` / `db:seed`, `migrate deploy/status/diff` + `db push --accept-data-loss/--force-reset` | `package.json` · `npx prisma migrate --help` · `npx prisma db push --help` (both executed) |

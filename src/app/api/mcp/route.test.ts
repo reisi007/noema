@@ -466,3 +466,4 @@ describe("extended MCP transport gating", () => {
     expect(body.error?.message).toContain("allowAdmin");
   });
 });
+

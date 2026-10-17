@@ -25,8 +25,8 @@
  */
 
 import type { Mark, RichNode } from "@/lib/blocks";
-import { underHtmlScanBudget } from "@/lib/html-budget";
 import { HTML_MAX_NESTING } from "@/lib/html-nesting";
+import { underHtmlScanBudget } from "@/lib/html-budget";
 import { safeUrl, sanitizeHtml } from "@/lib/html-sanitize";
 import { markColor } from "@/lib/mark-colors";
 import { safeHref } from "@/lib/markdown";
@@ -168,8 +168,9 @@ function isInlineElement(el: ElementNode): boolean {
   return !BLOCK_TAGS.has(el.tag) || el.tag === "div";
 }
 
-/* ------------------------------------------------------------ mark mapping */
+/* -------------------------------------------------------------------- urls */
 
+/* ------------------------------------------------------------ mark mapping */
 function styleMarks(style: string | undefined): Mark[] {
   if (!style || /expression\s*\(|javascript:/i.test(style)) return [];
   const marks: Mark[] = [];

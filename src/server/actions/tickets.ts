@@ -103,6 +103,23 @@ async function logActivity(
   });
 }
 
+/**
+ * The tickets of a selection that really belong to a workspace.
+ *
+ * `TicketLabel` and `TicketActivity` carry no workspace column of their own —
+ * both hang off the ticket — so a bulk write cannot be scoped by a filter of
+ * its own. The ticket ids are narrowed here once, and only that list is
+ * written to. The order of the selection is kept.
+ */
+async function ticketsInWorkspace(ticketIds: string[], workspaceId: string): Promise<string[]> {
+  const rows = await prisma.ticket.findMany({
+    where: { id: { in: ticketIds }, workspaceId },
+    select: { id: true },
+  });
+  const scoped = new Set(rows.map((row) => row.id));
+  return ticketIds.filter((id) => scoped.has(id));
+}
+
 // ---------------------------------------------------------------------------
 // Labels (workspace level)
 // ---------------------------------------------------------------------------
@@ -301,6 +318,10 @@ export async function createTicketAction(input: {
   if (input.parentId && !(await ticketInWorkspace(input.parentId, input.workspaceId))) {
     return { error: "That parent ticket is not in this workspace." };
   }
+  // Labels are workspace level, and `TicketLabel` has no workspace column of
+  // its own, so the check has to happen on the id list: by id alone a ticket
+  // could be created carrying another workspace's label.
+  let labelIds: string[] = [];
   if (input.labelIds && input.labelIds.length > 0) {
     const labels = await prisma.label.findMany({
       where: { id: { in: input.labelIds }, workspaceId: input.workspaceId },
@@ -309,6 +330,7 @@ export async function createTicketAction(input: {
     if (labels.length !== new Set(input.labelIds).size) {
       return { error: "That label is not in this workspace." };
     }
+    labelIds = input.labelIds;
   }
 
   // Reserve the next number atomically so keys never collide.
@@ -348,8 +370,8 @@ export async function createTicketAction(input: {
       reporterId: user.id,
       parentId: input.parentId ?? null,
       position: (last?.position ?? 0) + 1000,
-      ...(input.labelIds && input.labelIds.length > 0
-        ? { labels: { create: input.labelIds.map((labelId) => ({ labelId })) } }
+      ...(labelIds.length > 0
+        ? { labels: { create: labelIds.map((labelId) => ({ labelId })) } }
         : {}),
     },
     select: { id: true, key: true },
@@ -797,15 +819,7 @@ export async function bulkUpdateTicketsAction(input: {
       return { error: "That project is not in this workspace." };
     }
   }
-  // The selection is caller-controlled: keep only the rows of the workspace the
-  // first ticket belongs to. The scalar update and the relation writes below
-  // must not be handed a foreign id, even when the caller mixes one in.
-  const scoped = await prisma.ticket.findMany({
-    where: { id: { in: input.ticketIds }, workspaceId: first.workspaceId },
-    select: { id: true },
-  });
-  const ticketIds = scoped.map((row) => row.id);
-  if (ticketIds.length === 0) return { ok: true, updated: 0 };
+
   if (input.status && STATUS_IDS.includes(input.status)) {
     data.status = input.status;
     data.completedAt = isClosed(input.status) ? new Date() : null;
@@ -839,6 +853,11 @@ export async function bulkUpdateTicketsAction(input: {
   const hasScalar = Object.keys(data).length > 0;
   const hasLabels = addLabelIds.length > 0 || removeLabelIds.length > 0;
   if (!hasScalar && !hasLabels) return { ok: true, updated: 0 };
+
+  // The selection is narrowed to this workspace once. The label rows and the
+  // activity trail hang off the ticket and carry no workspace of their own, so
+  // a ticket from another workspace would otherwise receive both.
+  const ticketIds = await ticketsInWorkspace(input.ticketIds, first.workspaceId);
 
   // Which of the selected tickets actually change hands? Read *before* the
   // update so the assignee's notice counts what moved ("3 tickets"), not what was
@@ -918,11 +937,7 @@ export async function bulkArchiveTicketsAction(input: {
     return { error: "You do not have permission to edit tickets." };
   }
 
-  const scoped = await prisma.ticket.findMany({
-    where: { id: { in: input.ticketIds }, workspaceId: first.workspaceId },
-    select: { id: true },
-  });
-  const ticketIds = scoped.map((row) => row.id);
+  const ticketIds = await ticketsInWorkspace(input.ticketIds, first.workspaceId);
   if (ticketIds.length === 0) return { ok: true, updated: 0 };
 
   const archived = input.archived ?? true;
@@ -930,6 +945,7 @@ export async function bulkArchiveTicketsAction(input: {
     where: { id: { in: ticketIds }, workspaceId: first.workspaceId },
     data: { archived },
   });
+
   for (const ticketId of ticketIds) {
     await logActivity(ticketId, user.id, archived ? "archived" : "restored");
   }

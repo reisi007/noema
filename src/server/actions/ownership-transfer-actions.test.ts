@@ -48,14 +48,6 @@ import {
   startOwnershipTransferAction,
 } from "./workspaces";
 
-/**
- * The owner proves their password on every start now. Keep the state-machine
- * cases focused on their transition by supplying the owner's password; the
- * recipient-proof cases still exercise their own password separately.
- */
-const start = (input: Parameters<typeof startOwnershipTransferAction>[0]) =>
-  startOwnershipTransferAction({ password: SENDER_PASSWORD, ...input });
-
 /** The workspace row `startTransfer` reads (owner + guest-safe member). */
 function workspaceWithMembers(id: string) {
   return {
@@ -72,7 +64,7 @@ const RECIPIENT_HASH = "stored-hash-of-the-recipient";
 const SENDER_HASH = "stored-hash-of-the-sender";
 /** The password that matches the recipient's hash. */
 const RECIPIENT_PASSWORD = "the-recipients-password";
-/** The password that matches the owner's hash. */
+/** The password that matches the sender's (owner's) hash. */
 const SENDER_PASSWORD = "the-senders-password";
 
 beforeEach(() => {
@@ -104,10 +96,10 @@ afterEach(() => {
 describe("startOwnershipTransferAction", () => {
   it("opens one transfer and refuses a second while one is pending", async () => {
     auth.user = { id: "actor-1" };
-    const first = await start({ workspaceId: "ws-1", toUserId: "user-2" });
+    const first = await startOwnershipTransferAction({ workspaceId: "ws-1", toUserId: "user-2", password: SENDER_PASSWORD });
     expect(first).toMatchObject({ ok: true });
 
-    const second = await start({ workspaceId: "ws-1", toUserId: "user-2" });
+    const second = await startOwnershipTransferAction({ workspaceId: "ws-1", toUserId: "user-2", password: SENDER_PASSWORD });
     expect(second).toEqual({ error: "This workspace already has a pending ownership transfer." });
   });
 
@@ -120,7 +112,7 @@ describe("startOwnershipTransferAction", () => {
       ],
     });
     await expect(
-      start({ workspaceId: "ws-guest", toUserId: "guest-2" }),
+      startOwnershipTransferAction({ workspaceId: "ws-guest", toUserId: "guest-2", password: SENDER_PASSWORD }),
     ).resolves.toEqual({
       error: "A guest cannot own this workspace — promote them to a member first.",
     });
@@ -130,20 +122,18 @@ describe("startOwnershipTransferAction", () => {
 describe("acceptOwnershipTransferAction", () => {
   it("lets only the recipient accept, then swaps ownership atomically", async () => {
     auth.user = { id: "actor-1" };
-    const started = await start({ workspaceId: "ws-accept", toUserId: "user-2" });
+    const started = await startOwnershipTransferAction({ workspaceId: "ws-accept", toUserId: "user-2", password: SENDER_PASSWORD });
     if (!("ok" in started)) throw new Error(started.error);
 
     // The sender is not the recipient.
-    await expect(acceptOwnershipTransferAction(started.id)).resolves.toEqual({
+    await expect(acceptOwnershipTransferAction(started.id, { password: RECIPIENT_PASSWORD })).resolves.toEqual({
       error: "Only the intended recipient can accept this transfer.",
     });
     expect(db.transaction).not.toHaveBeenCalled();
 
     auth.user = { id: "user-2" };
     db.workspaceFindUnique.mockResolvedValue({ ownerId: "actor-1" });
-    await expect(
-      acceptOwnershipTransferAction(started.id, { password: RECIPIENT_PASSWORD }),
-    ).resolves.toEqual({ ok: true });
+    await expect(acceptOwnershipTransferAction(started.id, { password: RECIPIENT_PASSWORD })).resolves.toEqual({ ok: true });
     expect(db.memberUpdate).toHaveBeenCalledWith({ where: { id: "m2" }, data: { role: "OWNER" } });
     expect(db.memberUpdateMany).toHaveBeenCalledWith({
       where: { workspaceId: "ws-accept", userId: "actor-1" },
@@ -157,10 +147,11 @@ describe("acceptOwnershipTransferAction — the password step (B14)", () => {
   /** Open a transfer that demands a password and hand it to the recipient. */
   async function passwordTransfer(workspaceId: string) {
     auth.user = { id: "actor-1" };
-    const started = await start({
+    const started = await startOwnershipTransferAction({
       workspaceId,
       toUserId: "user-2",
       requirePassword: true,
+      password: SENDER_PASSWORD,
     });
     if (!("ok" in started)) throw new Error(started.error);
     auth.user = { id: "user-2" };
@@ -228,15 +219,17 @@ describe("acceptOwnershipTransferAction — the password step (B14)", () => {
 
   it("does not ask a non-recipient for a password", async () => {
     auth.user = { id: "actor-1" };
-    const started = await start({
+    const started = await startOwnershipTransferAction({
       workspaceId: "ws-b14-other",
       toUserId: "user-2",
       requirePassword: true,
+      password: SENDER_PASSWORD,
     });
     if (!("ok" in started)) throw new Error(started.error);
 
-    // The start already checked the owner's password. The sender is not the
-    // recipient: the refusal names that, and no password is compared for it.
+    // The sender is not the recipient: the refusal names that, and no
+    // password is compared for it (in the accept step — the owner's password
+    // was already checked when the transfer was started).
     auth.verifyPassword.mockClear();
     await expect(
       acceptOwnershipTransferAction(started.id, { password: RECIPIENT_PASSWORD }),
@@ -247,9 +240,10 @@ describe("acceptOwnershipTransferAction — the password step (B14)", () => {
 
   it("still requires the recipient password when the start omits the flag", async () => {
     auth.user = { id: "actor-1" };
-    const started = await start({
+    const started = await startOwnershipTransferAction({
       workspaceId: "ws-b14-open",
       toUserId: "user-2",
+      password: SENDER_PASSWORD,
     });
     if (!("ok" in started)) throw new Error(started.error);
 
@@ -261,6 +255,7 @@ describe("acceptOwnershipTransferAction — the password step (B14)", () => {
     });
     expect(db.transaction).not.toHaveBeenCalled();
 
+    db.workspaceFindUnique.mockResolvedValue({ ownerId: "actor-1" });
     await expect(
       acceptOwnershipTransferAction(started.id, { password: RECIPIENT_PASSWORD }),
     ).resolves.toEqual({ ok: true });
@@ -272,7 +267,7 @@ describe("acceptOwnershipTransferAction — the password step (B14)", () => {
 describe("decline / cancel", () => {
   it("lets the recipient decline", async () => {
     auth.user = { id: "actor-1" };
-    const started = await start({ workspaceId: "ws-decline", toUserId: "user-2" });
+    const started = await startOwnershipTransferAction({ workspaceId: "ws-decline", toUserId: "user-2", password: SENDER_PASSWORD });
     if (!("ok" in started)) throw new Error(started.error);
 
     auth.user = { id: "user-2" };
@@ -284,7 +279,7 @@ describe("decline / cancel", () => {
 
   it("lets the sender cancel", async () => {
     auth.user = { id: "actor-1" };
-    const started = await start({ workspaceId: "ws-cancel", toUserId: "user-2" });
+    const started = await startOwnershipTransferAction({ workspaceId: "ws-cancel", toUserId: "user-2", password: SENDER_PASSWORD });
     if (!("ok" in started)) throw new Error(started.error);
 
     await expect(cancelOwnershipTransferAction(started.id)).resolves.toEqual({ ok: true });
@@ -297,10 +292,11 @@ describe("decline / cancel", () => {
 describe("lazy expiry", () => {
   it("lapses a request at its boundary and refuses a late accept", async () => {
     auth.user = { id: "actor-1" };
-    const started = await start({
+    const started = await startOwnershipTransferAction({
       workspaceId: "ws-exp",
       toUserId: "user-2",
       ttlMs: 1000,
+      password: SENDER_PASSWORD,
     });
     if (!("ok" in started)) throw new Error(started.error);
 
@@ -314,7 +310,7 @@ describe("lazy expiry", () => {
 
     auth.user = { id: "user-2" };
     db.workspaceFindUnique.mockResolvedValue({ ownerId: "actor-1" });
-    await expect(acceptOwnershipTransferAction(started.id)).resolves.toEqual({
+    await expect(acceptOwnershipTransferAction(started.id, { password: RECIPIENT_PASSWORD })).resolves.toEqual({
       error: "This transfer request has expired.",
     });
     expect(db.transaction).not.toHaveBeenCalled();

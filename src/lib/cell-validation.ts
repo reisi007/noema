@@ -233,6 +233,61 @@ function dateRangeOf(value: unknown): { start: string | null; end: string | null
 }
 
 /**
+ * Whether a group body holds an alternation (`|`). Escapes and character
+ * classes are skipped, so `([a|b])` is not an alternation.
+ */
+function containsAlternation(body: string): boolean {
+  let inClass = false;
+  let i = 0;
+  while (i < body.length) {
+    const char = body[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (inClass) {
+      if (char === "]") inClass = false;
+      i += 1;
+      continue;
+    }
+    if (char === "[") {
+      inClass = true;
+      i += 1;
+      continue;
+    }
+    if (char === "|") return true;
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * Where the content of the group that opens at `open` starts. A group may
+ * carry a prefix — `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!`, `(?<name>` — and that
+ * prefix is group syntax, not a quantifier on the content.
+ */
+function groupBodyStart(pattern: string, open: number): number {
+  if (pattern[open + 1] !== "?") return open + 1;
+  const marker = open + 2;
+  if (pattern[marker] === "<") {
+    if (pattern[marker + 1] === "=" || pattern[marker + 1] === "!") {
+      return marker + 2;
+    }
+    const close = pattern.indexOf(">", marker);
+    return close === -1 ? open + 1 : close + 1;
+  }
+  if (
+    pattern[marker] === ":" ||
+    pattern[marker] === "=" ||
+    pattern[marker] === "!"
+  ) {
+    return marker + 1;
+  }
+  return open + 1; // unknown group syntax: the prefix stays part of the body
+}
+
+
+/**
  * Compile a stored pattern safely. An invalid regex is not an error — it is
  * ignored, so a bad pattern can never reject every value or throw. The same
  * holds for a pattern whose backtracking can explode and for a pattern whose

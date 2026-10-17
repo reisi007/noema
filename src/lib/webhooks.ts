@@ -167,6 +167,26 @@ export function encryptWebhookSecret(secret: string): string {
 }
 
 /**
+ * B21 — the state of a stored webhook signing secret.
+ *
+ * - `sealed` — an envelope that opened: `secret` is the plaintext to sign with.
+ * - `legacy` — a pre-migration PLAINTEXT secret (the M28.3 transition window):
+ *   it is used as-is, so already-configured hooks keep delivering signed
+ *   requests, but the secret sits in the clear in the database.
+ * - `unreadable` — an envelope that did NOT open: the key that opens it is
+ *   gone (a rotated `AUTH_SECRET`) or the ciphertext is corrupt. There is no
+ *   signing key at all, so there is nothing to sign with.
+ * - `missing` — no secret is stored. The hook predates the mandatory secret
+ *   (R28.17); the receiver holds no shared key either, so its delivery is
+ *   unsigned by the documented wire format.
+ */
+type WebhookSecretState =
+  | { readonly kind: "sealed"; readonly secret: string }
+  | { readonly kind: "legacy"; readonly secret: string }
+  | { readonly kind: "unreadable"; readonly secret: null }
+  | { readonly kind: "missing"; readonly secret: null };
+
+/**
  * B63 — seal the secret of a hook that was created before the sealing (R28.17).
  *
  * Such a row still holds its secret in cleartext, and the secret is the shared
@@ -197,27 +217,6 @@ export async function sealLegacyWebhookSecret(hook: {
 }
 
 /**
- * Resolve a stored webhook secret to the plaintext used for signing.
- * B21 — the state of a stored webhook signing secret.
- *
- * - `sealed` — an envelope that opened: `secret` is the plaintext to sign with.
- * - `legacy` — a pre-migration PLAINTEXT secret (the M28.3 transition window):
- *   it is used as-is, so already-configured hooks keep delivering signed
- *   requests, but the secret sits in the clear in the database.
- * - `unreadable` — an envelope that did NOT open: the key that opens it is
- *   gone (a rotated `AUTH_SECRET`) or the ciphertext is corrupt. There is no
- *   signing key at all, so there is nothing to sign with.
- * - `missing` — no secret is stored. The hook predates the mandatory secret
- *   (R28.17); the receiver holds no shared key either, so its delivery is
- *   unsigned by the documented wire format.
- */
-type WebhookSecretState =
-  | { readonly kind: "sealed"; readonly secret: string }
-  | { readonly kind: "legacy"; readonly secret: string }
-  | { readonly kind: "unreadable"; readonly secret: null }
-  | { readonly kind: "missing"; readonly secret: null };
-
-/**
  * Resolve a stored webhook secret to the plaintext used for signing, and say
  * WHICH state it is in.
  *
@@ -227,11 +226,7 @@ type WebhookSecretState =
  *   requests; {@link sealLegacyWebhookSecret} seals the row at rest when the
  *   app reads it. (Follow-up: hard-fail once the migration window closes,
  *   per R28.17.)
- * - A corrupt/unreadable envelope resolves to `null` — the delivery is sent
- *   unsigned rather than signed with ciphertext — and is logged. New hooks are
- *   always sealed on write, so this cannot happen to a freshly created hook.
- *   requests; re-creating the hook seals it. (Follow-up: hard-fail once the
- *   migration window closes, per R28.17.)
+ *
  * - An envelope that does not open resolves to `unreadable` and is logged.
  *   New hooks are always sealed on write, so this cannot happen to a freshly
  *   created hook — only after the key was rotated out from under the row.
@@ -357,18 +352,31 @@ export async function deliverWithRetry(
   const sleep = options.sleep ?? defaultSleep;
   const row: DeliveryRowRef = { id: options.deliveryId ?? null };
   // R28.17 — the secret is sealed at rest; open it once per logical delivery.
+  // B63 — a hook that predates the sealing still holds its secret in
+  // cleartext: seal it now, so the plaintext leaves the database.
+  await sealLegacyWebhookSecret(hook);
   const resolved = resolveWebhookSecret(hook.secret);
-  // B21 - a secret that does not OPEN leaves nothing to sign with: the row
+  // B21 — a secret that does not OPEN leaves nothing to sign with: the row
   // holds an envelope, but the key that opens it is gone (a rotated
-  // `AUTH_SECRET`) or the ciphertext is corrupt. Refuse it instead of
-  // sending an unsigned delivery.
+  // `AUTH_SECRET`) or the ciphertext is corrupt. The delivery used to go out
+  // UNSIGNED and was booked as a success, so a receiver that only asks
+  // whether the header is present accepted a manipulated payload. Refuse it
+  // instead: no request leaves the server, and the row records the failure.
+  // The condition does not change while the process runs, so the retry loop
+  // is not entered — this is a policy decision, like a blocked target.
   if (resolved.kind === "unreadable") {
-    await recordAttempt(row, hook.id, event, 1, false, null, UNREADABLE_SECRET_ERROR);
+    await recordAttempt(
+      row,
+      hook.id,
+      event,
+      1,
+      false,
+      null,
+      UNREADABLE_SECRET_ERROR,
+    );
     return;
   }
-  // B63 - a hook that predates the sealing still holds its secret in
-  // cleartext: seal it now, so the plaintext leaves the database.
-  if (resolved.kind === "legacy") await sealLegacyWebhookSecret(hook);
+
   const secret = resolved.secret;
 
   for (let attempt = 1; attempt <= WEBHOOK_MAX_ATTEMPTS; attempt += 1) {

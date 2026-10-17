@@ -19,7 +19,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const db = vi.hoisted(() => ({
   userFindUnique: vi.fn(),
   userUpdate: vi.fn(),
-  userUpdateMany: vi.fn(),
+  // B25: the replay guard spends the time step of the code with a
+  // conditional update — the mock has to offer it.
+  userUpdateMany: vi.fn(async () => ({ count: 1 })),
 }));
 
 const auth = vi.hoisted(() => ({

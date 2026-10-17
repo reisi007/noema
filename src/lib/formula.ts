@@ -159,6 +159,179 @@ function compareValues(a: FormulaValue, b: FormulaValue): number {
 }
 
 /**
+ * The element a quantifier at `index` applies to, as source text: the
+ * character before it, the escape, the character class or the group.
+ */
+function repetitionElement(pattern: string, index: number): { start: number; source: string } {
+  const end = index - 1;
+  if (end < 0) return { start: 0, source: "" };
+  const last = pattern[end];
+  if (last === "]") {
+    let open = end;
+    while (open > 0 && pattern[open] !== "[") open -= 1;
+    return { start: open, source: pattern.slice(open, end + 1) };
+  }
+  if (last === ")") {
+    let open = end;
+    let depth = 0;
+    while (open >= 0) {
+      if (pattern[open] === ")") depth += 1;
+      if (pattern[open] === "(") {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      open -= 1;
+    }
+    return { start: open, source: pattern.slice(open, end + 1) };
+  }
+  if (last === "\\" && end > 0) return { start: end - 1, source: pattern.slice(end - 1, end + 1) };
+  return { start: end, source: last };
+}
+
+/** A repetition in a pattern: the element a quantifier applies to. */
+type RegexRepetition = {
+  /** The source of the repeated element. */
+  source: string;
+  /** Where the element starts in the pattern. */
+  start: number;
+  /** Where the quantifier ends in the pattern. */
+  end: number;
+};
+
+/**
+ * The repetitions of a pattern: the elements a quantifier (`*`, `+`,
+ * `{n,m}`) applies to. A `?` is not one — a single optional element does
+ * not let the engine split the text.
+ */
+function findRepetitions(pattern: string): RegexRepetition[] {
+  const repetitions: RegexRepetition[] = [];
+  let inClass = false;
+  let i = 0;
+  while (i < pattern.length) {
+    const char = pattern[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (inClass) {
+      if (char === "]") inClass = false;
+      i += 1;
+      continue;
+    }
+    if (char === "[") {
+      inClass = true;
+      i += 1;
+      continue;
+    }
+    if (char === "*" || char === "+" || char === "{") {
+      const element = repetitionElement(pattern, i);
+      if (element.source !== "") {
+        repetitions.push({ source: element.source, start: element.start, end: i + 1 });
+      }
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return repetitions;
+}
+
+/**
+ * Whether the element a repetition applies to can match a character. The
+ * element is described by its own source, so a group is described by what it
+ * starts with; an element that does not compile is taken to match anything.
+ */
+function elementMatcher(source: string): (char: string) => boolean {
+  try {
+    const matcher = new RegExp(`^(?:${source})`);
+    return (char: string) => matcher.test(char);
+  } catch {
+    return () => true;
+  }
+}
+
+/** How often every character of a text occurs. */
+function characterCounts(text: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const char of text) counts.set(char, (counts.get(char) ?? 0) + 1);
+  return counts;
+}
+
+/**
+ * How often the element of a repetition can match the text: every such
+ * character is a place where the engine may split the text.
+ */
+function splitCount(
+  counts: Map<string, number>,
+  matcher: (char: string) => boolean,
+): number {
+  let total = 0;
+  for (const [char, count] of counts) {
+    if (matcher(char)) total += count;
+  }
+  return total;
+}
+
+/**
+ * Whether a literal between two repetitions pins them apart: the first
+ * repetition has to give characters back before the literal can match, so
+ * the literal decides how it splits (`(\d+)-(\d+)` splits the text once,
+ * `(\w+)\s*(\w+)` splits it twice).
+ */
+function pinnedApart(separator: string, matcher: (char: string) => boolean): boolean {
+  let inClass = false;
+  let i = 0;
+  while (i < separator.length) {
+    const char = separator[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (inClass) {
+      if (char === "]") inClass = false;
+      i += 1;
+      continue;
+    }
+    if (char === "[") {
+      inClass = true;
+      i += 1;
+      continue;
+    }
+    if (!"*+?{}".includes(char) && !matcher(char)) return true;
+    i += 1;
+  }
+  return false;
+}
+
+/**
+ * The engine's expected work for one evaluation, in backtracking steps.
+ *
+ * The engine tries every start position and, at every start position, every
+ * split of every repeated element — but only for elements that can match the
+ * text at all, and only while no literal in between pins them apart. The
+ * result is a product of the split counts, which is what the budget is
+ * checked against.
+ */
+function estimatedRegexSteps(text: string, pattern: string): number {
+  const counts = characterCounts(text);
+  let steps = text.length;
+  let previous: RegexRepetition | null = null;
+  for (const repetition of findRepetitions(pattern)) {
+    const splits = splitCount(counts, elementMatcher(repetition.source));
+    if (splits === 0) continue;
+    if (
+      previous !== null &&
+      pinnedApart(pattern.slice(previous.end, repetition.start), elementMatcher(previous.source))
+    ) {
+      continue;
+    }
+    steps *= splits;
+    previous = repetition;
+  }
+  return steps;
+}
+
+/**
  * Runs a native regex operation under the wall-clock budget: an operation
  * that overran the budget comes back as an error value instead of a result.
  */

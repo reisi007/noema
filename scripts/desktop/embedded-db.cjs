@@ -175,6 +175,7 @@ async function authenticate(socket, password, log) {
         // answers it itself.
         return Buffer.concat([head, await reader.read(8)]);
       }
+      }
       if (length < 8) throw new Error("the client sent a malformed startup packet");
       startup = Buffer.concat([head, await reader.read(length - 8)]);
       break;

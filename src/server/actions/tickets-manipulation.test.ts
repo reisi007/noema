@@ -59,6 +59,11 @@ beforeEach(() => {
     (args?.where?.id?.in ?? []).map((id) => ({ id })),
   );
   db.ticketActivity.create.mockResolvedValue({ id: "a1" });
+  // The scope filter: the whole selection is in the workspace, so the bulk
+  // writes cover every selected ticket.
+  db.ticket.findMany.mockImplementation(async ({ where }: { where: { id: { in: string[] } } }) =>
+    where.id.in.map((id) => ({ id })),
+  );
 });
 
 describe("deleteTicketAction (permanent, single)", () => {

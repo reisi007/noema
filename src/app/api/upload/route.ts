@@ -6,7 +6,7 @@ import { randomToken } from "@/lib/slug";
 import { rateLimit } from "@/lib/api-guard";
 import { bodyReadError, readFormDataBody } from "@/lib/body-limit";
 import { storageDriver } from "@/lib/storage";
-import { extForMime, fileNameExt, isAllowedType, mimeForExt } from "@/lib/file-type";
+import { baseMimeType, extForMime, fileNameExt, isAllowedType, mimeForExt } from "@/lib/file-type";
 import { isSvgSafe } from "@/lib/svg-safety";
 import { isComplete, planChunks, validateChunkPlan } from "@/lib/upload-chunk";
 
@@ -166,13 +166,11 @@ export async function POST(request: Request) {
 
   // Validate against the shared allow-list. `File.type` is blank on many
   // systems, so fall back to the MIME implied by the file name's extension.
-  // Strip parameters (`image/svg+xml; charset=utf-8`) before both the allow
-  // check and the SVG comparison: the matcher normalises them, but a raw
-  // comparison would let the parameterised form skip the SVG scanner.
-  const mime = (file.type || mimeForExt(fileNameExt(file.name)))
-    .split(";")[0]
-    .trim()
-    .toLowerCase();
+  // The **base** type is the one that decides: a browser may declare
+  // `image/svg+xml; charset=utf-8`, and the allow-list compares the base
+  // type — so the SVG rule below has to compare the same value, otherwise a
+  // parameter would slip the file past the rule.
+  const mime = baseMimeType(file.type) || mimeForExt(fileNameExt(file.name));
   if (!isAllowedType(mime, { allow: ALLOWED_TYPES })) {
     return NextResponse.json(
       { error: `Unsupported file type: ${file.type || "unknown"}` },
@@ -180,29 +178,35 @@ export async function POST(request: Request) {
     );
   }
 
+  // The bytes are read once: the SVG rule needs them (strictly decoded, see
+  // below) and the storage driver needs them.
   const bytes = new Uint8Array(await file.arrayBuffer());
 
   // An SVG is served inline from the app origin, so it runs the same safety
-  // rule the clipboard path applies (`@/lib/svg-safety` - one rule, one
+  // rule the clipboard path applies (`@/lib/svg-safety` — one rule, one
+  // place). Fail closed: the bytes are checked *before* anything is stored,
+  // so a refused SVG never reaches the disk, the Asset table or a URL.
+  // The answer names the rule, not the place in the file that broke it, so
+  // two different unsafe SVGs get the same reply.
   // place). Fail closed: the bytes are checked *before* anything is stored,
   // so a refused SVG never reaches the disk, the Asset table or a URL.
   // The answer names the rule, not the place in the file that broke it, so
   // two different unsafe SVGs get the same reply.
   if (mime === "image/svg+xml") {
-    // A UTF-16/UTF-32 document is full of NUL bytes and `file.text()` would
-    // decode it as UTF-8 garbage; the markup scanner would then miss the
-    // script tags. Only a valid UTF-8 SVG without NULs is accepted.
-    let svgText: string;
+    // A UTF-16/UTF-32 document is full of NUL bytes and a lenient decoder
+    // would replace invalid bytes with U+FFFD, so the markup scanner would
+    // miss the script tags. Only a valid UTF-8 SVG without NULs is accepted.
+    let text: string;
     try {
       if (bytes.includes(0)) throw new Error("NUL byte");
-      svgText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     } catch {
       return NextResponse.json(
         { error: "File rejected by the image safety policy" },
         { status: 415 },
       );
     }
-    if (!isSvgSafe(svgText)) {
+    if (!isSvgSafe(text)) {
       return NextResponse.json(
         { error: "File rejected by the image safety policy" },
         { status: 415 },

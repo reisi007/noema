@@ -38,8 +38,8 @@
  */
 
 import type { Mark, RichNode } from "@/lib/blocks";
-import { underHtmlScanBudget } from "@/lib/html-budget";
 import { HTML_MAX_NESTING } from "@/lib/html-nesting";
+import { underHtmlScanBudget } from "@/lib/html-budget";
 import { stripTags } from "@/lib/html-sanitize";
 import { safeHref } from "@/lib/markdown";
 

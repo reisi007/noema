@@ -193,14 +193,13 @@ export function resolveBackupPassphrase(env) {
         "BACKUP_ENCRYPTION_KEY is not set — refusing to write an unencrypted dump (it holds every password hash, 2FA seed and provider key in cleartext).",
     };
   }
-  const passphrase = raw.trim();
-  if (passphrase.length < MIN_BACKUP_PASSPHRASE_LENGTH) {
+  if (raw.length < MIN_BACKUP_PASSPHRASE_LENGTH) {
     return {
       ok: false,
-      reason: `BACKUP_ENCRYPTION_KEY is too short (${passphrase.length} characters) - at least ${MIN_BACKUP_PASSPHRASE_LENGTH} are required.`,
+      reason: `BACKUP_ENCRYPTION_KEY is too short (${raw.length} characters) — at least ${MIN_BACKUP_PASSPHRASE_LENGTH} are required.`,
     };
   }
-  return { ok: true, passphrase };
+  return { ok: true, passphrase: raw };
 }
 
 /** Stretch the passphrase into a 32-byte key (memory-hard, salted per file). */

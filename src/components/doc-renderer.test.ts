@@ -167,8 +167,6 @@ describe("DocRenderer external images (B69)", () => {
     ]);
   });
 });
-
-
 describe("DocRenderer Mermaid blocks", () => {
   it("routes Mermaid code to the client diagram renderer", () => {
     const html = render({

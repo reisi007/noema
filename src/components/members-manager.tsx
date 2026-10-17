@@ -320,7 +320,7 @@ export function MembersManager({
   const { run, pending, error } = useAction(locale);
   const [removeTarget, setRemoveTarget] = useState<MemberRow | null>(null);
   const [transferTarget, setTransferTarget] = useState<MemberRow | null>(null);
-  // B138: the owner proves their password before the workspace changes hands.
+  // B138: the owner proves their password before the workspace changes hands. fork/main
   const [transferPassword, setTransferPassword] = useState("");
   const [leaveOpen, setLeaveOpen] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");

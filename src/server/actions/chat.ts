@@ -786,6 +786,22 @@ export async function executeChatActionAction(input: {
   // The proposal turn is already marked applied by the claim above; the
   // confirm button stays hidden from here on.
 
+  // Hide the confirm button: the proposal turn is now applied.
+  const proposalMessage = await prisma.chatMessage.findUnique({
+    where: { id: proposalMessageId },
+    select: { threadId: true, meta: true },
+  });
+  if (proposalMessage && proposalMessage.threadId === thread.id) {
+    const meta =
+      proposalMessage.meta && typeof proposalMessage.meta === "object" && !Array.isArray(proposalMessage.meta)
+        ? (proposalMessage.meta as Record<string, unknown>)
+        : {};
+    await prisma.chatMessage.update({
+      where: { id: proposalMessageId },
+      data: { meta: { ...meta, applied: true } },
+    });
+  }
+
   revalidatePath("/w", "layout");
   return { ok: true, message };
 }

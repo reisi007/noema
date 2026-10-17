@@ -36,6 +36,8 @@ const db = vi.hoisted(() => ({
 
 const auth = vi.hoisted(() => ({
   requireUser: vi.fn(),
+  // B39: `disableTwoFactorAction` reads the session of the caller to keep it
+  // alive while it ends the other sessions of the account.
   getSessionId: vi.fn(async () => null),
   createSession: vi.fn(),
   destroySession: vi.fn(),

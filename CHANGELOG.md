@@ -77,18 +77,6 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   workflows and fails when a reference carries no SHA, when a tool is
   installed without an exact version, or when a cache key caches that tool
   without its version.
-- The compose smoke test of the site workflow is checked before it runs. It
-  can only succeed if the workflow, the compose file and the image agree: the
-  stack must be started with the profile that gates the `app` service, the
-  probe must ask for the port the compose file publishes, and the image must
-  apply the migrations before the probe. At the reviewed commit none of the
-  three held, and the job could never succeed. The three symptoms are fixed
-  upstream, but nothing kept them fixed — and the job itself runs only on a
-  push to `main`, never in a pull request. The new gate (`npm run
-  check:compose-smoke`) reads the workflow, the compose file, the `Dockerfile`
-  and the boot wrapper and checks the seven rules that make the job work, so a
-  pull request that breaks the container path fails in the CI that runs on
-  every pull request.
 - The data directory of the desktop app belongs to the user alone, and the
   embedded engine asks for a password. The cluster directory was created with
   the umask's default (0755) and PGlite writes its files with 0666 — the
@@ -104,6 +92,18 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   Postgres cleartext-password handshake, compared in constant time); the
   password is 32 random bytes per launch and reaches the app in the
   environment, never on a command line.
+- The compose smoke test of the site workflow is checked before it runs. It
+  can only succeed if the workflow, the compose file and the image agree: the
+  stack must be started with the profile that gates the `app` service, the
+  probe must ask for the port the compose file publishes, and the image must
+  apply the migrations before the probe. At the reviewed commit none of the
+  three held, and the job could never succeed. The three symptoms are fixed
+  upstream, but nothing kept them fixed — and the job itself runs only on a
+  push to `main`, never in a pull request. The new gate (`npm run
+  check:compose-smoke`) reads the workflow, the compose file, the `Dockerfile`
+  and the boot wrapper and checks the seven rules that make the job work, so a
+  pull request that breaks the container path fails in the CI that runs on
+  every pull request.
 - The public share pages no longer hand the visitor's IP address to a third
   party. The read-only renderer emitted the stored picture `src` verbatim, so
   opening a shared page made the **visitor's browser** fetch the picture from
@@ -121,6 +121,16 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   and the response is capped in size. **A picture from a host that is not on
   the allowlist is no longer shown** — add the host to `EXTERNAL_IMAGE_ALLOWLIST`
   to have it back.
+- The link gate of the paste module reads the scheme the way a browser reads
+  it. Two URL gates stood in one module with different strictness: `safeHref`
+  only tested for a **literal** `javascript:`/`vbscript:`/`data:text/html`
+  prefix, while `unsafeUrl` right next to it removed the control characters
+  first — so `safeHref("java\nscript:alert(1)")` passed, and a browser strips
+  the newline inside the scheme. Both gates now share one probe (the control
+  characters removed, the value lower-cased), and `safeHref` refuses **every**
+  `data:` target, because a `data:` document is never a valid link target: its
+  payload can carry markup. The embedded images (`<img src="data:image/…">`)
+  are untouched — they do not run through this gate.
 - The HTML serializer checks the scheme of the href and the colour. The
   serializer of the documents escaped the **text** of an href, not its
   **scheme** — a `javascript:` href survived, unlike in the live export, which
@@ -173,12 +183,6 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   pattern whose estimate exceeds 50 ms. A wall-clock fallback times the native
   evaluation as well, because a native `RegExp` cannot be interrupted once it
   started.
-- The page tree's "Open in new tab" now passes `noreferrer` as well. The call
-  `window.open(href, "_blank", "noopener")` set `noopener` — so the opened tab
-  cannot reach back through `window.opener` — but left the `Referer` header
-  standing, so the new tab learned the app URL. The gate for new tabs reads
-  the `rel` of the elements and does not look at the feature string of a
-  `window.open`, which is why the place passed it.
 - The chat snapshot is framed now, and its block structure can no longer be forged.
   The chat hands the model a complete snapshot of the workspace, and every
   block of it begins with a header line (`CURRENT PAGE — …`, `WORKSPACE
@@ -192,16 +196,6 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   request — with an id minted per request, so the content cannot know which
   tag closes the block. The system prompt says what the block is: data to
   read, quote and summarise, never instructions.
-- The ticket actions only reference their own workspace. `createTicketAction` wrote
-  `projectId`, `assigneeId` and `parentId` as they arrived, `updateTicketAction`
-  and `bulkUpdateTicketsAction` connected a project and an assignee unchecked, and
-  `moveTicketAction` read the position of `beforeId` without asking which
-  workspace that ticket belongs to — a foreign ticket's position steered the
-  board. The read side selected the relations without a workspace filter, so the
-  name and the e-mail address of a user who is not a member of this workspace
-  appeared in the tracker and in `GET /api/tickets`. Every reference is now
-  validated against the ticket's workspace before it is written, and the selects
-  are scoped to the workspace column.
 - The AI-autofill action now frames the row context and declares it as data.
   The action sent the row's property values and its title to the model under a
   `Row context:` heading, unframed: that content is workspace content, written
@@ -217,18 +211,22 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   says what the block is: data to quote, never instructions. The frame goes
   around the finished text, and the autofill has no context budget (`maxTokens`
   there is the output budget), so nothing can cut the closing tag off.
-- The AI skills now frame the caller's text and declare it as data. The skills
-  route put the text of the request — the editor selection, up to 8000
-  characters — into the user message without a delimiter, while the system
-  prompts only described the transformation. When the text is a page somebody
-  else wrote, it carries their instructions into the model. The text is now
-  framed with two tags that name the request — `<selection-text id="…">` …
-  `</selection-text id="…">` — with an id that is minted per request, so the
-  text cannot know which tag closes the block; the text that could pass for a
-  tag is removed; and the system prompt says what the block is: data to
-  rewrite, never instructions. The framing happens after the token budget is
-  applied, so the budget can never cut the closing tag off, and the text
-  inside the frame is the same text the budget left.
+- The page tree's "Open in new tab" now passes `noreferrer` as well. The call
+  `window.open(href, "_blank", "noopener")` set `noopener` — so the opened tab
+  cannot reach back through `window.opener` — but left the `Referer` header
+  standing, so the new tab learned the app URL. The gate for new tabs reads
+  the `rel` of the elements and does not look at the feature string of a
+  `window.open`, which is why the place passed it.
+- The ticket actions only reference their own workspace. `createTicketAction` wrote
+  `projectId`, `assigneeId` and `parentId` as they arrived, `updateTicketAction`
+  and `bulkUpdateTicketsAction` connected a project and an assignee unchecked, and
+  `moveTicketAction` read the position of `beforeId` without asking which
+  workspace that ticket belongs to — a foreign ticket's position steered the
+  board. The read side selected the relations without a workspace filter, so the
+  name and the e-mail address of a user who is not a member of this workspace
+  appeared in the tracker and in `GET /api/tickets`. Every reference is now
+  validated against the ticket's workspace before it is written, and the selects
+  are scoped to the workspace column.
 - The compose stack no longer publishes its database on every interface of the
   machine, and it no longer starts it with a password that is written down in
   the file. The port is bound to the loopback, and the password is read from
@@ -236,6 +234,32 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   value is missing. `.env.example` ships the password empty, and a gate
   (`scripts/check-compose-exposure.mjs`) fails when a database is published
   without a loopback address or carries a fixed password.
+- The invitation e-mail no longer interpolates its values unescaped, and its
+  link origin no longer comes from the request. `emailTemplate` wrote the CTA
+  URL into the `href` attribute and the footer into the text of the mail
+  without escaping them, while the origin of that URL was taken from the
+  `Host`/`X-Forwarded-Host` header of the request that asked for the
+  invitation. A caller that sent such a header therefore decided which host
+  the link in the mail pointed at, and the payload of the header could close
+  the attribute and open a tag of its own — in a mail a third party reads. The
+  template now escapes every value it interpolates (the CTA URL in attribute
+  context, the CTA label and the footer in text context), and the origin comes
+  from the configuration only (`APP_URL`, then `NEXT_PUBLIC_APP_URL`).
+  **This is a breaking change for a deployment that does not set `APP_URL`:**
+  its invitation links now point at the local development origin instead of
+  the request host.
+- A stored property pattern can no longer freeze the editor that applies it.
+  The cell validation compiled the pattern a property carries without a
+  backtracking guard, so a workspace admin could store `(a|aa)+` on a TEXT
+  property and every cell of that column was matched against it — on every
+  render, without a cache. Measured, `(a|aa)+$` against 28 `a`s took 25 to
+  36 ms per cell and `(a+)+$` against 24 `a`s took 334 to 505 ms per cell; a
+  column of a hundred cells paid that on every repaint. The guard the formula
+  engine uses now stands in front of a stored pattern as well: a quantified
+  group whose body holds an alternation (`(a|aa)+`) or an inner quantifier
+  (`(a+)+`) is refused. A refused pattern is not applied at all — like a
+  pattern that does not compile — so the constraint is skipped instead of
+  rejecting every value or freezing the tab.
 - An uploaded SVG is no longer served as a document of the app's own origin.
   The upload endpoint accepts `image/svg+xml` and the asset route handed the
   bytes back with that content type and without a `Content-Disposition`, so a
@@ -266,33 +290,6 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   `npm run check:hsts` checks the wiring — it evaluates the real configuration
   and fails when the default sends no header, when `HSTS_MAX_AGE=0` still
   sends one, or when a refused value sends one.
-
-- The invitation e-mail no longer interpolates its values unescaped, and its
-  link origin no longer comes from the request. `emailTemplate` wrote the CTA
-  URL into the `href` attribute and the footer into the text of the mail
-  without escaping them, while the origin of that URL was taken from the
-  `Host`/`X-Forwarded-Host` header of the request that asked for the
-  invitation. A caller that sent such a header therefore decided which host
-  the link in the mail pointed at, and the payload of the header could close
-  the attribute and open a tag of its own — in a mail a third party reads. The
-  template now escapes every value it interpolates (the CTA URL in attribute
-  context, the CTA label and the footer in text context), and the origin comes
-  from the configuration only (`APP_URL`, then `NEXT_PUBLIC_APP_URL`).
-  **This is a breaking change for a deployment that does not set `APP_URL`:**
-  its invitation links now point at the local development origin instead of
-  the request host.
-- A stored property pattern can no longer freeze the editor that applies it.
-  The cell validation compiled the pattern a property carries without a
-  backtracking guard, so a workspace admin could store `(a|aa)+` on a TEXT
-  property and every cell of that column was matched against it — on every
-  render, without a cache. Measured, `(a|aa)+$` against 28 `a`s took 25 to
-  36 ms per cell and `(a+)+$` against 24 `a`s took 334 to 505 ms per cell; a
-  column of a hundred cells paid that on every repaint. The guard the formula
-  engine uses now stands in front of a stored pattern as well: a quantified
-  group whose body holds an alternation (`(a|aa)+`) or an inner quantifier
-  (`(a+)+`) is refused. A refused pattern is not applied at all — like a
-  pattern that does not compile — so the constraint is skipped instead of
-  rejecting every value or freezing the tab.
 - The three secret-redaction lists of the codebase are one list now. The
   observability logger, the error reporter and the env-secret diagnostics each
   carried their own set of secret-shaped field names, and the three had
@@ -345,6 +342,18 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
   with the **page title** in the payload. The three kinds are now entities of
   the existing engine: the export (Art. 15) lists them, a legal hold keeps
   them, and the plan deletes the whole row.
+- The AI skills now frame the caller's text and declare it as data. The skills
+  route put the text of the request — the editor selection, up to 8000
+  characters — into the user message without a delimiter, while the system
+  prompts only described the transformation. When the text is a page somebody
+  else wrote, it carries their instructions into the model. The text is now
+  framed with two tags that name the request — `<selection-text id="…">` …
+  `</selection-text id="…">` — with an id that is minted per request, so the
+  text cannot know which tag closes the block; the text that could pass for a
+  tag is removed; and the system prompt says what the block is: data to
+  rewrite, never instructions. The framing happens after the token budget is
+  applied, so the budget can never cut the closing tag off, and the text
+  inside the frame is the same text the budget left.
 - The notification rows of a removed member no longer outlive the membership.
   The `notification` rows were never deleted anywhere in the tree, and
   `getNotifications(userId)` filters by `userId` alone while the inbox loads
@@ -975,20 +984,6 @@ list marks it as **No access**.
   still in cleartext into their digest, losslessly and idempotently, so an
   invitation that was issued before the change and has not expired still
   works. The migration is a data migration, not a schema change.
-- Every image the repository pulls is now pinned by digest, and a new gate
-  keeps it that way. A tag is a name, not a version: `FROM node:24-alpine` and
-  `image: postgres:16-alpine` resolve to whatever the registry serves at build
-  time, so the same commit can produce an image nobody reviewed — without the
-  repository changing at all. The `Dockerfile` and the compose file already
-  named their images by digest, but the Postgres service of the desktop
-  workflow's payload smoke test still pulled `postgres:16-alpine` by tag; it
-  now names the digest of the image that tag pointed at. The gate
-  (`npm run check:image-pins`, and the test CI runs with it) reads the `FROM`
-  instructions of the `Dockerfile` and the `image:` keys of the compose file
-  and of the workflow services, and fails when one of them has no `sha256`
-  digest behind it. The image this repository publishes itself is exempt: its
-  digest changes with every release, so a digest in the repository would freeze
-  every installation on the release the file was written for.
 - The database backup is sealed and access-restricted. A dump is the most
   secret file this product writes — the `COPY` blocks carry every password
   hash, 2FA seed, OAuth client secret and provider key in cleartext — and it
@@ -1003,6 +998,20 @@ list marks it as **No access**.
   (`npm run backup:restore -- backups/<file>.sql.enc | psql "$DATABASE_URL"`);
   the seal is opened with the same key, and a wrong key or a tampered file
   fails instead of restoring garbage.
+- Every image the repository pulls is now pinned by digest, and a new gate
+  keeps it that way. A tag is a name, not a version: `FROM node:24-alpine` and
+  `image: postgres:16-alpine` resolve to whatever the registry serves at build
+  time, so the same commit can produce an image nobody reviewed — without the
+  repository changing at all. The `Dockerfile` and the compose file already
+  named their images by digest, but the Postgres service of the desktop
+  workflow's payload smoke test still pulled `postgres:16-alpine` by tag; it
+  now names the digest of the image that tag pointed at. The gate
+  (`npm run check:image-pins`, and the test CI runs with it) reads the `FROM`
+  instructions of the `Dockerfile` and the `image:` keys of the compose file
+  and of the workflow services, and fails when one of them has no `sha256`
+  digest behind it. The image this repository publishes itself is exempt: its
+  digest changes with every release, so a digest in the repository would freeze
+  every installation on the release the file was written for.
 - Every link that opens a new tab now carries `rel="noreferrer noopener"`.
   Six of them wrote `noreferrer` alone — five with a literal
   `target="_blank"`, one behind a conditional `target` that a grep for

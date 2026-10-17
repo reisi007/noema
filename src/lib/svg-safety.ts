@@ -284,12 +284,16 @@ function tagsOf(source: string): SvgTag[] {
       const attributeName = source.slice(nameStart, cursor);
       while (cursor < length && isSpace(source.charCodeAt(cursor))) cursor += 1;
       if (source.charCodeAt(cursor) !== 61) {
-        // A valueless attribute (`<svg hidden>`). A stray `/` that is not the
-        // `/>` close consumes no name; advance so the scanner cannot spin.
-        if (cursor === nameStart) cursor += 1;
-        else if (attributeName !== "") {
+        // A valueless attribute (`<svg hidden>`).
+        if (attributeName !== "") {
           attributes.push({ name: attributeName.toLowerCase(), value: "" });
         }
+        // A character that cannot start a name — a stray "/" for example
+        // (`<svg/onload=…>`) — was not consumed. It must not be read a second
+        // time: the scan would stand still and the request would hang. Such a
+        // character is not part of the tag, so the scan continues behind it.
+        if (cursor === nameStart) cursor += 1;
+
         continue;
       }
       cursor += 1; // "="
@@ -350,7 +354,8 @@ export function isSvgSafe(svg: string): boolean {
   // either binary or written in an encoding this scanner does not read: a
   // UTF-16 document interleaves a NUL after every ASCII character, and a
   // browser would decode it as UTF-16 and find the very markup the scanner
-  // did not see. Such a document is refused — the rule is "no script", and a
+   // did not see. Such a document is refused — the rule is "no script", and a
+
   // document the scanner cannot read is not one it can clear.
   if (source.includes("\u0000")) return false;
   if (SOURCE_FORBIDDEN.some((re) => re.test(source))) return false;

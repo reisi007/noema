@@ -28,7 +28,6 @@ import { fileURLToPath } from "node:url";
 // The suite builds a POSIX `pg_dump` shim and asserts POSIX mode bits; neither
 // exists on Windows. The production paths are still exercised on Linux CI.
 const describeBackup = process.platform === "win32" ? describe.skip : describe;
-
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const BACKUP = join(REPO, "scripts", "backup.mjs");
 const RESTORE = join(REPO, "scripts", "backup-restore.mjs");

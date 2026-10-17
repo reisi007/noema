@@ -196,7 +196,6 @@ describe("POST /api/upload — the SVG safety rule (B56)", () => {
     expect(res.status).toBe(415);
     expect(edge.put).not.toHaveBeenCalled();
   });
-
   it("leaves a raster upload alone", async () => {
     const png = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "shot.png", {
       type: "image/png",
@@ -221,5 +220,37 @@ describe("POST /api/upload — the SVG safety rule (B56)", () => {
     const smil = inspectClipboardItem({ mimeType: "image/svg+xml", data: SMIL_SVG }, {});
     expect(smil.accept).toBe(false);
     expect(smil.reason).toBe("unsafe-svg");
+  });
+  /* -------------------------------- the three gaps of the diff review */
+
+  it("refuses an SVG whose declared type carries a parameter", async () => {
+    const res = await POST(
+      uploadRequest(
+        new File([SCRIPT_SVG], "payload.svg", { type: "image/svg+xml; charset=utf-8" }),
+      ),
+    );
+
+    expect(res.status).toBe(415);
+    await expect(res.json()).resolves.toEqual({
+      error: "File rejected by the image safety policy",
+    });
+    expect(edge.put).not.toHaveBeenCalled();
+    expect(edge.assetCreate).not.toHaveBeenCalled();
+  });
+
+  it("refuses an SVG that is not valid UTF-8", async () => {
+    const utf16 = new Uint8Array(SCRIPT_SVG.length * 2);
+    for (let i = 0; i < SCRIPT_SVG.length; i += 1) {
+      utf16[i * 2] = SCRIPT_SVG.charCodeAt(i) & 0xff;
+      utf16[i * 2 + 1] = SCRIPT_SVG.charCodeAt(i) >> 8;
+    }
+
+    const res = await POST(
+      uploadRequest(new File([utf16], "payload.svg", { type: "image/svg+xml" })),
+    );
+
+    expect(res.status).toBe(415);
+    expect(edge.put).not.toHaveBeenCalled();
+    expect(edge.assetCreate).not.toHaveBeenCalled();
   });
 });

@@ -101,7 +101,6 @@ describe("transferOwnershipAction — the owner proves their password (B138)", (
   it("refuses the transfer without the password", async () => {
     db.memberFindUnique.mockResolvedValue({ role: "OWNER" });
     db.memberFindFirst.mockResolvedValue({ id: "m2", role: "MEMBER" });
-
     await expect(transferOwnershipAction("ws-1", "user-2")).resolves.toEqual({
       error: "That password is not correct.",
     });
@@ -112,8 +111,6 @@ describe("transferOwnershipAction — the owner proves their password (B138)", (
     db.memberFindUnique.mockResolvedValue({ role: "OWNER" });
     db.memberFindFirst.mockResolvedValue({ id: "m2", role: "MEMBER" });
     auth.verifyPassword.mockResolvedValue(false);
-
-
     await expect(transferOwnershipAction("ws-1", "user-2", "wrong")).resolves.toEqual({
       error: "That password is not correct.",
     });
@@ -123,7 +120,6 @@ describe("transferOwnershipAction — the owner proves their password (B138)", (
   it("compares the password with the owner's own hash", async () => {
     db.memberFindUnique.mockResolvedValue({ role: "OWNER" });
     db.memberFindFirst.mockResolvedValue({ id: "m2", role: "MEMBER" });
-
     await transferOwnershipAction("ws-1", "user-2", "correct horse");
 
     expect(auth.verifyPassword).toHaveBeenCalledWith("correct horse", "hash-of-the-owner");

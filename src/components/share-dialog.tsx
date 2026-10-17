@@ -337,6 +337,7 @@ export function ShareDialog({
   const [password, setPassword] = useState("");
   const [days, setDays] = useState("");
   const [created, setCreated] = useState<string | null>(null);
+
   const [indexing, setIndexing] = useState(false);
   const [confirmUnpublish, setConfirmUnpublish] = useState(false);
 
@@ -350,6 +351,7 @@ export function ShareDialog({
     getShareLinkStateAction(pageId)
       .then((state) => {
         if (!live) return;
+
         setIndexing(state.indexing);
       })
       .catch(() => {
@@ -422,6 +424,7 @@ export function ShareDialog({
       success: "Unpublished",
       onSuccess: () => {
         setCreated(null);
+
         setIndexing(false);
         onTokenChange(null);
         router.refresh();

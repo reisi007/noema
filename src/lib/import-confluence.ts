@@ -40,8 +40,8 @@
  */
 
 import type { BlockMark, RichBlock } from "./markdown";
-import { underHtmlScanBudget } from "@/lib/html-budget";
 import { HTML_MAX_NESTING } from "@/lib/html-nesting";
+import { underHtmlScanBudget } from "@/lib/html-budget";
 import { stripTags } from "./html-sanitize";
 import { sanitizeHref } from "./validation";
 

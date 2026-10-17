@@ -1,0 +1,15 @@
+[
+  { "preset": "agent-rules" },
+
+  {
+    "rules": {
+      "unverified-commits": {
+        "class": "a commit with no verification evidence",
+        "incident": "the fork's history is upstream's, and a shallow clone would make a whole-history count meaningless",
+        "unit": "commits without a Verify: footer since the epoch",
+        "direction": "ceiling",
+        "count": { "agent_rule": "unverified-commits", "since": "2026-10-30" }
+      }
+    }
+  }
+]
