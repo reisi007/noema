@@ -118,6 +118,46 @@ describe("readZipDirectory()", () => {
     if (read.ok) expect(new TextDecoder().decode(read.bytes)).toBe("# Alpha");
   });
 
+  it("accepts a central-directory digital signature after the declared directory", async () => {
+    const archive = await makeArchive({ "a.md": "ok" });
+    const eocd = archive.length - 22;
+    const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+    const record = new Uint8Array([0x50, 0x4b, 0x05, 0x05, 0x03, 0x00, 1, 2, 3]);
+    const bytes = new Uint8Array(archive.length + record.length);
+    bytes.set(archive.subarray(0, eocd));
+    bytes.set(record, eocd);
+    bytes.set(archive.subarray(eocd), eocd + record.length);
+    expect(readZipDirectory(bytes)).toMatchObject({ ok: true, entries: [{ name: "a.md" }] });
+
+    // A signature with a payload length extending into the EOCD fails closed.
+    bytes[eocd + 4] = 0xff;
+    bytes[eocd + 5] = 0xff;
+    expect(readZipDirectory(bytes)).toEqual({ ok: false, reason: "damaged" });
+  });
+
+  it("ignores digital-signature bytes inside a central-directory filename", async () => {
+    const bytes = new Uint8Array(await makeArchive({ "a-long-name.md": "ok" }));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let offset = 0; offset + 46 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) !== 0x02014b50) continue;
+      const nameLength = view.getUint16(offset + 28, true);
+      expect(nameLength).toBeGreaterThanOrEqual(6);
+      bytes.set([0x50, 0x4b, 0x05, 0x05, 0x03, 0x00], offset + 46);
+      break;
+    }
+    expect(readZipDirectory(bytes)).toMatchObject({ ok: true, entries: [{ name: "PK\u0005\u0005\u0003\u0000-name.md" }] });
+  });
+
+  it("rejects a truncated central-directory digital-signature record", async () => {
+    const archive = await makeArchive({ "a.md": "ok" });
+    const eocd = archive.length - 22;
+    const malformed = new Uint8Array(archive.length + 6);
+    malformed.set(archive.subarray(0, eocd));
+    malformed.set([0x50, 0x4b, 0x05, 0x05, 0x01, 0x00], eocd);
+    malformed.set(archive.subarray(eocd), eocd + 6);
+    expect(readZipDirectory(malformed)).toEqual({ ok: false, reason: "damaged" });
+  });
+
   it("names the format it refuses instead of claiming the file is not an archive", async () => {
     const archive = await makeArchive({ "a.md": "# Alpha" });
 

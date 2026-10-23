@@ -93,6 +93,7 @@ export type ZipEntryRead =
 
 const EOCD_SIGNATURE = 0x06054b50;
 const CENTRAL_SIGNATURE = 0x02014b50;
+const CENTRAL_DIGITAL_SIGNATURE = 0x05054b50;
 const LOCAL_SIGNATURE = 0x04034b50;
 /** The ZIP64 "value does not fit" marker (32-bit fields). */
 const ZIP64_MARKER = 0xffffffff;
@@ -197,7 +198,17 @@ export function readZipDirectory(bytes: Uint8Array): ZipDirectory {
   // directory offset is relative to the start of the archive, not the file.
   // The stub is the difference between where the directory should be and
   // where it is; the same difference applies to every local header offset.
-  const prefix = eocd - (centralOffset + centralSize);
+  // An optional central-directory digital-signature record may follow the
+  // declared directory. Its own length is not included in centralSize.
+  let directoryTrailerLength = 0;
+  for (let offset = eocd - 6; offset >= Math.max(0, eocd - 6 - 0xffff); offset -= 1) {
+    if (view.getUint32(offset, true) !== CENTRAL_DIGITAL_SIGNATURE) continue;
+    const payloadLength = view.getUint16(offset + 4, true);
+    if (offset + 6 + payloadLength !== eocd) continue;
+    directoryTrailerLength = 6 + payloadLength;
+    break;
+  }
+  const prefix = eocd - directoryTrailerLength - (centralOffset + centralSize);
   const start = centralOffset + prefix;
   if (prefix < 0 || start < 0 || start + centralSize > bytes.length) {
     return { ok: false, reason: "damaged" };
