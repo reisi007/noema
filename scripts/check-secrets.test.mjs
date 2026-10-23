@@ -18,13 +18,10 @@
 // and the cases that have to stay green — a documented example and a fixture
 // literal are not credentials.
 //
-// The gate runs over a throwaway repository: each case writes the files, the
-// commits, and then runs the script against it. The gate resolves the
-// repository from its own location, so the script is copied into the
-// throwaway tree — the way a checkout looks.
+// The gate runs over a throwaway repository via its --root option.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,9 +59,6 @@ function gateOver(commits) {
     git("init", "--quiet", "--initial-branch=main");
     git("config", "user.name", "Tester");
     git("config", "user.email", "tester@example.com");
-    mkdirSync(join(dir, "scripts"), { recursive: true });
-    copyFileSync(GATE, join(dir, "scripts", "check-secrets.mjs"));
-
     for (const files of commits) {
       for (const [name, source] of Object.entries(files)) {
         const path = join(dir, name);
@@ -79,19 +73,20 @@ function gateOver(commits) {
       git("commit", "--quiet", "--allow-empty", "-m", "probe");
     }
 
-    return { tree: run(dir, []), history: run(dir, ["--history"]) };
+    return { tree: runRoot(dir, []), history: runRoot(dir, ["--history"]) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
 
-/** Run the gate in the throwaway repository. */
-function run(dir, args) {
+function runRoot(dir, args) {
+  return runGate(["--root", dir, ...args]);
+}
+
+function runGate(args, cwd = process.cwd()) {
   try {
-    const output = execFileSync("node", [join(dir, "scripts", "check-secrets.mjs"), ...args], {
-      cwd: dir,
-      encoding: "utf8",
-      stdio: "pipe",
+    const output = execFileSync("node", [GATE, ...args], {
+      cwd, encoding: "utf8", stdio: "pipe",
     });
     return { code: 0, output };
   } catch (error) {
@@ -172,6 +167,56 @@ if (process.env.VITEST) {
     for (const testCase of CASES) {
       it(testCase.name, () => runCase(testCase));
     }
+    it("rejects a missing --root value", () => {
+      const result = runGate(["--root"]);
+      assert.equal(result.code, 2);
+      assert.match(result.output, /--root requires exactly one directory path/);
+    });
+    it("rejects an option in place of the --root value", () => {
+      const result = runGate(["--root", "--history"]);
+      assert.equal(result.code, 2);
+      assert.match(result.output, /--root requires exactly one directory path/);
+    });
+    it("rejects a non-Git root", () => {
+      const dir = mkdtempSync(join(tmpdir(), "noema-secrets-not-git-"));
+      try {
+        const result = runGate(["--root", dir]);
+        assert.equal(result.code, 2);
+        assert.match(result.output, /root is not a git repository/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+    it("rejects duplicate --root options", () => {
+      const result = runGate(["--root", process.cwd(), "--root", process.cwd()]);
+      assert.equal(result.code, 2);
+      assert.match(result.output, /--root requires exactly one directory path/);
+    });
+    it("rejects unsupported options", () => {
+      const result = runGate(["--unsupported"]);
+      assert.equal(result.code, 2);
+      assert.match(result.output, /unknown option --unsupported/);
+    });
+    it("uses the script's repository as the default root", () => {
+      const result = runGate([], tmpdir());
+      assert.notEqual(result.code, 2, result.output);
+      assert.match(result.output, /secret gate — \d+ tracked file\(s\) scanned/);
+    });
+    it("does not interpret the --root value as a Git ref", () => {
+      const dir = mkdtempSync(join(tmpdir(), "noema-secrets-root-ref-"));
+      try {
+        const git = (...args) => execFileSync("git", args, { cwd: dir, stdio: "pipe" });
+        git("init", "--quiet", "--initial-branch=main");
+        git("config", "user.name", "Tester");
+        git("config", "user.email", "tester@example.com");
+        writeFileSync(join(dir, "clean.txt"), "clean\n");
+        git("add", "clean.txt");
+        git("commit", "--quiet", "-m", "clean");
+        assertAccepted(runGate(["--root", dir, "--history"]));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   });
 } else {
   let failed = 0;

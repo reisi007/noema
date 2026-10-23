@@ -31,13 +31,13 @@
  */
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** The path of the gate itself — the allow lists below are written in it. */
-const SELF = relative(ROOT, fileURLToPath(import.meta.url)).replace(/\\/g, "/");
+const SELF = relative(DEFAULT_ROOT, fileURLToPath(import.meta.url)).replace(/\\/g, "/");
 
 /**
  * Files whose whole point is to contain secret-shaped strings.
@@ -137,7 +137,35 @@ const ALLOWED_IN_TESTS = new Set([
 
 const args = process.argv.slice(2);
 const withHistory = args.includes("--history");
-const ref = args.find((arg) => !arg.startsWith("--")) ?? "HEAD";
+let rootArg;
+let ref;
+for (let i = 0; i < args.length; i += 1) {
+  if (args[i] === "--root") {
+    if (rootArg !== undefined || !args[i + 1] || args[i + 1].startsWith("--")) {
+      console.error("check-secrets: --root requires exactly one directory path");
+      process.exit(2);
+    }
+    rootArg = args[++i];
+  } else if (args[i] === "--history") {
+    continue;
+  } else if (args[i].startsWith("--")) {
+    console.error(`check-secrets: unknown option ${args[i]}`);
+    process.exit(2);
+  } else if (ref === undefined) {
+    ref = args[i];
+  } else {
+    console.error(`check-secrets: unexpected argument ${args[i]}`);
+    process.exit(2);
+  }
+}
+const ROOT = resolve(rootArg ?? DEFAULT_ROOT);
+ref ??= "HEAD";
+try {
+  execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: ROOT, stdio: "pipe" });
+} catch {
+  console.error(`check-secrets: root is not a git repository: ${ROOT}`);
+  process.exit(2);
+}
 
 const rel = (file) => relative(ROOT, file).replace(/\\/g, "/");
 
