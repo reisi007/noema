@@ -244,10 +244,14 @@ async function makeZipFile(): Promise<File> {
   return new File([buffer], "archive.zip", { type: "application/zip" });
 }
 
-function docxForm(): FormData {
+async function docxForm(): Promise<FormData> {
+  const { default: JSZip } = await import("jszip");
+  const zip = new JSZip();
+  zip.file("word/document.xml", "<w:document></w:document>");
+  const bytes = await zip.generateAsync({ type: "uint8array" });
   const form = new FormData();
   form.append("workspaceId", "ws-1");
-  form.append("file", new File([new Uint8Array([1, 2, 3])], "notes.docx"));
+  form.append("file", new File([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], "notes.docx"));
   return form;
 }
 
@@ -312,7 +316,7 @@ describe("R23.6 — mid-import failure rolls back every write", () => {
   it("importDocxAction reports a failed create as an error instead of rejecting, with no residue", async () => {
     mock.fault.failPageCreateAt = 1;
 
-    const result = await importDocxAction(docxForm());
+    const result = await importDocxAction(await docxForm());
 
     expect(result).toEqual({ error: expect.any(String) });
     expect(mock.state.pages).toHaveLength(0);
@@ -346,7 +350,7 @@ describe("ImportResult counts (D23.4)", () => {
   });
 
   it("importDocxAction reports counts", async () => {
-    const result = await importDocxAction(docxForm());
+    const result = await importDocxAction(await docxForm());
 
     expect(result).toMatchObject({ ok: true, counts: { imported: 1, ...ZERO_COUNTS } });
   });
@@ -381,6 +385,32 @@ describe("ImportResult counts (D23.4)", () => {
       counts: { imported: 2, ...ZERO_COUNTS, failed: 1 },
     });
     expect(mock.txCount()).toBeGreaterThan(0);
+  });
+});
+
+describe("DOCX decompression budget", () => {
+  it("rejects actual expansion beyond budget before Mammoth or page creation", async () => {
+    const { default: JSZip } = await import("jszip");
+    const zip = new JSZip();
+    zip.file("word/document.xml", "x".repeat(17 * 1024 * 1024));
+    const bytes = new Uint8Array(await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }));
+    const view = new DataView(bytes.buffer);
+    for (let offset = 0; offset + 46 < bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x02014b50) {
+        view.setUint32(offset + 24, 1, true); // lie about expanded size
+        break;
+      }
+    }
+    const form = new FormData();
+    form.set("workspaceId", "ws-1");
+    form.set("file", new File([bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer], "bomb.docx"));
+    const mammoth = await import("mammoth");
+    const convert = vi.mocked(mammoth.convertToMarkdown);
+    convert.mockClear();
+    const result = await importDocxAction(form);
+    expect(result).toMatchObject({ error: expect.stringContaining("decompression limit") });
+    expect(convert).not.toHaveBeenCalled();
+    expect(mock.state.pages).toHaveLength(0);
   });
 });
 
@@ -547,6 +577,13 @@ describe("B22 — the archive import has a budget", () => {
   it("refuses an archive that under-declares the size of its entry", async () => {
     // The archive claims 16 bytes; the entry really holds 5 MiB.
     const bytes = underDeclare(await zipBytes({ "big.md": "x".repeat(5 * 1024 * 1024) }), 16);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let offset = 0; offset + 30 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x04034b50) {
+        view.setUint32(offset + 22, 16, true);
+        break;
+      }
+    }
 
     const result = await importZipAction(zipForm(bytes));
 

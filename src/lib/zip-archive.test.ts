@@ -168,6 +168,13 @@ describe("readZipEntry()", () => {
 
   it("refuses an entry that under-declares its size — the cap is on the real bytes", async () => {
     const bytes = underDeclare(await makeArchive({ "big.md": "x".repeat(64 * 1024) }), 16);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let offset = 0; offset + 30 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x04034b50) {
+        view.setUint32(offset + 22, 16, true);
+        break;
+      }
+    }
     const directory = readZipDirectory(bytes);
     expect(directory.ok).toBe(true);
     if (!directory.ok) return;
@@ -175,6 +182,90 @@ describe("readZipEntry()", () => {
     expect(directory.entries[0].uncompressedSize).toBe(16);
     const read = readZipEntry(bytes, directory.entries[0], 1024);
     expect(read).toEqual({ ok: false, reason: "too-large" });
+  });
+
+  it("refuses a local compression method that disagrees with the central directory", async () => {
+    const bytes = new Uint8Array(await makeArchive({ "a.md": "# Alpha" }));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let offset = 0; offset + 30 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x04034b50) {
+        view.setUint16(offset + 8, 0, true); // central directory still says DEFLATE
+        break;
+      }
+    }
+    const directory = readZipDirectory(bytes);
+    expect(directory.ok).toBe(true);
+    if (!directory.ok) return;
+    expect(readZipEntry(bytes, directory.entries[0], 1024)).toEqual({ ok: false, reason: "unreadable" });
+  });
+
+  it("compares raw local and central names before path normalization", async () => {
+    const bytes = new Uint8Array(await makeArchive({ "folder/../evil.md": "x" }));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let central = -1;
+    for (let offset = 0; offset + 46 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x02014b50) { central = offset; break; }
+    }
+    expect(central).toBeGreaterThanOrEqual(0);
+    const localNameLength = view.getUint16(26, true);
+    // Change central `folder/../evil.md` to `folder/./../evil.md` would
+    // alter lengths, so use a same-length sibling that normalizes identically.
+    const nameStart = central + 46;
+    bytes[nameStart] = "g".charCodeAt(0);
+    // Both names resolve to the same normalized path; raw identity must win.
+    const directory = readZipDirectory(bytes);
+    expect(directory.ok).toBe(true);
+    if (!directory.ok) return;
+    expect(readZipEntry(bytes, directory.entries[0], 1024)).toEqual({ ok: false, reason: "unreadable" });
+    expect(localNameLength).toBe(view.getUint16(central + 28, true));
+  });
+
+  it("accepts a bit-3 descriptor with zero local sizes and rejects mismatched descriptor sizes", async () => {
+    const generated = await new JSZip().file("a.md", "hello").generateAsync({
+      type: "uint8array", compression: "DEFLATE", streamFiles: true,
+    });
+    const bytes = new Uint8Array(generated);
+    const view = new DataView(bytes.buffer);
+    let local = -1;
+    for (let offset = 0; offset + 30 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x04034b50) { local = offset; break; }
+    }
+    expect(local).toBeGreaterThanOrEqual(0);
+    const flags = view.getUint16(local + 6, true);
+    expect(flags & 0x0008).toBeTruthy();
+    view.setUint32(local + 18, 0, true);
+    view.setUint32(local + 22, 0, true);
+    const dataStart = local + 30 + view.getUint16(local + 26, true) + view.getUint16(local + 28, true);
+    const directory = readZipDirectory(bytes);
+    expect(directory.ok).toBe(true);
+    if (!directory.ok) return;
+    expect(readZipEntry(bytes, directory.entries[0], 1024)).toEqual({ ok: true, bytes: new TextEncoder().encode("hello") });
+
+    // ZIP also permits a descriptor without its optional signature. Remove
+    // the signature and adjust the EOCD's central-directory offset.
+    const signedDescriptor = dataStart + directory.entries[0].compressedSize;
+    const unsignedBytes = new Uint8Array(bytes.length - 4);
+    unsignedBytes.set(bytes.subarray(0, signedDescriptor));
+    unsignedBytes.set(bytes.subarray(signedDescriptor + 4), signedDescriptor);
+    const unsignedView = new DataView(unsignedBytes.buffer);
+    let unsignedEocd = -1;
+    for (let offset = unsignedBytes.length - 22; offset >= 0; offset -= 1) {
+      if (unsignedView.getUint32(offset, true) === 0x06054b50) { unsignedEocd = offset; break; }
+    }
+    expect(unsignedEocd).toBeGreaterThanOrEqual(0);
+    unsignedView.setUint32(unsignedEocd + 16, unsignedView.getUint32(unsignedEocd + 16, true) - 4, true);
+    const unsignedDirectory = readZipDirectory(unsignedBytes);
+    expect(unsignedDirectory.ok).toBe(true);
+    if (unsignedDirectory.ok) {
+      expect(readZipEntry(unsignedBytes, unsignedDirectory.entries[0], 1024)).toEqual({ ok: true, bytes: new TextEncoder().encode("hello") });
+    }
+
+    const descriptorBytes = new Uint8Array(bytes);
+    const descriptorView = new DataView(descriptorBytes.buffer);
+    const descriptor = dataStart + directory.entries[0].compressedSize;
+    const sizeOffset = descriptorView.getUint32(descriptor, true) === 0x08074b50 ? descriptor + 8 : descriptor + 4;
+    descriptorView.setUint32(sizeOffset, directory.entries[0].compressedSize + 1, true);
+    expect(readZipEntry(descriptorBytes, directory.entries[0], 1024)).toEqual({ ok: false, reason: "unreadable" });
   });
 
   it("refuses an entry whose stored data is larger than the limit", async () => {

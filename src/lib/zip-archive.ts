@@ -44,6 +44,8 @@ export interface ZipEntry {
   compressedSize: number;
   /** The uncompressed size, as declared by the archive. */
   uncompressedSize: number;
+  /** The CRC-32, as declared by the archive. */
+  crc32: number;
   /**
    * The offset of the entry's local file header **within the buffer**.
    *
@@ -54,6 +56,10 @@ export interface ZipEntry {
   localOffset: number;
   /** True for a directory entry (MS-DOS attribute or a trailing slash). */
   dir: boolean;
+  /** General-purpose flags from the central directory. */
+  flags: number;
+  /** Raw central-directory name bytes, retained to validate local headers. */
+  rawName: Uint8Array;
 }
 
 /** Why an archive could not be read at all. */
@@ -198,6 +204,7 @@ export function readZipDirectory(bytes: Uint8Array): ZipDirectory {
 
     const flags = view.getUint16(cursor + 8, true);
     const method = view.getUint16(cursor + 10, true);
+    const crc32 = view.getUint32(cursor + 16, true);
     const compressedSize = view.getUint32(cursor + 20, true);
     const uncompressedSize = view.getUint32(cursor + 24, true);
     const nameLength = view.getUint16(cursor + 28, true);
@@ -217,12 +224,16 @@ export function readZipDirectory(bytes: Uint8Array): ZipDirectory {
 
     const nameStart = cursor + 46;
     if (nameStart + nameLength > bytes.length) return { ok: false, reason: "damaged" };
-    const name = decodeEntryName(bytes.subarray(nameStart, nameStart + nameLength));
+    const rawName = bytes.slice(nameStart, nameStart + nameLength);
+    const name = decodeEntryName(rawName);
     entries.push({
       name,
       method,
+      flags,
+      rawName,
       compressedSize,
       uncompressedSize,
+      crc32,
       // The archive declares the offset relative to the start of the archive;
       // the stub of a self-extracting archive is added here.
       localOffset: localOffset + prefix,
@@ -256,11 +267,45 @@ export function readZipEntry(
   }
 
   const method = view.getUint16(offset + 8, true);
+  const flags = view.getUint16(offset + 6, true);
   const nameLength = view.getUint16(offset + 26, true);
   const extraLength = view.getUint16(offset + 28, true);
   const dataStart = offset + 30 + nameLength + extraLength;
+  if (dataStart > bytes.length || method !== entry.method || flags !== entry.flags) {
+    return { ok: false, reason: "unreadable" };
+  }
+  const localName = bytes.subarray(offset + 30, offset + 30 + nameLength);
+  if (localName.length !== entry.rawName.length || localName.some((byte, index) => byte !== entry.rawName[index])) {
+    return { ok: false, reason: "unreadable" };
+  }
+  // Without bit 3 the local header is authoritative too; contradictory sizes
+  // make the archive ambiguous to readers that choose either header.
+  if (!(flags & 0x0008) && (
+    view.getUint32(offset + 18, true) !== entry.compressedSize ||
+    view.getUint32(offset + 22, true) !== entry.uncompressedSize
+  )) return { ok: false, reason: "unreadable" };
   const dataEnd = dataStart + entry.compressedSize;
   if (dataEnd > bytes.length) return { ok: false, reason: "unreadable" };
+
+  // With bit 3 set, sizes live in the data descriptor rather than the local
+  // header. Validate them when present so contradictory records are rejected.
+  if (flags & 0x0008) {
+    const descriptor = dataEnd;
+    const hasSignature = descriptor + 4 <= bytes.length && view.getUint32(descriptor, true) === 0x08074b50;
+    const unsignedMatches = descriptor + 12 <= bytes.length &&
+      view.getUint32(descriptor, true) === entry.crc32 &&
+      view.getUint32(descriptor + 4, true) === entry.compressedSize &&
+      view.getUint32(descriptor + 8, true) === entry.uncompressedSize;
+    const signedMatches = hasSignature && descriptor + 16 <= bytes.length &&
+      view.getUint32(descriptor + 4, true) === entry.crc32 &&
+      view.getUint32(descriptor + 8, true) === entry.compressedSize &&
+      view.getUint32(descriptor + 12, true) === entry.uncompressedSize;
+    // A CRC equal to the optional signature is ambiguous by its first word;
+    // accept whichever complete descriptor matches the central directory.
+    if (!unsignedMatches && !signedMatches) {
+      return { ok: false, reason: "unreadable" };
+    }
+  }
 
   const compressed = bytes.subarray(dataStart, dataEnd);
 

@@ -27,6 +27,13 @@ import { importCsvAction } from "./database";
 
 const TRELLO_COLORS = ["gray", "blue", "green", "yellow", "orange", "purple", "pink", "red"];
 
+// DOCX is a ZIP container. Bound both parser work and actual expansion before
+// Mammoth sees the bytes; declared ZIP sizes are not trusted for this check.
+const DOCX_MAX_INPUT_BYTES = 1 * 1024 * 1024;
+const DOCX_MAX_ENTRIES = 256;
+const DOCX_MAX_ENTRY_BYTES = 8 * 1024 * 1024;
+const DOCX_MAX_TOTAL_BYTES = 16 * 1024 * 1024;
+
 /**
  * B71 / R23.6: every multi-record import runs inside one `prisma.$transaction`
  * so a mid-import failure rolls back instead of leaving partial pages.
@@ -136,6 +143,9 @@ export async function importDocxAction(formData: FormData): Promise<ImportResult
   if (!isUploadAllowed(file, UPLOAD_ALLOW.docx)) {
     return { error: `Unsupported file type: ${file.name}. Expected a .docx document.` };
   }
+  if (file.size > DOCX_MAX_INPUT_BYTES) {
+    return { error: "That Word document exceeds the import size limit." };
+  }
   const access = await getWorkspaceAccess(user.id, workspaceId);
   if (!access || !canEditContent(access.role)) {
     return { error: "You do not have permission to import." };
@@ -151,6 +161,26 @@ export async function importDocxAction(formData: FormData): Promise<ImportResult
   });
   if (!workspace) return { error: "Workspace not found." };
 
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const directory = readZipDirectory(buffer);
+  if (!directory.ok || directory.entries.length === 0 || directory.entries.length > DOCX_MAX_ENTRIES) {
+    return { error: "That file is not a readable .docx document." };
+  }
+  let expandedTotal = 0;
+  for (const entry of directory.entries) {
+    if (entry.dir) continue;
+    const expanded = readZipEntry(buffer, entry, DOCX_MAX_ENTRY_BYTES);
+    if (!expanded.ok) {
+      return { error: expanded.reason === "too-large"
+        ? "That Word document exceeds the decompression limit."
+        : "That file is not a readable .docx document." };
+    }
+    expandedTotal += expanded.bytes.byteLength;
+    if (expandedTotal > DOCX_MAX_TOTAL_BYTES) {
+      return { error: "That Word document exceeds the decompression limit." };
+    }
+  }
+
   const mod = await import("mammoth");
   const convert =
     (mod as { convertToMarkdown?: (input: { buffer: Buffer }) => Promise<{ value: string }> })
@@ -159,7 +189,6 @@ export async function importDocxAction(formData: FormData): Promise<ImportResult
       .default?.convertToMarkdown;
   if (!convert) return { error: "Word import is unavailable." };
 
-  const buffer = Buffer.from(await file.arrayBuffer());
   const result = await convert({ buffer }).catch(() => null);
   if (!result) return { error: "That file is not a readable .docx document." };
 

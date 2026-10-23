@@ -35,6 +35,11 @@ in [`docs/MISSING_FEATURES.md`](./docs/MISSING_FEATURES.md).
 
 ### Security
 
+- DOCX imports now cap compressed input, entry count, per-entry expansion, and
+  total expansion before Mammoth runs. Preflight also rejects disagreement
+  between ZIP local headers and the central directory (including compression
+  method, flags, raw entry name, and sizes/descriptors), preventing Mammoth
+  from selecting a different decoder or entry layout from the bounded reader.
 - The dependency tree is audited in CI, and one advisory chain is gone. The
   lockfile carried `mammoth` → `argparse` 1.0.10 → `sprintf-js` 1.0.3, and
   `sprintf-js` 1.0.3 carries GHSA-hp3w-g68c-fv3c (a denial of service through
