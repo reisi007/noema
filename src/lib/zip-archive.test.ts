@@ -168,6 +168,10 @@ describe("readZipEntry()", () => {
 
   it("refuses an entry that under-declares its size — the cap is on the real bytes", async () => {
     const bytes = underDeclare(await makeArchive({ "big.md": "x".repeat(64 * 1024) }), 16);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let offset = 0; offset + 30 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x04034b50) { view.setUint32(offset + 22, 16, true); break; }
+    }
     const directory = readZipDirectory(bytes);
     expect(directory.ok).toBe(true);
     if (!directory.ok) return;
@@ -175,6 +179,23 @@ describe("readZipEntry()", () => {
     expect(directory.entries[0].uncompressedSize).toBe(16);
     const read = readZipEntry(bytes, directory.entries[0], 1024);
     expect(read).toEqual({ ok: false, reason: "too-large" });
+  });
+
+  it("rejects local-vs-central method and name mismatches", async () => {
+    const bytes = new Uint8Array(await makeArchive({ "a.md": "hello" }));
+    const view = new DataView(bytes.buffer);
+    let central = -1;
+    for (let offset = 0; offset + 46 <= bytes.length; offset++) if (view.getUint32(offset, true) === 0x02014b50) { central = offset; break; }
+    view.setUint16(8, 0, true);
+    const directory = readZipDirectory(bytes);
+    expect(directory.ok).toBe(true);
+    if (!directory.ok) return;
+    expect(readZipEntry(bytes, directory.entries[0], 1024)).toEqual({ ok: false, reason: "unreadable" });
+    view.setUint16(8, 8, true);
+    bytes[central + 46] ^= 1;
+    const changed = readZipDirectory(bytes);
+    expect(changed.ok).toBe(true);
+    if (changed.ok) expect(readZipEntry(bytes, changed.entries[0], 1024)).toEqual({ ok: false, reason: "unreadable" });
   });
 
   it("refuses an entry whose stored data is larger than the limit", async () => {
