@@ -156,16 +156,26 @@ function decodeAttr(value: string): string {
     .replace(/&quot;/g, '"');
 }
 
-/** The sanitised iframe `src`, or `null` when the embed is not a frame. */
-function embedSrc(html: string | null): string | null {
-  if (html === null) return null;
-  // The stored value is untrusted: it can arrive from an older write path or
-  // from the MCP `append_blocks` tool, not only from the creation-time
-  // resolver. Re-run the same allowlist at render time, so an arbitrary host
-  // can never be framed in the app origin.
-  const safe = sanitizeEmbedHtml(html, { allowedHosts: OEMBED_ALLOWED_HOSTS });
-  if (safe === null) return null;
-  const match = /<iframe\b[^>]*\bsrc="([^"]+)"/i.exec(safe);
+/**
+ * The `src` the stored embed may be framed with, or `null` when the stored
+ * markup is not a frame or does not pass the oEmbed allowlist.
+ *
+ * The stored markup is untrusted: the allowlist only ran when the card was
+ * created, while the write paths (the server actions, the MCP
+ * `append_blocks` tool) store it as it is. So the stored value goes through
+ * the same sanitiser here, and only the `src` of the frame it allows may be
+ * framed.
+ */
+function embedSrc(html: unknown): string | null {
+  if (typeof html !== "string" || html === "") return null;
+  // The stored markup is the sanitiser's own output, so its attributes still
+  // carry the entities that sanitiser emitted: undo them before the value is
+  // read again, and undo the new ones on the `src` that is framed.
+  const sanitized = sanitizeEmbedHtml(decodeAttr(html), {
+    allowedHosts: OEMBED_ALLOWED_HOSTS,
+  });
+  if (sanitized === null) return null;
+  const match = /<iframe\b[^>]*\bsrc="([^"]+)"/i.exec(sanitized);
   return match ? decodeAttr(match[1]) : null;
 }
 
@@ -457,7 +467,7 @@ export function BookmarkView({ node, updateAttributes, deleteNode, locale }: Nod
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const host = (node.attrs.host as string) || (url ? hostOf(url) : "");
-  const embedUrl = embedSrc((node.attrs.embed as string | null) ?? null);
+  const embedUrl = embedSrc(node.attrs.embed);
 
   const submit = async () => {
     const origin = typeof window === "undefined" ? "" : window.location.origin;

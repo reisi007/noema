@@ -91,6 +91,16 @@ const pinnedPattern: TestProperty = {
   type: "TEXT",
   config: { pattern: "^(\\d+)-(\\d+)$" },
 };
+/** Consecutive quantifiers: the pattern holds no group at all. */
+const polynomialPattern: TestProperty = {
+  id: "poly", name: "Poly", type: "TEXT", config: { pattern: "a*a*a*a*a*a*a*a*a*b" },
+};
+const cheapQuantifierPattern: TestProperty = {
+  id: "cheap", name: "Cheap", type: "TEXT", config: { pattern: "a*a*b" },
+};
+const tailPattern: TestProperty = {
+  id: "tail", name: "Tail", type: "TEXT", config: { pattern: "z$" },
+};
 const status: TestProperty = {
   id: "status",
   name: "Status",
@@ -322,6 +332,23 @@ describe("validateCell — pattern", () => {
   it("still applies a quantified group whose body is a character class", () => {
     expect(validateCell(classPattern, "a").ok).toBe(true);
     expect(codes(validateCell(classPattern, "c"))).toEqual(["PATTERN"]);
+  });
+
+  it("ignores consecutive quantifiers that overrun the budget", () => {
+    const started = Date.now();
+    const result = validateCell(polynomialPattern, "a".repeat(26));
+    expect(result.ok).toBe(true);
+    expect(Date.now() - started).toBeLessThan(100);
+  });
+
+  it("still applies consecutive quantifiers that fit the budget", () => {
+    expect(validateCell(cheapQuantifierPattern, "aab").ok).toBe(true);
+    expect(codes(validateCell(cheapQuantifierPattern, "aa"))).toEqual(["PATTERN"]);
+  });
+
+  it("cuts the cell text off before the test", () => {
+    const long = `${"a".repeat(20_000)}z`;
+    expect(codes(validateCell(tailPattern, long))).toEqual(["PATTERN"]);
   });
 });
 
