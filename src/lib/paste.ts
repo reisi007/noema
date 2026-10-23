@@ -28,6 +28,7 @@ import type { Mark, RichNode } from "@/lib/blocks";
 import { underHtmlScanBudget } from "@/lib/html-budget";
 import { HTML_MAX_NESTING } from "@/lib/html-nesting";
 import { safeUrl, sanitizeHtml } from "@/lib/html-sanitize";
+import { markColor } from "@/lib/mark-colors";
 import { safeHref } from "@/lib/markdown";
 import { looksLikeMatrix, matrixToTableBlocks, parseClipboardMatrix } from "@/lib/paste-matrix";
 
@@ -178,10 +179,12 @@ function styleMarks(style: string | undefined): Mark[] {
     if (idx > 0) declarations[part.slice(0, idx).trim().toLowerCase()] = part.slice(idx + 1).trim();
   }
   const color = declarations["color"];
-  if (color) marks.push({ type: "textStyle", attrs: { color } });
+  const textColor = color ? markColor(color) : null;
+  if (textColor) marks.push({ type: "textStyle", attrs: { color: textColor } });
   const background = declarations["background-color"];
   if (background && background !== "transparent" && background !== "inherit") {
-    marks.push({ type: "highlight", attrs: { color: background } });
+    const highlight = markColor(background);
+    marks.push(highlight ? { type: "highlight", attrs: { color: highlight } } : { type: "highlight" });
   }
   const weight = declarations["font-weight"];
   if (weight && (weight === "bold" || weight === "bolder" || Number(weight) >= 600)) {
@@ -210,12 +213,12 @@ function extraMarks(el: ElementNode): Mark[] {
     }
     case "mark": {
       const background = /background-color\s*:\s*([^;]+)/i.exec(el.attrs.style ?? "")?.[1]?.trim();
-      if (background) marks.push({ type: "highlight", attrs: { color: background } });
-      else marks.push({ type: "highlight" });
+      const highlight = background ? markColor(background) : null;
+      marks.push(highlight ? { type: "highlight", attrs: { color: highlight } } : { type: "highlight" });
       break;
     }
     case "font": {
-      const color = el.attrs.color;
+      const color = markColor(el.attrs.color);
       if (color) marks.push({ type: "textStyle", attrs: { color } });
       break;
     }

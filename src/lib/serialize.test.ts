@@ -235,6 +235,23 @@ describe("html export - href scheme and style allowlist", () => {
     expect(injected).toBe("<p>coloured</p>");
     expect(docToHtml(colourDoc("url(javascript:alert(1))"))).toBe("<p>coloured</p>");
   });
+
+  it("keeps valid highlight colours and omits invalid stored colours", () => {
+    const highlightDoc = (color: string) => ({
+      type: "doc",
+      content: [{
+        type: "paragraph",
+        content: [{ type: "text", text: "highlighted", marks: [{ type: "highlight", attrs: { color } }] }],
+      }],
+    });
+
+    expect(docToHtml(highlightDoc("var(--tag-blue-bg)"))).toBe(
+      '<p><mark style="background-color:var(--tag-blue-bg)">highlighted</mark></p>',
+    );
+    expect(docToHtml(highlightDoc("red; background-image: url(https://evil.test)"))).toBe(
+      "<p><mark>highlighted</mark></p>",
+    );
+  });
 });
 
 /**

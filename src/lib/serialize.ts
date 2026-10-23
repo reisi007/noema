@@ -7,7 +7,7 @@
 
 import { docToMarkdown, type BlockDoc, type RichNode } from "./blocks";
 import { formatCaption } from "./code-block";
-import { TAG_SEQUENCE } from "./palette";
+import { markColor } from "./mark-colors";
 import { DEFAULT_PULL_QUOTE_SIZE, isPullQuoteSize } from "./pull-quote";
 import { sanitizeHref } from "./validation";
 
@@ -272,24 +272,6 @@ function escapeHtml(value: string): string {
  * foreground tokens (`var(--tag-<hue>-fg)`) the editor writes, and a plain
  * hex value for a document stored before the token migration.
  */
-const ALLOWED_STYLE_COLORS = new Set(TAG_SEQUENCE.map((hue) => `var(--tag-${hue}-fg)`));
-
-/** `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa` - the legacy stored colour form. */
-const HEX_COLOR = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
-
-/**
- * The colour a `textStyle` mark may render, or `null` when the value is not
- * on the allowlist. A stored mark can therefore never push a second CSS
- * declaration (or a `url()`) into the exported `style` attribute.
- */
-export function styleColor(raw: unknown): string | null {
-  if (typeof raw !== "string") return null;
-  const value = raw.trim();
-  if (!value) return null;
-  if (ALLOWED_STYLE_COLORS.has(value) || HEX_COLOR.test(value)) return value;
-  return null;
-}
-
 function inlineHtml(nodes: RichNode[] = []): string {
   return nodes
     .map((node) => {
@@ -307,11 +289,16 @@ function inlineHtml(nodes: RichNode[] = []): string {
         else if (mark.type === "underline") html = `<u>${html}</u>`;
         else if (mark.type === "strike") html = `<s>${html}</s>`;
         else if (mark.type === "code") html = `<code>${html}</code>`;
-        else if (mark.type === "highlight") html = `<mark>${html}</mark>`;
+        else if (mark.type === "highlight") {
+          const color = markColor(mark.attrs?.color);
+          html = color
+            ? `<mark style="background-color:${escapeHtml(color)}">${html}</mark>`
+            : `<mark>${html}</mark>`;
+        }
         else if (mark.type === "textStyle" && mark.attrs?.color) {
           // Only an allowlisted colour reaches the `style` attribute; the text
           // itself always survives.
-          const color = styleColor(mark.attrs.color);
+          const color = markColor(mark.attrs.color);
           if (color) html = `<span style="color:${escapeHtml(color)}">${html}</span>`;
         } else if (mark.type === "link" && mark.attrs?.href) {
           // `sanitizeHref` is the shared scheme allowlist: a `javascript:`

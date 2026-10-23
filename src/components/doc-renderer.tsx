@@ -7,6 +7,7 @@ import { tagClass, tagStyle, type TagHue } from "@/lib/design-tokens";
 import { embedMeta, resolveEmbed } from "@/lib/embeds";
 import { externalImageSrc } from "@/lib/external-image";
 import { t } from "@/lib/i18n";
+import { markColor } from "@/lib/mark-colors";
 import { alignOf, alignStyle } from "@/lib/media";
 import {
   blocksToQuote,
@@ -18,7 +19,6 @@ import {
 import { buildTocItems, tocAnchorId, type TocHeading, type TocItem } from "@/lib/toc";
 import { truncateMiddle } from "@/lib/truncate";
 import { cn } from "@/lib/utils";
-import { styleColor } from "@/lib/serialize";
 import { sanitizeHref } from "@/lib/validation";
 
 /**
@@ -63,16 +63,16 @@ function applyMarks(node: PMNode, children: ReactNode, key: string): ReactNode {
         );
         break;
       case "highlight": {
-        const color = styleColor(mark.attrs?.color);
+        const color = markColor(mark.attrs?.color);
         element = (
-          <mark key={key} style={color ? { background: color } : undefined}>
+          <mark key={key} style={color ? { backgroundColor: color } : undefined}>
             {element}
           </mark>
         );
         break;
       }
       case "textStyle": {
-        const color = styleColor(mark.attrs?.color);
+        const color = markColor(mark.attrs?.color);
         element = color ? (
           <span key={key} style={{ color }}>
             {element}
