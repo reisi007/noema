@@ -144,6 +144,18 @@ describe("readZipDirectory()", () => {
     }
     expect(readZipDirectory(encrypted)).toEqual({ ok: false, reason: "encrypted" });
   });
+
+  it("rejects central entries whose variable data exceeds the declared directory", async () => {
+    const bytes = new Uint8Array(await makeArchive({ "a.md": "ok" }));
+    const view = new DataView(bytes.buffer);
+    for (let offset = 0; offset + 46 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x02014b50) {
+        view.setUint16(offset + 30, 0xffff, true);
+        break;
+      }
+    }
+    expect(readZipDirectory(bytes)).toEqual({ ok: false, reason: "damaged" });
+  });
 });
 
 describe("readZipEntry()", () => {
@@ -205,5 +217,21 @@ describe("readZipEntry()", () => {
     if (!directory.ok) return;
     const read = readZipEntry(bytes, directory.entries[0], 1024);
     expect(read).toEqual({ ok: false, reason: "too-large" });
+  });
+
+  it.each(["STORE", "DEFLATE"] as const)("rejects %s data with an incorrect CRC", async (compression) => {
+    const bytes = new Uint8Array(await makeArchive({ "a.md": "hello" }, compression));
+    const view = new DataView(bytes.buffer);
+    let local = -1;
+    let central = -1;
+    for (let offset = 0; offset + 46 <= bytes.length; offset += 1) {
+      if (view.getUint32(offset, true) === 0x04034b50) local = offset;
+      if (view.getUint32(offset, true) === 0x02014b50) { central = offset; break; }
+    }
+    view.setUint32(local + 14, view.getUint32(local + 14, true) ^ 1, true);
+    view.setUint32(central + 16, view.getUint32(central + 16, true) ^ 1, true);
+    const directory = readZipDirectory(bytes);
+    expect(directory.ok).toBe(true);
+    if (directory.ok) expect(readZipEntry(bytes, directory.entries[0], 1024)).toEqual({ ok: false, reason: "unreadable" });
   });
 });

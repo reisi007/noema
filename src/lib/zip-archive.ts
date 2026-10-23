@@ -102,6 +102,18 @@ const ZIP64_MARKER16 = 0xffff;
 const METHOD_STORE = 0;
 const METHOD_DEFLATE = 8;
 
+/** ZIP's reflected CRC-32 (polynomial 0xedb88320). */
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 /** The bit that marks an encrypted entry. */
 const FLAG_ENCRYPTED = 0x0001;
 
@@ -194,7 +206,8 @@ export function readZipDirectory(bytes: Uint8Array): ZipDirectory {
   const entries: ZipEntry[] = [];
   let cursor = start;
   for (let index = 0; index < totalEntries; index += 1) {
-    if (cursor + 46 > bytes.length) return { ok: false, reason: "damaged" };
+    const directoryEnd = start + centralSize;
+    if (cursor + 46 > directoryEnd) return { ok: false, reason: "damaged" };
     if (view.getUint32(cursor, true) !== CENTRAL_SIGNATURE) {
       return { ok: false, reason: "damaged" };
     }
@@ -220,7 +233,8 @@ export function readZipDirectory(bytes: Uint8Array): ZipDirectory {
     }
 
     const nameStart = cursor + 46;
-    if (nameStart + nameLength > bytes.length) return { ok: false, reason: "damaged" };
+    const entryEnd = nameStart + nameLength + extraLength + commentLength;
+    if (entryEnd > directoryEnd) return { ok: false, reason: "damaged" };
     const rawName = bytes.slice(nameStart, nameStart + nameLength);
     const name = decodeEntryName(rawName);
     entries.push({
@@ -238,8 +252,10 @@ export function readZipDirectory(bytes: Uint8Array): ZipDirectory {
       // signals the reference reader uses.
       dir: (view.getUint32(cursor + 38, true) & 0x0010) !== 0 || name.endsWith("/"),
     });
-    cursor = nameStart + nameLength + extraLength + commentLength;
+    cursor = entryEnd;
   }
+  // Do not silently accept unparsed bytes inside the declared directory.
+  if (cursor !== start + centralSize) return { ok: false, reason: "damaged" };
   return { ok: true, entries };
 }
 
@@ -271,7 +287,7 @@ export function readZipEntry(
   if (dataStart > bytes.length || method !== entry.method || flags !== entry.flags) return { ok: false, reason: "unreadable" };
   const localName = bytes.subarray(offset + 30, offset + 30 + nameLength);
   if (localName.length !== entry.rawName.length || localName.some((byte, index) => byte !== entry.rawName[index])) return { ok: false, reason: "unreadable" };
-  if (!(flags & 0x0008) && (view.getUint32(offset + 18, true) !== entry.compressedSize || view.getUint32(offset + 22, true) !== entry.uncompressedSize)) return { ok: false, reason: "unreadable" };
+  if (!(flags & 0x0008) && (view.getUint32(offset + 14, true) !== entry.crc32 || view.getUint32(offset + 18, true) !== entry.compressedSize || view.getUint32(offset + 22, true) !== entry.uncompressedSize)) return { ok: false, reason: "unreadable" };
   const dataEnd = dataStart + entry.compressedSize;
   if (dataEnd > bytes.length) return { ok: false, reason: "unreadable" };
 
@@ -288,6 +304,7 @@ export function readZipEntry(
   if (method === METHOD_STORE) {
     // A stored entry is not compressed: its size is the size of the data.
     if (compressed.length > limit) return { ok: false, reason: "too-large" };
+    if (crc32(compressed) !== entry.crc32) return { ok: false, reason: "unreadable" };
     return { ok: true, bytes: compressed.slice() };
   }
   if (method !== METHOD_DEFLATE) {
@@ -297,7 +314,9 @@ export function readZipEntry(
 
   try {
     const inflated = inflateRawSync(compressed, { maxOutputLength: limit });
-    return { ok: true, bytes: new Uint8Array(inflated) };
+    const output = new Uint8Array(inflated.buffer, inflated.byteOffset, inflated.byteLength);
+    if (crc32(output) !== entry.crc32) return { ok: false, reason: "unreadable" };
+    return { ok: true, bytes: output };
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code === "ERR_BUFFER_TOO_LARGE") return { ok: false, reason: "too-large" };
