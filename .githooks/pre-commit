@@ -1,4 +1,16 @@
 #!/bin/sh
+
+# Agent-rule gates — the preset from ratchet.
+if command -v ratchet >/dev/null 2>&1; then
+  RATCHET_BIN=ratchet
+elif [ -x "$HOME/.local/bin/ratchet" ]; then
+  RATCHET_BIN="$HOME/.local/bin/ratchet"
+else
+  RATCHET_BIN=
+fi
+if [ -n "$RATCHET_BIN" ]; then
+  "$RATCHET_BIN" check --tier fast -q || exit 1
+fi
 # Noema pre-commit hook — an opt-in convenience, NOT the check.
 #
 # It does not run in a fresh clone: `core.hooksPath` is a local Git setting, so
