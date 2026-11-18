@@ -85,6 +85,9 @@ async function renderPage() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // The SP URLs come from the configured public origin, never from an
+  // untrusted Host header.
+  vi.stubEnv("APP_URL", "https://app.example.com");
   auth.requireUser.mockResolvedValue({ id: "u1", locale: "en" });
   queries.getWorkspaceBySlug.mockResolvedValue({ id: "ws-1", name: "Acme", slug: "acme" });
   permissions.getWorkspaceAccess.mockResolvedValue({ role: "ADMIN" });
