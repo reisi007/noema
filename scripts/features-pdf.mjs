@@ -66,6 +66,7 @@ const CHAPTERS = [
     areas: [
       "Editor",
       "Editor blocks",
+      "Diagrams",
       "Block menu",
       "Undo / redo",
       "Backlinks",
@@ -146,6 +147,7 @@ const CHAPTERS = [
       "An HTTP API, OAuth apps, signed webhooks, bring-your-own-model AI, importers, and the settings that hold it together.",
     areas: [
       "Public API",
+      "MCP",
       "OAuth apps",
       "Webhooks",
       "Webhook log",

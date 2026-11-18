@@ -37,6 +37,9 @@ const RS = "\u001e";
 
 const HUMANS = new Map([
   ["2719454+reisi007@users.noreply.github.com", "Florian Reisinger"],
+  // The same contributor, under the address the fork's local commits carry.
+  // Both appear in the history and both are credited in AUTHORS.md.
+  ["florian.reisinger.at@gmail.com", "Florian Reisinger"],
   ["bilel.guembri@outlook.fr", "Bilel Guembri"],
   ["wissal.benothmen01@gmail.com", "Wissal Ben Othmen"],
 ]);
