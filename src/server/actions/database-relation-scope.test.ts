@@ -37,6 +37,7 @@ const h = vi.hoisted(() => {
     template: [],
     activity: [],
     workspaceMember: [],
+    rowDependency: [],
   };
   return {
     tables,
@@ -273,6 +274,9 @@ vi.mock("@/lib/db", () => {
     },
     activity: {
       findMany: (args: Record<string, unknown>) => findMany("activity", args),
+    },
+    rowDependency: {
+      findMany: (args: Record<string, unknown>) => findMany("rowDependency", args),
     },
   };
 
@@ -587,7 +591,13 @@ describe("updatePropertyAction — the relation target must stay in the workspac
     expect(result).toEqual({ ok: true });
     expect(h.propertyUpdate).toHaveBeenCalledWith({
       where: { id: "rel-write" },
-      data: { config: { targetDatabaseId: "db-a-2" } },
+      data: {
+        config: {
+          targetDatabaseId: "db-a-2",
+          multi: true,
+          inversePropertyId: null,
+        },
+      },
     });
 
     const database = await getDatabase("db-a");
@@ -605,7 +615,13 @@ describe("updatePropertyAction — the relation target must stay in the workspac
     // The stored config carries the trimmed id — the very id that was checked.
     expect(h.propertyUpdate).toHaveBeenCalledWith({
       where: { id: "rel-write" },
-      data: { config: { targetDatabaseId: "db-a-2" } },
+      data: {
+        config: {
+          targetDatabaseId: "db-a-2",
+          multi: true,
+          inversePropertyId: null,
+        },
+      },
     });
 
     // And the read path resolves it: the relation is not empty.

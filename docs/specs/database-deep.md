@@ -126,7 +126,7 @@ requirement already owned by a sibling spec (§2.4).
 | AI autofill property | `ai-surface.md` | **R25.x** | Nothing (matrix `:304` points there). |
 | Per-page permission inheritance, share-link toggles, publish-to-web (matrix §8) | *no spec owns yet* (row-level grants ship in `plans-licensing.md` R26.x gating and `PagePermission` is read by relations R21.4/R21.20) | — | R89.23/R89.24 define the **database-scoped** capability split only; §8 inheritance stays open (O89.3). |
 | Collab on database-row pages | `realtime-collab.md` (B09) | **R9.x**, open question O9.2 | Nothing. |
-| Public form sharing | — (share links exist: `schema.prisma:393` `model ShareLink`) | — | R89.29 specifies internal forms; public publishing is O89.1. |
+| Public form sharing | `ShareLink.viewId` + `/s/[token]` (R89.29 / O89.1) | R89.29 (internal forms), O89.1 (public publishing) | The tokenized route, builder link management, per-address/link throttles and atomic public row+cells are implemented; public links hide authenticated-only pickers (people/files/verification). |
 
 ## 3. Decisions
 
@@ -316,30 +316,38 @@ are rejected at write time.
 
 ### M2 — linked/synced databases, templates deep, row ops, import integration
 
-- **R89.14** — **Linked database: view identity + picker** (matrix `:237`):
-  the `linkedDatabase` node attrs become `{ databasePageId, viewId, mode,
-  overrides? }` (`linked-database.tsx:21-33`); the insert flow
-  (`slash-menu` → picker) offers database → view → mode (Linked/Synced), and the
-  block renders **that view's config** (filters/sorts/group/columns via
-  `applyView`) instead of raw rows; a "Source view" chip links back to the
-  database with that view active. Per-instance `overrides` accept filter/sort
-  changes made in the block without touching the source view (bounded to the
-  `ViewConfig` subset, normalized by the same parser). Backward compat: old
-  nodes (`databasePageId` only) default to `viewId = source's first view`,
-  `mode = linked`. *Accept:* unit: attr normalizer incl. legacy nodes; e2e:
-  insert a linked block bound to a filtered view — only matching rows show;
-  edit an override, source view config unchanged.
-- **R89.15** — **Synced mode is read-only; linked mode writes through the
-  source's authz** (matrix `:237`): in `synced` mode the block hides all edit
-  affordances **and** the server refuses writes that carry a synced-view
-  provenance (defense in depth — row/property actions keep their existing
-  `authorizeDatabase` checks, `database.ts:41`); in `linked` mode create/edit/
-  delete rows call the existing actions unchanged (one write path, one authz
-  path), scoped so a member without source-database access sees the block as an
-  "unavailable database" placeholder (no existence oracle — mirrors R9.7
-  semantics). *Accept:* integration: user with read-only access to source →
-  linked block renders, write attempt returns "No permission."; synced block →
-  same via provenance check.
+- **R89.14** — **Linked database: view identity + picker** (matrix `:238`):
+  the `linkedDatabase` node attrs are `{ databasePageId, sourceViewId, mode,
+  overrides? }`; the insert flow (`slash-menu` → picker) offers database → view
+  → mode (Synced/Detached), and the block renders **that view's config**
+  (filters/sorts/group/columns via `applyView`) instead of raw rows; a source
+  chip links back to the database with that view active. A stale/absent
+  `sourceViewId` falls back to the source's first view. Per-instance
+  `overrides` are the `ViewConfig` subset, normalized by the same parser, and
+  the detached-only in-block editor writes `filterBuilder` (AND/OR builder,
+  including nested source groups) and `sorts` without touching the source view.
+  Backward compat: old nodes (`databasePageId` only) default to the source's
+  first view and `mode = "synced"`. *Accept:* unit: override seeding from
+  `filterBuilder`/`filterTree`/flat filters, add/update/remove leaves, match
+  mode, sort add/remove/reset, legacy attr normalizer; e2e: insert a linked
+  block bound to a filtered view — only matching rows show; edit an override,
+  source view config unchanged.
+- **R89.15** — **Synced mode is read-only; detached mode writes through the
+  source's authz** (matrix `:238`): `synced` hides every edit affordance, while
+  `detached` offers New row and a row editor only when
+  `getLinkedDatabaseAction` returns `canEdit`. That flag is computed from
+  `pageCapabilitiesFromRelation` for the reader (guests and explicit
+  READ/COMMENT grants are false), and the directory/member payload is read only
+  for an editor who may see it. Create/edit/delete call the existing
+  `createRowAction`/`setPropertyValueAction`/`deleteRowAction` unchanged (one
+  write path, one authz path); the primary title mirrors through
+  `updatePageAction`, and the editor reuses the database `Cell` renderer so
+  every editable property type is covered. A member without source-database
+  access sees the block as an "unavailable database" placeholder (no existence
+  oracle — mirrors R9.7 semantics). *Accept:* integration: a guest or a member
+  with READ on the source sees the linked block but `canEdit = false`; a member
+  without source access gets the placeholder; a member with edit gets the row
+  affordances and writes land on the source rows.
 - **R89.16** — **Database templates deep** (matrix `:260`, `:261`) —
   *coordinate with `templates.md`: model/flag/gallery = R31.1/R31.7-R31.12,
   default semantics = R31.13, editing = R31.14*. This spec owns only the

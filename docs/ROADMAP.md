@@ -42,7 +42,7 @@ Ordered by dependency and impact. Every item maps to rows in
 - [~] Embeds + bookmark cards (YouTube, Vimeo, Loom, Spotify, SoundCloud, Figma, CodePen
   recognized; SSRF-guarded link preview) — generic sandboxed iframe path, provider
   allowlist pending (matrix 🟡)
-- [ ] Synced view / synced blocks — no code yet (matrix 🧭; the earlier [x] here was wrong)
+- [x] Synced block / source marker — source link, same-page live propagation, cross-page refresh, detach (matrix ✅); synced *view* is the separate page embed
 - [ ] Ask-AI **block** (matrix 🧭) · [~] Ask AI in the selection toolbar + block menu
   (ask/summarize/translate via the docked chat; matrix 🟡)
 - [~] Page settings: full-width (works, persisted) · [ ] small text + page fonts
@@ -77,9 +77,11 @@ Ordered by dependency and impact. Every item maps to rows in
 - [x] Row side-peek (labelled property panel with inline editors) · [ ] sub-items,
   dependencies, calculations footer
 - [~] Database templates (create-from-template + template manager wired) — matrix 🧭
-- [~] Linked databases (the editor's linked-database node view renders inline; view
-  identity model pending) · [~] recurring templates (`POST /api/cron/templates`,
-  fail-closed materializer; matrix 🧭 pending scheduler rows) · [x] view config (above)
+- [x] Linked databases (source-view binding, filters/sorts, per-node synced/detached
+  overrides, stale-id fallback, detached-only in-block filter/sort editing, and
+  create/edit/delete rows through the existing database actions + authz)
+  · [~] recurring templates (`POST /api/cron/templates`, fail-closed materializer;
+  matrix 🧭 pending scheduler rows) · [x] view config (above)
 - [~] CSV import/export (Export/Import CSV live in the full-page database toolbar +
   `src/lib/importers.ts`; matrix section-3 rows 🧭)
 - [ ] Database lock · [~] button properties (per-row button config UI exists) + basic
@@ -195,9 +197,27 @@ Ordered by dependency and impact. Every item maps to rows in
   server-side room-join authz in `collab-server.mjs` (session + workspace membership +
   guest page scoping, fail-closed, no existence oracle) per `realtime-collab.md` §M1 and
   the audit's C1 critical. Gates the matrix's multiplayer/presence/cursor rows.
-- [ ] **SAML T10.1** (`saml-sso.md` §M1 first slice, next to charter now that every spec
-  exists): `@node-saml/node-saml`, `SsoConnection`/`SamlAssertionSeen` schema
-  (`prisma db push`, Tier HEAVY), ACS + JIT login against the mock-IdP plan [R10.1, R10.5].
+- [x] **SAML T10.1 (env-level slice)** — `@node-saml/node-saml`, start/ACS/metadata/SLO,
+  signed RelayState, `SamlAssertionSeen` replay cache, JIT/linking and real signed-fixture
+  tests [R10.1, R10.2, R10.3, R10.4, R10.5, R10.6, R10.14, R10.16].
+- [x] **SAML T10.2/T10.4** — `SsoConnection` persistence, admin CRUD actions, signed
+  connection-aware RelayState, `?connection=` start/metadata/ACS, group→role mapping and
+  workspace auto-join.
+- [x] **SAML T10.9 (domain half)** — `VerifiedDomain` persistence, DNS TXT add/verify/delete
+  actions and verified-domain auto-join.
+- [x] **SAML T10.7 (rotation half)** — guarded metadata-URL refresh, IdP metadata parsing and
+  24-hour previous-certificate overlap.
+- [x] **SAML SLO** — POST/redirect logout-message validation with audit, while always ending
+  the local session.
+- [x] **SAML T10.5/T10.6** — admin SSO settings section: connection CRUD, metadata refresh and
+  verified-domain TXT workflow.
+- [x] **SAML T10.8 (Users half)** — SCIM 2.0 Users endpoints with one-time hashed tokens,
+  pagination, JIT membership, deprovisioning and owner protection.
+- [x] **SAML T10.8 (Groups half)** — SCIM Groups map to teamspaces (list/get/create/member
+  add/remove/replace/delete) and recompute the mapped workspace role.
+- [x] **SAML polish** — login-page domain chooser, invite precedence for JIT users and a
+  recent-SSO activity view.
+- [ ] **SAML polish** — dry “Test connection” action and split per-IdP setup pages.
 - [ ] CRDT M2 — persisted documents + text CRDT; M3 — cursors/awareness UX. Honest scope:
   M2/M3 only if M1 lands clean this year — otherwise multiplayer rows stay 🧭 into 2027.
 
@@ -207,8 +227,8 @@ Ordered by dependency and impact. Every item maps to rows in
   notes appended — re-verify rows first, then two-way pairs, cell correctness, e2e).
 - [ ] Formula engine M1–M3 per `formula-engine.md` (B22): editor UX + autocomplete,
   function coverage, error states, caching — section 5 reads 0/16 today.
-- [ ] Groups/aggregation + calculations footer, sub-items/dependencies, linked-database
-  view identity, database-template rows.
+- [ ] Groups/aggregation + calculations footer, sub-items/dependencies,
+  linked-database write path, database-template rows.
 - [ ] Closes B17's 13 property partials and flips section 4's remaining 🟡/🧭.
 
 ## Milestone 8 — Platform hardening (Nov–Dec 2026)

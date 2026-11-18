@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 // both, so this test covers the policy itself and the fact that there is still
 // only one copy of it.
 const require = createRequire(import.meta.url);
-const { allowedOrigins, localHosts } = require("./allowed-origins.cjs");
+const { allowedOrigins, localHosts, serverHostname } = require("./allowed-origins.cjs");
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..", "..");
@@ -59,6 +59,35 @@ describe("allowedOrigins", () => {
     const origins = allowedOrigins({ env: {}, interfaces: {} });
     expect(origins.length).toBeGreaterThan(0);
     expect(origins).toContain("127.0.0.1:3200");
+  });
+
+  it("is loopback-only and port-exact in desktop mode", () => {
+    const origins = allowedOrigins({
+      env: {
+        NOEMA_RUNTIME: "desktop",
+        PORT: "4123",
+        APP_ORIGINS: "https://notes.example.com",
+      },
+      interfaces,
+    });
+    expect(origins.sort()).toEqual(
+      ["127.0.0.1:4123", "[::1]:4123", "localhost:4123"].sort(),
+    );
+    expect(origins).not.toContain("10.153.77.93:4123");
+    expect(origins).not.toContain("notes.example.com");
+  });
+
+  it("never binds the desktop server to a non-loopback host", () => {
+    for (const requested of [undefined, "", "0.0.0.0", "10.153.77.93", "localhost"]) {
+      expect(serverHostname(requested, "desktop")).toBe("127.0.0.1");
+    }
+    expect(serverHostname("::1", "desktop")).toBe("::1");
+  });
+
+  it("lets the container honour HOSTNAME while staying safe by default", () => {
+    expect(serverHostname("0.0.0.0", "server")).toBe("0.0.0.0");
+    expect(serverHostname("::1", "server")).toBe("::1");
+    expect(serverHostname(undefined, "server")).toBe("0.0.0.0");
   });
 
   it("reads this machine's own interfaces when none are injected", () => {

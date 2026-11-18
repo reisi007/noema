@@ -37,6 +37,11 @@ vi.mock("@/lib/webhooks", () => ({ dispatchWebhooks: vi.fn(async () => undefined
 vi.mock("@/lib/activity", () => ({ logActivity: vi.fn(async () => undefined) }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
+const guest = vi.hoisted(() => ({ guestReadablePageIds: vi.fn() }));
+vi.mock("@/lib/guest-access", () => ({
+  guestReadablePageIds: guest.guestReadablePageIds,
+}));
+
 const perms = vi.hoisted(() => ({ getWorkspaceAccess: vi.fn() }));
 vi.mock("@/lib/permissions", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/permissions")>();
@@ -64,6 +69,7 @@ function parentRow(authorId: string) {
     pageId: PAGE_ID,
     authorId,
     body: "the original comment",
+    blockId: "block-1",
     createdAt: new Date("2026-10-21T10:00:00.000Z"),
   };
 }
@@ -90,6 +96,7 @@ beforeEach(() => {
   db.memberFindMany.mockResolvedValue([]);
   db.notificationCreate.mockResolvedValue({ id: "notif-1" });
   db.notificationCreateMany.mockResolvedValue({ count: 0 });
+  guest.guestReadablePageIds.mockResolvedValue(new Set<string>());
   // The actor and every member have access; the removed member has none.
   perms.getWorkspaceAccess.mockImplementation(async (userId: string) =>
     userId === REMOVED ? null : { role: "MEMBER" },
@@ -108,7 +115,12 @@ describe("addCommentAction → reply dispatch", () => {
       {
         userId: MEMBER,
         type: "comment.reply",
-        payload: { workspaceId: "ws-1", pageId: PAGE_ID, commentId: REPLY_ID },
+        payload: {
+          workspaceId: "ws-1",
+          pageId: PAGE_ID,
+          commentId: REPLY_ID,
+          blockId: "block-1",
+        },
       },
     ]);
   });
@@ -127,6 +139,28 @@ describe("addCommentAction → reply dispatch", () => {
       userId: MEMBER,
       type: "page.mention",
       payload: { workspaceId: "ws-1", pageId: PAGE_ID, commentId: REPLY_ID },
+    });
+  });
+
+  it("carries the thread's block anchor into a reply mention", async () => {
+    db.memberFindMany.mockResolvedValue([
+      { userId: MEMBER, user: { name: "Ada", email: "ada@example.test" } },
+    ]);
+
+    await addCommentAction({
+      pageId: PAGE_ID,
+      body: "@Ada reply",
+      parentId: PARENT_ID,
+    });
+
+    const rows = db.notificationCreateMany.mock.calls.map(
+      (call) => call[0].data as { userId: string; type: string; payload: unknown }[],
+    );
+    expect(rows[0][0].payload).toEqual({
+      workspaceId: "ws-1",
+      pageId: PAGE_ID,
+      commentId: REPLY_ID,
+      blockId: "block-1",
     });
   });
 
@@ -173,6 +207,45 @@ describe("addCommentAction → reply dispatch", () => {
   });
 });
 
+describe("addCommentAction → inline anchors", () => {
+  it("stores a root anchor and drops an anchor supplied on a reply", async () => {
+    await addCommentAction({
+      pageId: PAGE_ID,
+      body: "a root comment",
+      blockId: "block-1",
+      quote: "the selected words",
+    });
+    expect(db.commentCreate).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          parentId: null,
+          blockId: "block-1",
+          quote: "the selected words",
+        }),
+      }),
+    );
+
+    await addCommentAction({
+      pageId: PAGE_ID,
+      body: "a reply",
+      parentId: PARENT_ID,
+      blockId: "block-2",
+      quote: "ignored on a reply",
+    });
+    expect(db.commentCreate).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        data: expect.objectContaining({
+          parentId: PARENT_ID,
+          blockId: undefined,
+          quote: null,
+        }),
+      }),
+    );
+  });
+});
+
 describe("addCommentAction → mention dispatch (unchanged)", () => {
   it("notifies a mentioned member of the workspace", async () => {
     db.memberFindMany.mockResolvedValue([
@@ -202,5 +275,43 @@ describe("addCommentAction → mention dispatch (unchanged)", () => {
     await addCommentAction({ pageId: PAGE_ID, body: "ping @ada" });
 
     expect(db.notificationCreateMany).not.toHaveBeenCalled();
+  });
+
+  it("does not notify a guest outside the page read scope", async () => {
+    db.memberFindMany.mockResolvedValue([
+      {
+        userId: "guest-1",
+        role: "GUEST",
+        user: { name: "Ada Lovelace", email: "ada@example.com" },
+      },
+    ]);
+
+    await addCommentAction({ pageId: PAGE_ID, body: "ping @ada" });
+
+    expect(guest.guestReadablePageIds).toHaveBeenCalledWith("guest-1", "ws-1");
+    expect(db.notificationCreateMany).not.toHaveBeenCalled();
+  });
+
+  it("notifies a guest whose read scope contains the page", async () => {
+    db.memberFindMany.mockResolvedValue([
+      {
+        userId: "guest-1",
+        role: "GUEST",
+        user: { name: "Ada Lovelace", email: "ada@example.com" },
+      },
+    ]);
+    guest.guestReadablePageIds.mockResolvedValue(new Set([PAGE_ID]));
+
+    await addCommentAction({ pageId: PAGE_ID, body: "ping @ada" });
+
+    expect(db.notificationCreateMany).toHaveBeenCalledWith({
+      data: [
+        {
+          userId: "guest-1",
+          type: "page.mention",
+          payload: { workspaceId: "ws-1", pageId: PAGE_ID, commentId: REPLY_ID },
+        },
+      ],
+    });
   });
 });

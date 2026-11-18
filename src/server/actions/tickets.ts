@@ -607,7 +607,17 @@ export async function loadMoreTicketsAction(input: {
  */
 export async function getTicketActivityAction(
   ticketId: string,
-): Promise<TicketResult<{ activity: TicketActivityRow[] }>> {
+): Promise<
+  TicketResult<{
+    activity: TicketActivityRow[];
+    comments: {
+      id: string;
+      body: string;
+      createdAt: Date;
+      author: { id: string; name: string; email: string };
+    }[];
+  }>
+> {
   const user = await requireUser();
   const ticket = await prisma.ticket.findUnique({
     where: { id: ticketId },
@@ -628,7 +638,13 @@ export async function getTicketActivityAction(
     createdAt: entry.createdAt,
     actor: entry.actor,
   }));
-  return { ok: true, activity };
+  const comments = (detail?.comments ?? []).map((comment) => ({
+    id: comment.id,
+    body: comment.body,
+    createdAt: comment.createdAt,
+    author: comment.author,
+  }));
+  return { ok: true, activity, comments };
 }
 
 /** Attach or detach a workspace label. */

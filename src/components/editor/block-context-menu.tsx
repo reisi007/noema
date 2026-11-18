@@ -8,6 +8,7 @@ import {
   ArrowUp,
   ClipboardCopy,
   Copy,
+  Layers,
   Link2,
   ListOrdered,
   MessageSquare,
@@ -30,8 +31,20 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { PromptDialog } from "@/components/prompt-dialog";
 import { AI_SKILLS, type AiSkillId } from "@/lib/ai-skills";
-import { runAiSkill } from "@/lib/ai-client";
-import { COMMENT_EVENT, EQUATION_EVENT } from "@/lib/editor-events";
+import { aiSkillMenuEntries } from "@/lib/ai-skill-menu";
+import { runAiSkill, type AiSkillRunOptions } from "@/lib/ai-client";
+import {
+  aiInsertMode,
+  applySkillResult,
+  blockSkillTarget,
+  pageSkillTarget,
+} from "@/components/editor/ai-skill-actions";
+import {
+  COMMENT_EVENT,
+  EQUATION_EVENT,
+  type CommentRequest,
+} from "@/lib/editor-events";
+import { wholeBlockAnchor } from "@/components/editor/comment-anchor";
 import {
   BLOCK_COLOR_CATALOGUE,
   BLOCK_COLOR_TYPES,
@@ -161,7 +174,19 @@ function blockTypeOfNode(name: string, attrs: Record<string, unknown>): BlockTyp
       return "paragraph";
     case "heading": {
       const level = Number(attrs.level);
-      return level === 1 ? "h1" : level === 2 ? "h2" : level === 3 ? "h3" : null;
+      return level === 1
+        ? "h1"
+        : level === 2
+          ? "h2"
+          : level === 3
+            ? "h3"
+            : level === 4
+              ? "h4"
+              : level === 5
+                ? "h5"
+                : level === 6
+                  ? "h6"
+                  : null;
     }
     case "bulletList":
       return "bulletedList";
@@ -208,6 +233,9 @@ const TURN_TARGET_LABELS: Partial<Record<BlockType, I18nKey>> = {
   h1: "blockHeading1",
   h2: "blockHeading2",
   h3: "blockHeading3",
+  h4: "blockHeading4",
+  h5: "blockHeading5",
+  h6: "blockHeading6",
   bulletedList: "blockBulletedList",
   numberedList: "blockNumberedList",
   todoList: "blockTodoList",
@@ -288,12 +316,15 @@ export function BlockContextMenu({
   editor,
   editable,
   workspaceId,
+  pageId,
   locale = "en",
   children,
 }: {
   editor: Editor;
   editable: boolean;
   workspaceId?: string;
+  /** Current page id, so a synced copy can name its source page. */
+  pageId: string;
   locale?: string;
   children: ReactNode;
 }) {
@@ -356,9 +387,16 @@ export function BlockContextMenu({
         break;
       case "h1":
       case "h2":
-      case "h3": {
+      case "h3":
+      case "h4":
+      case "h5":
+      case "h6": {
         const level = converted.attrs?.level;
-        chain.setHeading({ level: level === 2 ? 2 : level === 3 ? 3 : 1 }).run();
+        const headingLevel =
+          level === 2 || level === 3 || level === 4 || level === 5 || level === 6
+            ? level
+            : 1;
+        chain.setHeading({ level: headingLevel }).run();
         break;
       }
       case "bulletedList":
@@ -398,6 +436,76 @@ export function BlockContextMenu({
       .insertContentAt(pos + node.nodeSize, node.toJSON())
       .run();
     toast.success(t(locale, "blockDuplicated"));
+  };
+
+  /**
+   * Insert a read-only mirror of the block under the menu immediately after its
+   * top-level ancestor. The source stays editable; `SyncedBlock`'s propagation
+   * plugin refreshes the mirror snapshot on every same-page edit, and a mirror
+   * copied to another page re-fetches its source on mount.
+   */
+  const createSyncedCopy = () => {
+    if (pos === null) return;
+    const node = editor.state.doc.nodeAt(pos);
+    if (!node) return;
+    if (node.type.name === "syncedBlock") {
+      const sourceBlockId =
+        typeof node.attrs.sourceBlockId === "string" ? node.attrs.sourceBlockId : "";
+      const sourcePageId =
+        typeof node.attrs.sourcePageId === "string" ? node.attrs.sourcePageId : "";
+      if (sourceBlockId === "" || sourcePageId === "") {
+        toast.error(t(locale, "syncedBlockNeedsId"));
+        return;
+      }
+      const at = pos + node.nodeSize;
+      editor
+        .chain()
+        .focus()
+        .insertSyncedBlock(
+          {
+            sourceBlockId,
+            sourcePageId,
+            sourcePageTitle:
+              typeof node.attrs.sourcePageTitle === "string"
+                ? node.attrs.sourcePageTitle
+                : null,
+            content: typeof node.attrs.content === "string" ? node.attrs.content : "",
+          },
+          { at },
+        )
+        .run();
+      toast.success(t(locale, "syncedCopyCreated"));
+      return;
+    }
+
+    const sourceId = blockAnchorId(editor.state.doc, pos);
+    if (!sourceId) {
+      toast.error(t(locale, "syncedBlockNeedsId"));
+      return;
+    }
+    let sourceContent: string | null = null;
+    let insertAt: number | null = null;
+    editor.state.doc.forEach((candidate, offset) => {
+      if (insertAt !== null) return;
+      if (typeof candidate.attrs?.id === "string" && candidate.attrs.id === sourceId) {
+        sourceContent = JSON.stringify(candidate.toJSON());
+        insertAt = offset + candidate.nodeSize;
+      }
+    });
+    const at = insertAt ?? pos + node.nodeSize;
+    editor
+      .chain()
+      .focus()
+      .insertSyncedBlock(
+        {
+          sourceBlockId: sourceId,
+          sourcePageId: pageId,
+          content: sourceContent ?? JSON.stringify(node.toJSON()),
+        },
+        { at },
+      )
+      .run();
+    toast.success(t(locale, "syncedCopyCreated"));
   };
 
   /**
@@ -623,36 +731,61 @@ export function BlockContextMenu({
     editor.view.dispatch(tr);
     editor.chain().setNodeSelection(insertAt).run();
   };
-  const aiSkill = (id: AiSkillId) => {
+  const aiSkill = (id: AiSkillId, options?: AiSkillRunOptions) => {
     if (pos === null) return;
-    const node = editor.state.doc.nodeAt(pos);
-    if (!node) return;
-    const text = node.textContent.trim();
-    if (!text) {
+    const target = blockSkillTarget(editor, pos);
+    if (!target) {
       toast.error(t(locale, "nothingToWorkWith"));
       return;
     }
     const skill = AI_SKILLS.find((candidate) => candidate.id === id);
     if (!skill) return;
     startTransition(async () => {
-      const result = await runAiSkill(id, text, workspaceId);
+      const result = await runAiSkill(id, target.text, workspaceId, options, locale);
       if ("error" in result) {
         toast.error(result.error);
         return;
       }
-      const range = innerRange(pos);
-      if (!range) return;
-      if (result.replacesSelection) {
-        editor.chain().focus().setTextSelection(range).insertContent(result.text).run();
-      } else {
-        editor
-          .chain()
-          .focus()
-          .insertContentAt(pos + node.nodeSize, {
-            type: "paragraph",
-            content: [{ type: "text", text: result.text }],
-          })
-          .run();
+      const mode = aiInsertMode({
+        skillId: id,
+        replacesSelection: result.replacesSelection,
+        scope: target.scope,
+      });
+      if (!applySkillResult(editor, { target, mode, text: result.text })) {
+        toast.error(t(locale, "aiRequestFailed"));
+        return;
+      }
+      toast.success(`${skill.label} applied`);
+    });
+  };
+
+  /**
+   * Run a skill on the whole page instead of the block under the menu. The
+   * result appends at the end of the document, so "Summarize page" /
+   * "Translate page" can never overwrite the page they describe.
+   */
+  const aiPageSkill = (id: AiSkillId, options?: AiSkillRunOptions) => {
+    const target = pageSkillTarget(editor);
+    if (!target) {
+      toast.error(t(locale, "nothingToWorkWith"));
+      return;
+    }
+    const skill = AI_SKILLS.find((candidate) => candidate.id === id);
+    if (!skill) return;
+    startTransition(async () => {
+      const result = await runAiSkill(id, target.text, workspaceId, options, locale);
+      if ("error" in result) {
+        toast.error(result.error);
+        return;
+      }
+      const mode = aiInsertMode({
+        skillId: id,
+        replacesSelection: result.replacesSelection,
+        scope: target.scope,
+      });
+      if (!applySkillResult(editor, { target, mode, text: result.text })) {
+        toast.error(t(locale, "aiRequestFailed"));
+        return;
       }
       toast.success(`${skill.label} applied`);
     });
@@ -660,8 +793,22 @@ export function BlockContextMenu({
 
   const comment = () => {
     const node = pos === null ? null : editor.state.doc.nodeAt(pos);
-    const quote = (node?.textContent ?? "").trim().slice(0, 300);
-    window.dispatchEvent(new CustomEvent(COMMENT_EVENT, { detail: { quote } }));
+    const blockId = pos === null ? undefined : blockAnchorId(editor.state.doc, pos);
+    // A block-menu comment anchors the whole block as an exact range, so it is
+    // still jumpable/highlightable on reload rather than a block-only anchor.
+    const anchor = blockId ? wholeBlockAnchor(editor.state.doc, blockId) : null;
+    const detail: CommentRequest = anchor
+      ? {
+          quote: anchor.quote,
+          blockId: anchor.blockId,
+          from: anchor.from,
+          to: anchor.to,
+        }
+      : {
+          quote: (node?.textContent ?? "").trim().slice(0, 300),
+          blockId,
+        };
+    window.dispatchEvent(new CustomEvent(COMMENT_EVENT, { detail }));
   };
 
   const selectedNode = pos === null ? null : editor.state.doc.nodeAt(pos);
@@ -773,11 +920,49 @@ export function BlockContextMenu({
               <Sparkles className="h-4 w-4 text-muted" /> {t(locale, "askAI")}
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
-              {AI_SKILLS.map((skill) => (
-                <DropdownMenuItem key={skill.id} onSelect={() => aiSkill(skill.id)}>
-                  {skill.label}
-                </DropdownMenuItem>
-              ))}
+              {aiSkillMenuEntries().map((entry) =>
+                entry.kind === "translate" ? (
+                  <Fragment key="translate">
+                    {entry.locales.map((choice) => (
+                      <DropdownMenuItem
+                        key={choice.code}
+                        onSelect={() =>
+                          aiSkill("translate", { targetLocale: choice.code })
+                        }
+                      >
+                        {entry.label}: {choice.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </Fragment>
+                ) : (
+                  <DropdownMenuItem key={entry.id} onSelect={() => aiSkill(entry.id)}>
+                    {entry.label}
+                  </DropdownMenuItem>
+                ),
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={() => aiPageSkill("summarize")}>
+                Summarize page
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => aiPageSkill("continue")}>
+                Continue page
+              </DropdownMenuItem>
+              {aiSkillMenuEntries()
+                .filter((entry) => entry.kind === "translate")
+                .flatMap((entry) =>
+                  entry.kind === "translate"
+                    ? entry.locales.map((choice) => (
+                        <DropdownMenuItem
+                          key={`page-${choice.code}`}
+                          onSelect={() =>
+                            aiPageSkill("translate", { targetLocale: choice.code })
+                          }
+                        >
+                          Translate page: {choice.label}
+                        </DropdownMenuItem>
+                      ))
+                    : [],
+                )}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
 
@@ -810,6 +995,9 @@ export function BlockContextMenu({
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={duplicate}>
             <Copy className="h-4 w-4 text-muted" /> {t(locale, "duplicate")}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={createSyncedCopy}>
+            <Layers className="h-4 w-4 text-muted" /> {t(locale, "createSyncedCopy")}
           </DropdownMenuItem>
           <DropdownMenuItem onSelect={comment}>
             <MessageSquare className="h-4 w-4 text-muted" /> {t(locale, "comment")}

@@ -126,6 +126,7 @@ describe("editor skills still use the registry prompts", () => {
     expect(ai.chatComplete).toHaveBeenCalledWith(
       expect.objectContaining({ user: expect.stringContaining("Proofread") }),
       CONFIG,
+      expect.objectContaining({ surface: "skill", userId: "u1" }),
     );
   });
 });
@@ -141,6 +142,7 @@ describe("writing skills route through ai-writing", () => {
     expect(ai.chatComplete).toHaveBeenCalledWith(
       expect.objectContaining({ user: expect.stringContaining("Alpha beta gamma.") }),
       CONFIG,
+      expect.objectContaining({ surface: "skill", userId: "u1" }),
     );
   });
 
@@ -153,7 +155,50 @@ describe("writing skills route through ai-writing", () => {
     expect(ai.chatComplete).toHaveBeenCalledWith(
       expect.objectContaining({ user: expect.stringContaining("English") }),
       CONFIG,
+      expect.objectContaining({ surface: "skill", userId: "u1" }),
     );
+  });
+
+  it("translates into the requested shipped locale", async () => {
+    const response = await postSkill({
+      skillId: "translate",
+      text: "Hello",
+      targetLocale: "fr",
+    });
+    expect(response.status).toBe(200);
+    expect(ai.chatComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ user: expect.stringContaining("French (fr)") }),
+      CONFIG,
+      expect.objectContaining({ surface: "skill", userId: "u1" }),
+    );
+  });
+
+  it("names each of the five shipped locales on request", async () => {
+    const names: Record<string, string> = {
+      en: "English",
+      fr: "French",
+      es: "Spanish",
+      de: "German",
+      ar: "Arabic",
+    };
+    for (const [code, name] of Object.entries(names)) {
+      await postSkill({ skillId: "translate", text: "Hello", targetLocale: code });
+      expect(ai.chatComplete).toHaveBeenLastCalledWith(
+        expect.objectContaining({ user: expect.stringContaining(`${name} (${code})`) }),
+        CONFIG,
+        expect.objectContaining({ surface: "skill", userId: "u1" }),
+      );
+    }
+  });
+
+  it("rejects a locale that is not shipped instead of silently defaulting", async () => {
+    const response = await postSkill({
+      skillId: "translate",
+      text: "Hello",
+      targetLocale: "xx",
+    });
+    expect(response.status).toBe(400);
+    expect(ai.chatComplete).not.toHaveBeenCalled();
   });
 
   it("accepts the new `continue` skill", async () => {
@@ -165,6 +210,7 @@ describe("writing skills route through ai-writing", () => {
     expect(ai.chatComplete).toHaveBeenCalledWith(
       expect.objectContaining({ user: expect.stringContaining("Continue") }),
       CONFIG,
+      expect.objectContaining({ surface: "skill", userId: "u1" }),
     );
   });
 
@@ -214,5 +260,22 @@ describe("GET catalogue", () => {
     expect(ids).toContain("continue");
     expect(ids).toContain("simplify");
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("advertises every id the POST handler accepts", async () => {
+    const response = await GET();
+    const body = (await response.json()) as SkillResponse;
+    const skills = body.skills ?? [];
+    expect(skills).toHaveLength(9);
+    for (const skill of skills) {
+      const posted = await postSkill({
+        skillId: skill.id,
+        text: "Hello there.",
+        ...(skill.id === "translate" ? { targetLocale: "fr" } : {}),
+      });
+      expect(posted.status, skill.id).toBe(200);
+      const answered = (await posted.json()) as SkillResponse;
+      expect(answered.replacesSelection, skill.id).toBe(skill.replacesSelection);
+    }
   });
 });

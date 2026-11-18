@@ -16,6 +16,15 @@ export type ActivityAction =
   | "member.removed"
   | "member.left"
   | "member.ownership_transferred"
+  | "sso.connection_created"
+  | "sso.connection_updated"
+  | "sso.connection_deleted"
+  | "sso.metadata_refreshed"
+  | "sso.logout"
+  | "sso.logout_failed"
+  | "sso.domain_added"
+  | "sso.domain_verified"
+  | "sso.domain_deleted"
   | "page.created"
   | "page.archived"
   | "page.restored"
@@ -29,7 +38,10 @@ export type ActivityAction =
   | "cycle.created"
   | "cycle.deleted"
   | "comment.created"
-  | "comment.resolved";
+  | "comment.edited"
+  | "comment.resolved"
+  | "comment.deleted"
+  | "row.edited";
 
 export async function logActivity(input: {
   workspaceId: string;

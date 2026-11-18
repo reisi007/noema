@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 // never reaches prisma or a Next router context.
 vi.mock("@/server/actions/database", () => ({
   setPropertyValueAction: vi.fn(),
+  setSubItemParentAction: vi.fn(),
 }));
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn(), replace: vi.fn() }),
@@ -339,6 +340,48 @@ describe("TimelineView render", () => {
     // The bar carries a real tooltip label, not a `title`.
     expect(html).toContain("aria-label=");
     expect(html).not.toContain("title=\"2026");
+  });
+
+  it("draws dependency arrows only when the caller supplies blocking edges", () => {
+    const datedRows: DBRow[] = [
+      ...rows,
+      {
+        id: "r3",
+        title: "Gamma",
+        icon: null,
+        propertyValues: [
+          {
+            propertyId: "date",
+            value: {
+              start: new Date(
+                Date.UTC(now.getFullYear(), now.getMonth(), 15),
+              ).toISOString(),
+            },
+          },
+        ],
+      },
+    ];
+    const withoutEdges = render(
+      createElement(TimelineView, {
+        locale: "en",
+        workspaceSlug: "w",
+        properties: [dateProperty],
+        rows: datedRows,
+      }),
+    );
+    expect(withoutEdges).not.toContain('data-testid="timeline-arrows"');
+
+    const withEdges = render(
+      createElement(TimelineView, {
+        locale: "en",
+        workspaceSlug: "w",
+        properties: [dateProperty],
+        rows: datedRows,
+        edges: [{ id: "r1:r3", from: "r1", to: "r3" }],
+      }),
+    );
+    expect(withEdges).toContain('data-testid="timeline-arrows"');
+    expect(withEdges).toContain('data-testid="timeline-edge-r1:r3"');
   });
 
   it("makes every bar a keyboard-operable slider with edge handles", () => {

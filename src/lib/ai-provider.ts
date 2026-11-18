@@ -10,10 +10,29 @@
 
 import { prisma } from "./db";
 import { decryptSecret } from "./secrets";
-import { isOpenCodeGoEndpoint, providerDefaultBaseUrl, normalizeBaseUrl } from "./ai-providers";
+import {
+  isLocalAiBaseUrl,
+  isOpenCodeGoEndpoint,
+  providerDefaultBaseUrl,
+  normalizeBaseUrl,
+} from "./ai-providers";
 import { serverAppVersion } from "./app-version";
 import { DEPLOYMENT_SESSION_ID, workspaceSessionId } from "./ai-session";
-import { checkBudget, estimateTokens, recordUsage, type BudgetRecord } from "./ai-cost";
+import {
+  evaluateBudget,
+  estimateTokens,
+  recordUsage,
+  type BudgetEvaluation,
+  type BudgetRecord,
+} from "./ai-cost";
+import {
+  budgetPeriod,
+  loadWorkspaceBudget,
+  recordAiUsage,
+  type AiBudgetGuard,
+  type AiSurface,
+} from "./ai-metering";
+import { assertAiDataBoundary, logAiDiagnostic } from "./ai-boundary";
 import { z } from "zod";
 import { getWorkspaceAccess } from "./permissions";
 import { redactSecrets } from "./error-reporting";
@@ -22,7 +41,7 @@ export const AI_NOT_CONFIGURED =
   "AI is not configured. Add a provider in workspace settings (AI) or set AI_API_KEY / AI_BASE_URL / AI_MODEL.";
 
 export const AI_BUDGET_EXCEEDED =
-  "The workspace AI token budget is exhausted for this period. Raise AI_BUDGET_TOKENS or wait for the next period.";
+  "The workspace AI token budget is exhausted for this month. An admin can raise it in workspace settings (AI), or wait for the next period.";
 
 /* -------------------------------------------------------------------------- *
  * Provider failures
@@ -313,7 +332,7 @@ export function logProviderFailure(
   failure: ProviderFailure,
   context?: ProviderAttribution,
 ): void {
-  console.error("ai provider error", {
+  logAiDiagnostic("ai provider error", {
     status: failure.status,
     code: failure.code,
     ...logContext(context),
@@ -387,7 +406,7 @@ function isProviderClassError(error: unknown): error is Error {
  * several workspaces.
  */
 export function transportFailure(context?: ProviderAttribution): string {
-  console.error("ai provider error", {
+  logAiDiagnostic("ai provider error", {
     code: TRANSPORT_ERROR,
     ...logContext(context),
   });
@@ -451,9 +470,12 @@ export function providerRequestHeaders(
   options: { json?: boolean } = {},
 ): Record<string, string> {
   const headers: Record<string, string> = {
-    authorization: `Bearer ${config.apiKey}`,
     "user-agent": providerUserAgent(),
   };
+  // A keyless local runtime (Ollama, vLLM, llama.cpp) must not receive an
+  // empty `Authorization: Bearer ` header: some reject the malformed value,
+  // and sending a credential-shaped header to a keyless endpoint is noise.
+  if (config.apiKey) headers.authorization = `Bearer ${config.apiKey}`;
   if (options.json) headers["content-type"] = "application/json";
   if (isOpenCodeGoEndpoint(config.baseUrl)) {
     headers["x-opencode-session"] = config.sessionId ?? DEPLOYMENT_SESSION_ID;
@@ -497,27 +519,37 @@ export function providerAttribution(
 }
 
 /**
- * Monthly token ceiling for every AI call, read from `AI_BUDGET_TOKENS`.
- * A missing, non-numeric or non-positive value disables enforcement (the
- * default), so self-hosters who never set it keep unmetered behaviour. The
- * budget engine (`./ai-cost`) is the gate; this only supplies the limit.
+ * Global fallback ceiling for calls that have no workspace (the env defaults)
+ * and for workspaces that never saved a budget. A missing, non-numeric or
+ * non-positive value disables it. Workspace budgets (`AiBudget`) take
+ * precedence over this fallback.
  */
 export function aiBudgetLimitTokens(): number {
   const raw = Number(process.env.AI_BUDGET_TOKENS);
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
 }
 
-/** The calendar-month period key (`YYYY-MM`, UTC) a budget belongs to. */
-export function budgetPeriod(now: Date = new Date()): string {
-  return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
-}
+// `budgetPeriod` is the calendar-month key the durable meter stores. It lives
+// in `./ai-metering` with the rest of the storage layer; re-exported here for
+// the routes and tests that already import it from the transport.
+export { budgetPeriod };
 
 /**
- * In-process usage ledger keyed by workspace + provider + model. Token usage
- * accrues here for the life of the process; `resetAiBudgetLedger` clears it
- * (tests invoke it between cases). Durable, cross-instance accounting is a
- * follow-up once a budget table exists — the *enforcement* path below is the
- * real one either way.
+ * The evaluated budget of one call. `durable` marks a workspace `AiBudget` row
+ * (persisted usage); the in-process ledger is only the env fallback for calls
+ * with no workspace or no saved budget.
+ */
+type BudgetGate = {
+  record: BudgetRecord;
+  warnPercent: number;
+  hardStop: boolean;
+  durable: boolean;
+};
+
+/**
+ * In-process usage ledger keyed by workspace + provider. It backs the
+ * `AI_BUDGET_TOKENS` fallback (tests and env-only deployments); workspace calls
+ * are metered durably in `AiUsage`.
  */
 const usageLedger = new Map<string, BudgetRecord>();
 
@@ -528,8 +560,29 @@ function budgetKey(config: AiRuntimeConfig): string {
   return `${config.workspaceId ?? "env"}:${config.provider}`;
 }
 
-/** The current budget record for a config, or `null` when enforcement is off. */
-function loadBudget(config: AiRuntimeConfig): BudgetRecord | null {
+/**
+ * Resolve the gate for a call: the workspace's durable `AiBudget` when one
+ * exists (a limit of 0 means explicitly unlimited), otherwise the env fallback
+ * ledger. Returns `null` when nothing is enforced.
+ */
+async function loadBudgetGate(config: AiRuntimeConfig): Promise<BudgetGate | null> {
+  const durable = await loadWorkspaceBudget(config.workspaceId);
+  if (durable) {
+    return {
+      record: {
+        workspaceId: durable.workspaceId,
+        period: durable.period,
+        limitTokens: durable.limitTokens,
+        usedInput: durable.usedInput,
+        usedOutput: durable.usedOutput,
+        spendUsd: 0,
+      },
+      warnPercent: durable.warnPercent,
+      hardStop: durable.hardStop,
+      durable: true,
+    };
+  }
+
   const limitTokens = aiBudgetLimitTokens();
   if (limitTokens <= 0) return null;
   const key = budgetKey(config);
@@ -538,37 +591,34 @@ function loadBudget(config: AiRuntimeConfig): BudgetRecord | null {
   // A record from an earlier month is not this month's usage: roll it over
   // before the gate, so an exhausted October does not refuse November.
   if (existing && existing.limitTokens === limitTokens && existing.period === period) {
-    return existing;
+    return {
+      record: existing,
+      warnPercent: 80,
+      hardStop: true,
+      durable: false,
+    };
   }
   return {
-    workspaceId: config.workspaceId ?? "env",
-    period,
-    limitTokens,
-    usedInput: 0,
-    usedOutput: 0,
-    spendUsd: 0,
+    record: {
+      workspaceId: config.workspaceId ?? "env",
+      period,
+      limitTokens,
+      usedInput: 0,
+      usedOutput: 0,
+      spendUsd: 0,
+    },
+    warnPercent: 80,
+    hardStop: true,
+    durable: false,
   };
 }
 
-/** Forget the in-process usage ledger (tests and maintenance). */
+/** Forget the in-process fallback ledger (tests and maintenance). */
 export function resetAiBudgetLedger(): void {
   usageLedger.clear();
 }
 
 /** Estimated prompt tokens for a chat request (spec `chars / 4` heuristic). */
-/** Whether a chat request may start under the current token ceiling. */
-export function aiRequestBudgetAllows(
-  config: AiRuntimeConfig,
-  input: { system: string; user?: string; context?: string; maxTokens?: number },
-): boolean {
-  const budget = loadBudget(config);
-  if (!budget) return true;
-  return checkBudget(budget, {
-    estimatedTokens: promptTokens(input) + (input.maxTokens ?? 0),
-    model: config.model,
-  }).allowed;
-}
-
 function promptTokens(input: { system: string; user?: string; context?: string }): number {
   const text = [input.system, input.context, input.user]
     .filter((part): part is string => typeof part === "string" && part.length > 0)
@@ -576,20 +626,133 @@ function promptTokens(input: { system: string; user?: string; context?: string }
   return estimateTokens(text);
 }
 
+/** Evaluate one prospect against a gate (shared by the guard and dispatch). */
+function evaluateGate(
+  gate: BudgetGate,
+  estimatedTokens: number,
+): BudgetEvaluation {
+  return evaluateBudget({
+    usedTokens: gate.record.usedInput + gate.record.usedOutput,
+    limitTokens: gate.record.limitTokens,
+    warnPercent: gate.warnPercent,
+    estimateTokens: estimatedTokens,
+    hardStop: gate.hardStop,
+  });
+}
+
+/** The guard verdict for a prospective call (settings + routes). */
+export async function aiBudgetGuard(
+  config: AiRuntimeConfig,
+  input: { system: string; user?: string; context?: string; maxTokens?: number },
+): Promise<AiBudgetGuard> {
+  const gate = await loadBudgetGate(config);
+  if (!gate) {
+    return {
+      ...evaluateBudget({ limitTokens: 0 }),
+      configured: false,
+      period: budgetPeriod(),
+    };
+  }
+  const verdict = evaluateGate(gate, promptTokens(input) + (input.maxTokens ?? 0));
+  return {
+    ...verdict,
+    configured: true,
+    period: gate.record.period,
+    ...(verdict.allowed ? {} : { code: "AI_BUDGET_EXCEEDED" as const }),
+  };
+}
+
+/** Whether a chat request may start under the current ceiling. */
+export async function aiRequestBudgetAllows(
+  config: AiRuntimeConfig,
+  input: { system: string; user?: string; context?: string; maxTokens?: number },
+): Promise<boolean> {
+  return (await aiBudgetGuard(config, input)).allowed;
+}
+
+/** Token counts a provider reported (or the documented estimate). */
+export type AiCallUsage = {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  durationMs: number;
+  /** True when at least one count came from the `chars / 4` heuristic. */
+  estimated: boolean;
+};
+
+/** Per-call options: the surface label and the optional usage callback. */
+export type AiCallOptions = {
+  /** Metering bucket (`chat`, `ask`, `skill`, `autofill`, `transcribe`, …). */
+  surface?: AiSurface | string;
+  /** The caller, kept for future per-user reporting; never sent to a provider. */
+  userId?: string;
+  /** The settings connection test stays allowed but is still recorded (O25.3). */
+  bypassBudget?: boolean;
+  /** Receives the final usage totals (streams call it at end-of-stream). */
+  onUsage?: (usage: AiCallUsage) => void;
+};
+
+/**
+ * Persist one call: durable `AiUsage` for a workspace, the in-process ledger
+ * for the env fallback. Failures are recorded with zero tokens so the request
+ * count stays honest.
+ */
+async function meterCall(params: {
+  config: AiRuntimeConfig;
+  gate: BudgetGate | null;
+  options?: AiCallOptions;
+  inputTokens: number;
+  outputTokens: number;
+  ok: boolean;
+  durationMs: number;
+}): Promise<void> {
+  const { config, gate, options } = params;
+  const period = gate?.record.period ?? budgetPeriod();
+
+  if (config.workspaceId) {
+    await recordAiUsage({
+      workspaceId: config.workspaceId,
+      surface: options?.surface,
+      period,
+      inputTokens: params.ok ? params.inputTokens : 0,
+      outputTokens: params.ok ? params.outputTokens : 0,
+      ok: params.ok,
+    });
+  }
+
+  if (gate && !gate.durable) {
+    const recorded = recordUsage(gate.record, {
+      model: config.model,
+      inputTokens: params.ok ? params.inputTokens : 0,
+      outputTokens: params.ok ? params.outputTokens : 0,
+      surface: options?.surface,
+      period,
+    });
+    usageLedger.set(budgetKey(config), recorded);
+  }
+}
+
 export type ChatMessage = { role: "system" | "user"; content: string };
 
 export type ChatResult =
-  | { ok: true; text: string }
-  | { ok: false; status: number; error: string };
+  | { ok: true; text: string; usage?: AiCallUsage }
+  | { ok: false; status: number; error: string; code?: string };
 
 function envConfig(): AiRuntimeConfig | null {
   const apiKey =
     process.env.AI_API_KEY ?? process.env.OPENAI_API_KEY ?? process.env.GEMINI_API_KEY ?? "";
-  if (!apiKey) return null;
+  const baseUrl = normalizeBaseUrl(
+    process.env.AI_BASE_URL ?? "https://api.openai.com/v1",
+  );
+  const model = process.env.AI_MODEL ?? "gpt-4o-mini";
+  // A remote provider needs a key. A loopback/private endpoint may be keyless
+  // (Ollama, vLLM), so the env defaults support the same local story as the
+  // workspace configuration.
+  if (!apiKey && !isLocalAiBaseUrl(baseUrl)) return null;
   return {
     provider: "env",
-    baseUrl: normalizeBaseUrl(process.env.AI_BASE_URL ?? "https://api.openai.com/v1"),
-    model: process.env.AI_MODEL ?? "gpt-4o-mini",
+    baseUrl,
+    model,
     apiKey,
     source: "env",
     sessionId: DEPLOYMENT_SESSION_ID,
@@ -609,9 +772,15 @@ export async function resolveAiConfig(
       .findUnique({ where: { workspaceId }, select: { provider: true, baseUrl: true, model: true, apiKeyEncrypted: true, enabled: true } })
       .catch(() => null);
     if (stored?.enabled) {
-      const apiKey = decryptSecret(stored.apiKeyEncrypted);
+      // `decryptSecret` returns null for an absent envelope; the runtime config
+      // uses an empty string for "keyless", which the header builder omits.
+      const apiKey = decryptSecret(stored.apiKeyEncrypted) ?? "";
       const baseUrl = normalizeBaseUrl(stored.baseUrl ?? providerDefaultBaseUrl(stored.provider));
-      if (apiKey && baseUrl && stored.model) {
+      // A keyless config is valid only when the endpoint is local: a remote
+      // provider without a key would fail at the provider anyway, and falling
+      // through to the env defaults keeps a broken workspace row from
+      // shadowing a working deployment config.
+      if (baseUrl && stored.model && (apiKey || isLocalAiBaseUrl(baseUrl))) {
         return {
           provider: stored.provider,
           baseUrl,
@@ -669,26 +838,55 @@ export async function chatComplete(
     maxTokens?: number;
   },
   config: AiRuntimeConfig,
+  options?: AiCallOptions,
 ): Promise<ChatResult> {
+  const startedAt = Date.now();
+
+  // The training boundary is checked before any content is serialised: a
+  // provider the operator declared as training is refused unless they also
+  // opted in.
+  try {
+    assertAiDataBoundary(config.provider);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "AI data boundary refused the call.";
+    await meterCall({
+      config,
+      gate: null,
+      options,
+      inputTokens: 0,
+      outputTokens: 0,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+    });
+    return { ok: false, status: 403, error: message };
+  }
+
   const messages: ChatMessage[] = [{ role: "system", content: input.system }];
   if (input.context) {
     messages.push({ role: "user", content: `Context:\n${input.context}` });
   }
   if (input.user) messages.push({ role: "user", content: input.user });
 
-  // Cost control: refuse the call up-front when it would cross the workspace's
-  // token ceiling. `checkBudget` is inclusive, so a request landing exactly on
-  // the limit is still allowed. Enforcement is off unless AI_BUDGET_TOKENS is
-  // set, so the default deployment is unaffected.
   const estimatedPromptTokens = promptTokens(input);
-  const budget = loadBudget(config);
-  if (budget) {
-    const verdict = checkBudget(budget, {
-      estimatedTokens: estimatedPromptTokens + (input.maxTokens ?? 0),
-      model: config.model,
-    });
+  const gate = await loadBudgetGate(config);
+
+  // Cost control: refuse up-front when this call would cross the workspace's
+  // token ceiling. `evaluateBudget` is inclusive, so a request landing exactly
+  // on the limit is allowed; a soft budget (`hardStop: false`) reports `over`
+  // but dispatches. The settings connection test is the one deliberate bypass
+  // (O25.3): it is still recorded below.
+  if (gate && !options?.bypassBudget) {
+    const verdict = evaluateGate(
+      gate,
+      estimatedPromptTokens + (input.maxTokens ?? 0),
+    );
     if (!verdict.allowed) {
-      return { ok: false, status: 429, error: AI_BUDGET_EXCEEDED };
+      return {
+        ok: false,
+        status: 503,
+        error: AI_BUDGET_EXCEEDED,
+        code: "AI_BUDGET_EXCEEDED",
+      };
     }
   }
 
@@ -708,7 +906,16 @@ export async function chatComplete(
       const text = await response.text();
       const failure = providerFailure(response.status, text, config.apiKey);
       logProviderFailure(failure, providerAttribution(config));
-      return { ok: false, status: 502, error: failure.message };
+      await meterCall({
+        config,
+        gate,
+        options,
+        inputTokens: 0,
+        outputTokens: 0,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+      });
+      return { ok: false, status: 502, error: failure.message, code: failure.code };
     }
     const data = (await response.json()) as {
       choices?: { message?: { content?: string } }[];
@@ -716,27 +923,48 @@ export async function chatComplete(
     };
     const text = data.choices?.[0]?.message?.content ?? "";
 
-    // Meter the call against the budget. Providers usually report token usage;
-    // when one does not, fall back to the same `chars / 4` estimate the
-    // pre-flight check used, so limits still hold under real traffic.
-    if (budget) {
-      const recorded = recordUsage(budget, {
-        model: config.model,
-        inputTokens: data.usage?.prompt_tokens ?? estimatedPromptTokens,
-        outputTokens: data.usage?.completion_tokens ?? estimateTokens(text),
-        surface: "chat",
-        period: budgetPeriod(),
-      });
-      usageLedger.set(budgetKey(config), recorded);
-    }
+    // Providers usually report token usage; when one does not, fall back to
+    // the same `chars / 4` estimate the pre-flight check used, so limits still
+    // hold under real traffic. One meter call fans out to the durable
+    // `AiUsage` counter and (for env-only configs) the fallback ledger.
+    const inputTokens = data.usage?.prompt_tokens ?? estimatedPromptTokens;
+    const outputTokens = data.usage?.completion_tokens ?? estimateTokens(text);
+    const usage: AiCallUsage = {
+      model: config.model,
+      inputTokens,
+      outputTokens,
+      durationMs: Date.now() - startedAt,
+      estimated:
+        data.usage?.prompt_tokens === undefined ||
+        data.usage?.completion_tokens === undefined,
+    };
+    await meterCall({
+      config,
+      gate,
+      options,
+      inputTokens,
+      outputTokens,
+      ok: true,
+      durationMs: usage.durationMs,
+    });
+    options?.onUsage?.(usage);
 
-    return { ok: true, text };
+    return { ok: true, text, usage };
   } catch {
     // A transport failure: the runtime's message can carry the request header,
     // and the header carries the workspace's key. It is never forwarded — not
     // even scrubbed, since a scrubber only knows credential *shapes* and the
     // tail of a key with an interior newline is no shape at all. The class
     // goes to the client, the class goes to the log.
+    await meterCall({
+      config,
+      gate,
+      options,
+      inputTokens: 0,
+      outputTokens: 0,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+    });
     return { ok: false, status: 502, error: transportFailure(providerAttribution(config)) };
   }
 }
@@ -749,11 +977,6 @@ export async function chatComplete(
  * the runtime's error — the caller must reduce it to a class before it reaches
  * a client (`providerClass`), because the runtime's message can carry the
  * request header, and the header carries the workspace's key.
- *
- * The token ceiling is enforced here as well: this is the transport the chat
- * panel reaches for first, so a gate the single-shot transport alone carried
- * would not hold on the ordinary path. The refusal is thrown as a class, so
- * the stream's in-band failure carries the message.
  */
 export async function* chatCompleteStream(
   input: {
@@ -764,59 +987,140 @@ export async function* chatCompleteStream(
     maxTokens?: number;
   },
   config: AiRuntimeConfig,
+  options?: AiCallOptions,
 ): AsyncGenerator<string, void, unknown> {
+  const startedAt = Date.now();
+
+  try {
+    assertAiDataBoundary(config.provider);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "AI data boundary refused the call.";
+    await meterCall({
+      config,
+      gate: null,
+      options,
+      inputTokens: 0,
+      outputTokens: 0,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+    });
+    throw new ProviderClassError("data_boundary", message);
+  }
+
   const messages: ChatMessage[] = [{ role: "system", content: input.system }];
   if (input.context) messages.push({ role: "user", content: `Context:\n${input.context}` });
   if (input.user) messages.push({ role: "user", content: input.user });
 
-  // Cost control: the same pre-flight verdict the single-shot transport makes
-  // — `checkBudget` is inclusive, so a request landing exactly on the limit is
-  // still allowed. A refusal is thrown as a class, so the failure that travels
-  // in-band is the budget message and not a transport error.
+  // The streaming transport is the ordinary chat path, so the ceiling has to
+  // hold here too. The caller checks this before it opens the stream (to answer
+  // 503); this is the transport's own fail-closed guard for other callers.
   const estimatedPromptTokens = promptTokens(input);
-  const budget = loadBudget(config);
-  if (budget) {
-    const verdict = checkBudget(budget, {
-      estimatedTokens: estimatedPromptTokens + (input.maxTokens ?? 0),
-      model: config.model,
-    });
+  const gate = await loadBudgetGate(config);
+  if (gate && !options?.bypassBudget) {
+    const verdict = evaluateGate(gate, estimatedPromptTokens + (input.maxTokens ?? 0));
     if (!verdict.allowed) {
       throw new ProviderClassError("budget_exceeded", AI_BUDGET_EXCEEDED);
     }
   }
 
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: providerRequestHeaders(config, { json: true }),
-    body: JSON.stringify({
-      model: config.model,
-      messages,
-      temperature: input.temperature ?? 0.4,
-      stream: true,
-      // A provider reports the usage of a streamed call in a final frame — but
-      // only when it is asked for it (docs/specs/ai-surface.md §6).
-      stream_options: { include_usage: true },
-      ...(input.maxTokens ? { max_tokens: input.maxTokens } : {}),
-    }),
-    signal: AbortSignal.timeout(60_000),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${config.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: providerRequestHeaders(config, { json: true }),
+      body: JSON.stringify({
+        model: config.model,
+        messages,
+        temperature: input.temperature ?? 0.4,
+        stream: true,
+        // Ask OpenAI-compatible providers for the final usage frame; providers
+        // that ignore it are metered with the documented estimate instead.
+        stream_options: { include_usage: true },
+        ...(input.maxTokens ? { max_tokens: input.maxTokens } : {}),
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+  } catch (error) {
+    await meterCall({
+      config,
+      gate,
+      options,
+      inputTokens: 0,
+      outputTokens: 0,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+    });
+    throw error;
+  }
+
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
     const failure = providerFailure(response.status, detail, config.apiKey);
     logProviderFailure(failure, providerAttribution(config));
+    await meterCall({
+      config,
+      gate,
+      options,
+      inputTokens: 0,
+      outputTokens: 0,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+    });
     // Thrown as a class: a caller may forward the message, and the message is
     // the class — never the provider's body.
     throw new ProviderClassError(failure.code, failure.message);
   }
   if (!response.body) {
+    await meterCall({
+      config,
+      gate,
+      options,
+      inputTokens: 0,
+      outputTokens: 0,
+      ok: false,
+      durationMs: Date.now() - startedAt,
+    });
     throw new Error("AI provider returned an empty response.");
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
-  let answer = "";
-  let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  let outputText = "";
+  let providerUsage: { prompt_tokens?: number; completion_tokens?: number } | null = null;
+  let failed = false;
+  let settled = false;
+
+  // The single end-of-stream meter: `settled` makes it idempotent across the
+  // `[DONE]` frame, the end of the body and an early consumer abort. A failed
+  // stream is still recorded (zero/partial tokens, `ok: false`) so requests
+  // and failures stay honest.
+  const finish = async () => {
+    if (settled) return;
+    settled = true;
+    const inputTokens = providerUsage?.prompt_tokens ?? estimatedPromptTokens;
+    const outputTokens = providerUsage?.completion_tokens ?? estimateTokens(outputText);
+    const usage: AiCallUsage = {
+      model: config.model,
+      inputTokens,
+      outputTokens,
+      durationMs: Date.now() - startedAt,
+      estimated:
+        providerUsage?.prompt_tokens === undefined ||
+        providerUsage?.completion_tokens === undefined,
+    };
+    await meterCall({
+      config,
+      gate,
+      options,
+      inputTokens,
+      outputTokens,
+      ok: !failed,
+      durationMs: usage.durationMs,
+    });
+    options?.onUsage?.(usage);
+  };
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -834,11 +1138,12 @@ export async function* chatCompleteStream(
             choices?: { delta?: { content?: string } }[];
             usage?: { prompt_tokens?: number; completion_tokens?: number };
           };
-          // The usage frame carries no delta — it is what the meter reads.
-          if (event.usage) usage = event.usage;
+          // The usage frame usually carries no choices; read it before the
+          // delta so the last frame of a stream is never mistaken for noise.
+          if (event.usage) providerUsage = event.usage;
           const delta = event.choices?.[0]?.delta?.content;
           if (delta) {
-            answer += delta;
+            outputText += delta;
             yield delta;
           }
         } catch {
@@ -846,22 +1151,11 @@ export async function* chatCompleteStream(
         }
       }
     }
+  } catch (error) {
+    failed = true;
+    throw error;
   } finally {
-    // Meter the call against the budget, the way the single-shot transport
-    // does. The provider usually reports the usage; when it does not, fall
-    // back to the same `chars / 4` estimate the pre-flight check used, so
-    // limits still hold under real traffic. The meter runs even when the
-    // stream was cut short: those tokens were billed as well.
-    if (budget) {
-      const recorded = recordUsage(budget, {
-        model: config.model,
-        inputTokens: usage?.prompt_tokens ?? estimatedPromptTokens,
-        outputTokens: usage?.completion_tokens ?? estimateTokens(answer),
-        surface: "chat",
-        period: budgetPeriod(),
-      });
-      usageLedger.set(budgetKey(config), recorded);
-    }
+    await finish();
   }
 }
 

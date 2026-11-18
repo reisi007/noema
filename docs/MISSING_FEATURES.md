@@ -2,48 +2,26 @@
 
 > Generated from `docs/FEATURE_MATRIX.md` by `npm run docs:gaps`. Do not edit by hand.
 
-**Status:** 563 feature rows — 454 implemented · 87 partial · 0 planned · 22 deliberately out of scope.
+**Status:** 565 feature rows — 513 implemented · 30 partial · 0 planned · 22 deliberately out of scope.
 
-This file lists the **87** rows that are not finished, area by area, plus 22 intentional divergences.
+This file lists the **30** rows that are not finished, area by area, plus 22 intentional divergences.
 
 ## Read this first — highest-leverage gaps
 
 | # | Gap | Why it matters | Area |
 | --- | --- | --- | --- |
-| 1 | **Filter tree UI** | The AND/OR filter tree already evaluates; the nested group builder UI is not exposed. | 3. Databases |
-| 2 | **Conditional formatting** | ColorRule is modelled and evaluated; the rule-authoring and render path are partial. | 3. Databases |
-| 3 | **Form view** | No ViewType.FORM yet; the builder + public submit path are spec'd but unwired. | 3. Databases |
-| 4 | **Linked database views** | The read-only node exists; view identity and per-instance overrides are missing. | 3. Databases |
-| 5 | **Synced blocks** | Mirror one block's content in many places with a canonical source marker. | 1. Editor & blocks |
-| 6 | **Suggestions mode** | Propose edits for approval with a diff overlay. | 7. Collaboration |
-| 7 | **Comment depth** | Server-side depth validation, block anchors and dispatch scoping on page threads. | 7. Collaboration |
-| 8 | **Notification inbox & preferences** | Per-user delivery preferences, digests and PageFollow dispatch are missing. | 7. Collaboration |
-| 9 | **Pagination everywhere** | Databases, tickets and audit lists load bounded sets; cursor pagination is pending. | 17. Data model & platform |
-| 10 | **Audit log UI** | Activity is recorded per ticket/page; a workspace-wide, filterable audit view is missing. | 8. Sharing & permissions |
-| 11 | **Object storage & backups** | Uploads and scheduled backups to S3-compatible storage. | 17. Data model & platform |
-| 12 | **SAML SSO** | OIDC is implemented and tested; SAML needs a provider-agnostic strategy layer. | 8. Sharing & permissions |
-| 13 | **Undo/redo (global)** | App-wide undo beyond the editor's local history. | 16. Navigation & UX |
-| 14 | **Self-hosting & auth** | Packaging, provider-agnostic sign-in and documented deployment remain. | 17. Data model & platform |
+| 1 | **SAML SSO** | Login, per-workspace connections, domain auto-join, metadata rotation, SLO, settings/activity UI, invite precedence and SCIM Users/Groups→teamspaces+roles are implemented; a dry test-connection action and split per-IdP pages remain. | 8. Sharing & permissions |
+| 2 | **Undo/redo (global)** | Page rename/icon/cover/move/archive/favorite/layout and property edits are undoable; bulk row actions and a history list remain. | 16. Navigation & UX |
+| 3 | **Self-hosting & auth** | Packaging, provider-agnostic sign-in and documented deployment remain. | 17. Data model & platform |
 
 ## By area
 
 ### 1. Editor & blocks
 
-86 done · 12 partial · 0 planned · 2 out of scope
+98 done · 1 partial · 0 planned · 2 out of scope
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| Inline equation | Small LaTeX expression inside a text line. | 🟡 | KaTeX renderer wired; editing UX rough. |
-| Block equation | Centered display equation. | 🟡 | Renders via KaTeX; edit/preview split unstable. |
-| KaTeX/LaTeX support | Math syntax engine for equations. | 🟡 | KaTeX chosen; macro support limited. |
-| Synced block | Mirror one block's content in many places. | 🟡 | Planned via reference ids; editing propagation needs care. |
-| Synced block source marker | Visual marker of the canonical source. | 🟡 | Planned. |
-| Template button block | Reusable set of blocks inserted on click. | 🟡 | Planned; depends on template subsystem. |
-| Button block | Interactive button triggering configured actions. | 🟡 | Planned; depends on automations. |
-| Ask-AI block | Prompt-driven AI block inside a page. | 🟡 | Planned; depends on AI layer and provider keys. |
-| Two-column page property layout | Place properties side by side. | 🟡 | Planned with property panel rework. |
-| Inline database block | A database rendered inside a page. | 🟡 | Renders a collection view inline; view config incomplete. |
-| Linked view of a database | Re-display an existing database elsewhere. | 🟡 | Planned; requires stable view model. |
 | Drag to another page | Move a block into a different page. | 🟡 | Planned. |
 | Comment block (doc annotation) | Pulls comments conceptually into flow. | ⛔ | Superseded by the inline comment model; not a block. |
 | Table merge/split cells | Combine or split cells. | ⛔ | High complexity for low demand; revisit if requested. |
@@ -58,58 +36,31 @@ This file lists the **87** rows that are not finished, area by area, plus 22 int
 
 ### 3. Databases
 
-44 done · 9 partial · 0 planned
+52 done · 1 partial · 0 planned
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| AND/OR filter groups | Boolean combination of filters. | 🟡 | Planned as a filter tree. FilterNode tree already evaluates (database-query.ts:66); tree UI spec'd: docs/specs/database-deep.md (R89.2). |
-| Nested filter groups | Arbitrary-depth boolean nesting. | 🟡 | Planned after flat groups. Spec'd with the tree UI: docs/specs/database-deep.md (R89.2). |
-| Conditional formatting | Color rows/cells by rule. | 🟡 | Planned. ColorRule already modelled in view config (database-query.ts:68); rule editor + evaluation spec'd: docs/specs/database-deep.md (R89.5). |
-| Row color rules | Two-tone row backgrounds. | 🟡 | Planned subset of conditional formatting. Spec'd: docs/specs/database-deep.md (R89.5). |
-| Linked database | Reuse a database elsewhere. | 🟡 | Planned; requires view identity model. Read-only node exists (linked-database.tsx, attrs = databasePageId only); view identity, per-instance overrides and synced mode spec'd: docs/specs/database-deep.md (R89.14, R89.15). |
-| Sub-items / sub-tasks | Parent-child rows inside a database. | 🟡 | Planned; tree ordering needed. Page.subOfId (depth cap 1) spec'd independent of relations: docs/specs/database-deep.md (R89.30). |
-| Dependencies | Blocking/blocked-by between rows. | 🟡 | Planned; mainly for timeline. RowDependency join model with cycle guard spec'd: docs/specs/database-deep.md (R89.31). |
-| Timeline dependencies | Draw dependency arrows on timeline. | 🟡 | Planned. Arrow rendering inside the gantt depth spec: docs/specs/database-deep.md (R89.31 with R89.11). |
-| Recurring templates | Create rows on a schedule. | 🟡 | Planned; depends on a scheduler. Core (resolver/nextRun/cron driver) owned by docs/specs/templates.md (R31.18-R31.23); database-side surfacing + system-actor materialization spec'd: docs/specs/database-deep.md (R89.17). |
+| Form view | Public/Internal form that creates rows. | 🟡 | The internal FORM view is wired end-to-end: ViewType.FORM (schema, canonical type list, view menu and action guards), the respondent renderer, validation, an inline builder (title/description/questions/required/order/accepting/submit copy) and atomic row creation through submitFormAction (server re-authorization, stored-schema revalidation, per-user/per-address throttles, row + cells in one transaction). Public forms publish one view through ShareLink.viewId at /s/<token>: the builder creates/copies/revokes the link and shows response count, the route handles password/expiry/unlock, and submitPublicFormAction applies per-address/link throttles plus stored-schema revalidation and an atomic row+cells write. Public links intentionally hide PEOPLE/FILES/VERIFICATION questions because those editors need a signed-in session; internal forms keep them. |
 
 ### 4. Properties
 
-27 done · 8 partial · 0 planned · 1 out of scope
+35 done · 0 partial · 0 planned · 1 out of scope
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| Relation property | Link rows across databases. | 🟡 | Planned. Spec: docs/specs/relations-rollups.md. |
-| Relation (single) | One linked row. | 🟡 | Planned. Spec: docs/specs/relations-rollups.md. |
-| Relation (multi) | Many linked rows. | 🟡 | Planned. Spec: docs/specs/relations-rollups.md. |
-| Two-way relation | Reciprocal relation property. | 🟡 | Planned; requires pair metadata. Spec: docs/specs/relations-rollups.md. |
-| Rollup property | Aggregate across a relation. | 🟡 | Planned; depends on relations. Spec: docs/specs/relations-rollups.md. |
-| Rollup functions | Count, sum, average, min/max, join, etc. | 🟡 | Planned function set. Spec: docs/specs/relations-rollups.md. |
-| Last edited by | Last editor. | 🟡 | Tracked from property/table edits via the activity log (falls back to creator); content/title edits outside the database view not yet recorded. |
-| AI autofill property | AI-generated value per row. | 🟡 | Planned; depends on AI layer. |
 | Property type change | Convert a property's type. | ⛔ | Lossy conversions; only safe transforms planned later. |
-
-### 5. Formulas
-
-15 done · 1 partial · 0 planned
-
-| Feature | What it should do | Status | Notes |
-| --- | --- | --- | --- |
-| Formula editor | Author expressions with autocomplete. | 🟡 | Planned; expression parser first. Spec: docs/specs/formula-engine.md. |
 
 ### 6. Templates
 
-6 done · 3 partial · 0 planned · 1 out of scope
+9 done · 0 partial · 0 planned · 1 out of scope
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| Page templates | Duplicate a page for reuse. | 🟡 | Duplicate-page works; gallery UI missing. Spec: docs/specs/templates.md. |
-| Recurring templates | Scheduled row creation. | 🟡 | Planned; needs scheduler. Spec: docs/specs/templates.md. |
-| Template duplication | Clone a template into a page. | 🟡 | Planned. Spec: docs/specs/templates.md. |
 | Template from selection | Turn a block selection into a template. | ⛔ | Uncommon flow; skip initially. B80 blocked-row triage: docs/specs/templates.md:308 + docs/specs/workspaces-structure.md §4 (editor-slot dependency). |
 
 ### 7. Collaboration
 
-21 done · 5 partial · 0 planned
+20 done · 6 partial · 0 planned
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
@@ -117,30 +68,20 @@ This file lists the **87** rows that are not finished, area by area, plus 22 int
 | CRDT data model | Conflict-free replicated structures. | 🟡 | Planned (automerge/Yjs-style). Spec: docs/specs/realtime-collab.md. |
 | Presence | See who is viewing a page. | 🟡 | Planned. |
 | Live cursors | Remote carets and selections. | 🟡 | Planned; needs presence transport. |
+| Comment mentions | Mention people in comments. | 🟡 | `@Name`, `@first`, `@ada@example.com` notify matching workspace members (`page.mention`); matching is a tested pure helper. Targets are the current `workspaceMember` rows, the author is skipped, and a guest target is filtered through `guestReadablePageIds` so a guest outside the page read scope receives neither the notification nor its `pageId`. Still open: no cross-event coalescing, edits do not re-dispatch, and inline `@user` nodes in page content dispatch nothing. R79.4. |
 | Coarse edit locks | Prevent simultaneous structural edits. | 🟡 | Planned fallback before full CRDT. |
 
 ### 8. Sharing & permissions
 
-20 done · 2 partial · 0 planned
+21 done · 1 partial · 0 planned
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| Owner role | Full control of the workspace. | 🟡 | Modeled; transfer flows missing. |
 | Move pages across workspaces | Relocate content between workspaces. | 🟡 | Planned; id-remap complexity. |
-
-### 9. Workspaces & structure
-
-20 done · 3 partial · 0 planned
-
-| Feature | What it should do | Status | Notes |
-| --- | --- | --- | --- |
-| Trash / recently deleted | Deleted pages list. | 🟡 | Soft delete exists; trash UI partial. |
-| Restore from trash | Undo a deletion. | 🟡 | Planned. |
-| Permanent delete | Permanently remove an item. | 🟡 | Planned; purge job needed. |
 
 ### 13. Integrations & API
 
-15 done · 7 partial · 0 planned
+18 done · 4 partial · 0 planned
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
@@ -148,67 +89,33 @@ This file lists the **87** rows that are not finished, area by area, plus 22 int
 | GitHub integration | Link commits/PRs. | 🟡 | Planned. |
 | Google Calendar sync | Two-way calendar sync. | 🟡 | ICS subscription import (read-only); no two-way OAuth sync yet. |
 | Outlook Calendar sync | Two-way calendar sync. | 🟡 | Works through the published ICS URL; native OAuth pending. |
-| MCP server | Expose workspace to AI agents. | ✅ | 43 token-scoped tools over `/api/mcp`; read-first, write/admin opt-in. See `docs/MCP.md`. |
-| Inbound webhooks | Accept events from outside. | 🟡 | Planned. |
-| Public embed oEmbed | Resolve third-party link metadata. | 🟡 | Basic title/favicon fetch. |
-
-### 14. AI
-
-7 done · 9 partial · 0 planned
-
-| Feature | What it should do | Status | Notes |
-| --- | --- | --- | --- |
-| AI autofill property | Generate row values. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Summarization | Summarize a page or section. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Translation | Translate selection or page. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Continue writing | Extend text from context. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Explain/Simplify | Rewrite for clarity. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Local model support | Run models without a cloud. | 🟡 | Planned; aligns with self-hosting. Spec: docs/specs/ai-surface.md. |
-| Prompt library | Reusable saved prompts. | 🟡 | Seven built-in AI skills with server-side prompts (`src/lib/ai-skills.ts`); user-defined prompts pending. Spec: docs/specs/ai-surface.md. |
-| AI cost controls | Token budgets per workspace. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| AI data boundaries | Guarantee no training on your data. | 🟡 | Planned; documented policy. Spec: docs/specs/ai-surface.md. |
-
-### 15. Media & embeds
-
-19 done · 2 partial · 0 planned
-
-| Feature | What it should do | Status | Notes |
-| --- | --- | --- | --- |
-| Paste image from clipboard | Insert a copied image. | 🟡 | Works for many sources. |
-| Animated GIF/devices | Play GIFs and device previews. | 🟡 | Planned. |
 
 ### 16. Navigation & UX
 
-44 done · 3 partial · 0 planned · 2 out of scope
+48 done · 0 partial · 0 planned · 2 out of scope
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| Focus management | Visible focus and traps. | 🟡 | Global `:focus-visible` ring everywhere; B45 hardened `ui/dialog` — Tab/Shift+Tab cycle inside with wrap, explicit `aria-modal="true"`, initial focus in-dialog, and focus restored to the invoker even for trigger-less controlled dialogs — plus `ui/dropdown-menu` (Escape → focus back to its trigger); both locked by `e2e/focus.spec.ts`. Still partial: hand-rolled feature overlays bypass the primitive entirely — `topbar/actions-menu`, `who-has-access`, `version-history`, `tickets/ticket-drawer`, `editor/equation-editor` have no Tab trap, Escape only works in the actions menu and equation editor, and `version-history` / `ticket-drawer` also lack `aria-modal` → feature-level follow-up (feature components are off-limits to B45). |
-| RTL support | Right-to-left layouts. | 🟡 | Arabic sets `dir="rtl"` and logical CSS; mixed-direction blocks untested. |
-| Undo/redo (global) | App-wide undo beyond editor. | 🟡 | Planned. |
 | Actions menu: Turn into wiki | Convert page to a wiki. | ⛔ | Data model lacks wiki type; blocked pending spec. B11 ships the entry as a disabled menu item with tooltip "Wiki coming soon" — not faked. |
 | Open in desktop app | "Open in Windows app" entry. | ⛔ | No desktop app; N/A for web parity. |
 
 ### 17. Data model & platform
 
-23 done · 14 partial · 0 planned
+26 done · 11 partial · 0 planned
 
 | Feature | What it should do | Status | Notes |
 | --- | --- | --- | --- |
-| Page snapshots | Versioned page state. | 🟡 | Planned; basis for history. |
 | Incremental syncing | Sync only changed blocks. | 🟡 | Planned; op-log approach. |
 | Offline cache | Local store for offline use. | 🟡 | Planned (IndexedDB/SQLite). |
 | Sync conflict handling | Merge concurrent edits. | 🟡 | Planned; CRDT. |
 | Transactions / atomic writes | All-or-nothing updates. | 🟡 | Planned; Prisma transactions. Spec: docs/specs/engineering-hardening.md. |
 | Multi-tenancy | Isolate workspaces. | 🟡 | Workspace scoping modeled. |
-| Restore from backup | Recover data. | 🟡 | Planned. |
 | Observability | Logs, metrics, traces. | 🟡 | Planned; OpenTelemetry. |
 | Error tracking | Capture and triage errors. | 🟡 | Planned. |
 | Authentication | Sign-up and sign-in. | 🟡 | Session auth; providers limited. |
 | Session management | Expire and revoke sessions. | 🟡 | Sessions stored; revocation partial. Spec: docs/specs/engineering-hardening.md. |
+| SSO / SAML | Enterprise single sign-on. | 🟡 | OIDC authorization-code + JWKS verification, and an **env-level SAML 2.0 connection** (`AUTH_SAML_*`): start/ACS/metadata/SLO routes, `@node-saml/node-saml` signature/audience/destination/condition validation with 120 s skew, a Postgres assertion replay cache, signed RelayState (no SameSite-cookie dependency on the cross-site POST), JIT users and verified-only account linking (B07). Both refuse an unverified local account with `?error=sso_email_taken`. Env-level directory auto-join maps `AUTH_SAML_GROUPS_ATTRIBUTE` through `AUTH_SAML_ROLE_RULES` into `AUTH_SAML_WORKSPACE_ID` (highest rule wins, OWNER is never granted, an existing owner is never demoted). Per-workspace `SsoConnection` rows, admin CRUD actions, `?connection=` start/metadata/ACS resolution and `VerifiedDomain` DNS verification are implemented; a verified email domain auto-joins its workspace when the env connection has no fixed workspace. Metadata-URL refresh parses the IdP document and rotates the signing certificate with a 24-hour previous-certificate overlap. SLO validates POST/redirect logout messages while always ending the local session. The **SSO settings section** manages connections, metadata refresh and verified domains (admin-only). SCIM **Users** endpoints are implemented with hashed bearer tokens, JIT user/membership creation, pagination, lookup, active=false deprovisioning and owner protection. SCIM **Groups** map to teamspaces (list/get/create/add/remove/replace members/delete), and group membership recomputes the mapped workspace role from the connection's `roleRules` (OWNER is never demoted). Login email-domain chooser, invite precedence for JIT users and the recent-SSO activity view are implemented. Each connection has a dedicated setup page with copyable SP entity/ACS/metadata/SLO URLs and an admin-only dry **Test connection** report (required fields, certificate parse/validity, SP origin consistency, SSRF-guarded metadata reachability/entity/SSO/certificate checks); it never sends an AuthnRequest. Setup: docs/integrations/saml.md. |
 | Self-hosting | Run on your own server. | 🟡 | Local dev works; packaging pending. Spec: docs/specs/engineering-hardening.md. |
-| Background jobs | Async task runner. | 🟡 | Planned; queue for imports/AI. |
-| GDPR data controls | Delete/export personal data. | 🟡 | Planned; admin tooling. |
 
 ### 18. Pricing & plan-gated features
 
@@ -244,14 +151,4 @@ This file lists the **87** rows that are not finished, area by area, plus 22 int
 | AI vendor lock-in | AI options tied to one vendor. | ⛔ | Noema supports BYO/local models; divergence. |
 | Third-party tracking | Hosted analytics on public pages. | ⛔ | Noema ships no trackers by default; divergence. |
 | Mandatory accounts for sharing | Viewers may need accounts. | ⛔ | Noema plans lightweight guest viewing. |
-
-### 20. Projects, tickets & planning
-
-29 done · 3 partial · 0 planned
-
-| Feature | What it should do | Status | Notes |
-| --- | --- | --- | --- |
-| Roadmap view | Timeline across projects. | 🟡 | Project Gantt exists; a cross-project roadmap view is pending. |
-| Recurring tickets | Repeat on a schedule. | 🟡 | Planned; template recurrence exists for page templates. Spec: docs/specs/automations.md. |
-| Per-project role editor | Fine-grained project roles. | 🟡 | Planned; workspace roles exist today. |
 

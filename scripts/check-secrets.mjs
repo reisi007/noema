@@ -226,9 +226,18 @@ const ALLOWED = new Set([
   "sk-proj-0123456789abcdef", // src/lib/ai-provider.error.test.ts — a fixture of an earlier revision
   "postgresql://${DB_USER}:${DB_USER}@${host}:${port}/${DB_NAME}?schema=public&connection_limit=1", // scripts/desktop/embedded-db.cjs — an earlier revision
   "b85-proof-secret", // scripts/_b85-redproof.mjs — a deleted proof script, only in the history
+  // Upstream's navigation/URL fixtures — literal dummy hosts and credentials.
+  "http://127.0.0.1:47821@evil.example/", // src-tauri/src/navigation.rs — SSRF test URL
+  "http://127.0.0.1:47821@evil.example", // the same literal as the gate's regex captures (no trailing slash)
+  "postgres://u:p@h:5432/db", // src-tauri/src/state.rs — validate_database_url fixture
+  "https://user:secret@host/v1", // src/lib/ai-providers.ts — documentation of a rejected base URL
 ]);
 
 const ALLOWED_IN_TESTS = new Set([
+  "https://user:secret@example.com/v1", // src/lib/ai-providers.endpoint.test.ts — rejected base URL fixture
+  "http://user:secret@localhost:11434", // src/lib/local-models.test.ts — local model fixture
+  "https://user:pass@example.com/v1", // src/server/actions/ai-settings.local.test.ts — rejected base URL fixture
+  "automations-test-secret", // src/server/actions/automations.test.ts — automation secret fixture
   "sk-live-abcdef1234567890", // src/app/api/ai/*.test.ts, src/lib/ai-provider.error.test.ts
   "sk-transcribe-abcdef1234567890", // src/app/api/ai/transcribe/route.test.ts
   "sk-proj-zzzzzzzzzzzzzzzz", // src/lib/ai-provider.error.test.ts

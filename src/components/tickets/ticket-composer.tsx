@@ -344,6 +344,7 @@ export function TicketComposerForm({
             min={0}
             step={ESTIMATE_STEP}
             placeholder={t(locale, "estimateWord")}
+            aria-label={t(locale, "ticketEstimateAria")}
             disabled={pending}
             invalid={Boolean(errors.estimate)}
             errorMessage={errors.estimate}
@@ -368,6 +369,7 @@ export function TicketComposerForm({
             setStartDate(value.date ?? "");
             clearError("dueDate");
           }}
+          aria-label={t(locale, "startDateAria")}
           placeholder={t(locale, "startDateAria")}
           showPresets={false}
           className={cn("w-full", pending && "pointer-events-none opacity-50")}
@@ -383,6 +385,7 @@ export function TicketComposerForm({
             setDueDate(value.date ?? "");
             clearError("dueDate");
           }}
+          aria-label={t(locale, "dueDateAria")}
           placeholder={t(locale, "dueDateAria")}
           showPresets={false}
           className={cn("w-full", pending && "pointer-events-none opacity-50")}
@@ -442,6 +445,7 @@ export function TicketComposerForm({
                 hue={label.color}
                 size="sm"
                 dot
+                title={label.description || undefined}
                 selected={labelIds.includes(label.id)}
                 disabled={pending}
                 onSelectedChange={(next) => toggleLabel(label.id, next)}

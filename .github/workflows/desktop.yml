@@ -1,9 +1,9 @@
-# Desktop app: builds the installable app for Windows, macOS (Intel + Apple
-# Silicon) and Linux.
+# Desktop app: builds the installable app for Windows, macOS (Apple Silicon)
+# and Linux.
 #
 # Two things are unusual here on purpose:
 #  · the Rust shell is built on native runners (cross-compiling a webview app is
-#    not supported), and macOS is built twice for both architectures;
+#    not supported), so macOS is built on an Apple Silicon runner;
 #  · the payload is assembled *before* Tauri packs it — the Next standalone
 #    server, its static assets, the Prisma CLI and a Node runtime — because the
 #    installed app must not require Node, npm or a terminal.
@@ -69,10 +69,6 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             rust-target: aarch64-apple-darwin
-            bundles: dmg,app
-          - os: macos-15-intel
-            name: macos-x64
-            rust-target: x86_64-apple-darwin
             bundles: dmg,app
 
     steps:
@@ -146,6 +142,9 @@ jobs:
         run: npm run desktop:prepare
         env:
           DATABASE_URL: postgresql://noema:dummy@127.0.0.1:5432/noema?schema=public
+          # `desktop:prepare` runs `next build`; the larger app chunk and the
+          # 7 GB macOS runner can otherwise abort the Next worker with SIGABRT.
+          NODE_OPTIONS: --max-old-space-size=4096
 
       - name: Type-check Rust
         working-directory: src-tauri
@@ -162,10 +161,14 @@ jobs:
         env:
           # linuxdeploy ships as an AppImage; extract it instead of requiring FUSE.
           APPIMAGE_EXTRACT_AND_RUN: "1"
+          # The payload is already assembled above. Tauri still runs
+          # `beforeBuildCommand`; this makes it assert freshness and re-stage
+          # instead of running a second `next build`, which runs the macOS
+          # runner out of heap.
+          NOEMA_SKIP_BUILD: "1"
         # No token and no tag: this job only builds. Creating the release — the
         # one thing that needs `contents: write` — is the `release` job's.
         with:
-          # The payload is already assembled, so skip the JS build hook.
           # --verbose is deliberate: Tauri otherwise hides linuxdeploy's stderr
           # behind "failed to run linuxdeploy".
           args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }} --verbose
@@ -209,10 +212,6 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             rust-target: aarch64-apple-darwin
-            bundles: dmg,app
-          - os: macos-15-intel
-            name: macos-x64
-            rust-target: x86_64-apple-darwin
             bundles: dmg,app
 
     steps:
@@ -284,6 +283,9 @@ jobs:
         run: npm run desktop:prepare
         env:
           DATABASE_URL: postgresql://noema:dummy@127.0.0.1:5432/noema?schema=public
+          # `desktop:prepare` runs `next build`; the larger app chunk and the
+          # 7 GB macOS runner can otherwise abort the Next worker with SIGABRT.
+          NODE_OPTIONS: --max-old-space-size=4096
 
       - name: Type-check Rust
         working-directory: src-tauri
@@ -295,12 +297,13 @@ jobs:
         working-directory: src-tauri
         run: cargo test --all-features
 
-      - name: Build the app and open the draft release
-        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+      - name: Configure code signing
+        # GitHub exposes a missing secret as an *empty* environment variable.
+        # The macOS bundler treats APPLE_CERTIFICATE as present and tries to
+        # import it, so an unsigned release fails with "Unable to decode the
+        # provided data". Export only the variables that actually have a value.
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # linuxdeploy ships as an AppImage; extract it instead of requiring FUSE.
-          APPIMAGE_EXTRACT_AND_RUN: "1"
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -309,14 +312,86 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in \
+            APPLE_CERTIFICATE \
+            APPLE_CERTIFICATE_PASSWORD \
+            APPLE_SIGNING_IDENTITY \
+            APPLE_ID \
+            APPLE_PASSWORD \
+            APPLE_TEAM_ID \
+            WINDOWS_CERTIFICATE \
+            WINDOWS_CERTIFICATE_PASSWORD
+          do
+            value="$(printenv "$name" || true)"
+            if [ -n "$value" ]; then
+              printf '%s=%s\n' "$name" "$value" >> "$GITHUB_ENV"
+            else
+              echo "::notice::$name is not configured; skipping it"
+            fi
+          done
+
+      - name: Build the app and open the draft release
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # linuxdeploy ships as an AppImage; extract it instead of requiring FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          # The payload is already assembled above. Tauri still runs
+          # `beforeBuildCommand`; skip the second `next build` (the macOS
+          # runner runs out of heap) while still asserting the build is fresh.
+          NOEMA_SKIP_BUILD: "1"
         with:
-          # The payload is already assembled, so skip the JS build hook.
           args: --target ${{ matrix.rust-target }} --bundles ${{ matrix.bundles }}
           tagName: ${{ github.ref_name }}
           releaseName: ${{ format('Noema {0}', github.ref_name) }}
           releaseDraft: true
           prerelease: false
           includeUpdaterJson: false
+
+  checksums:
+    # The release job opens a *draft* release and uploads one installer per
+    # platform. This job turns those assets into one `SHA256SUMS` file so a user
+    # can verify what they downloaded even while the binaries are unsigned. It
+    # only runs after every release matrix leg succeeded, so the file cannot
+    # describe a half-published release.
+    needs: release
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release assets
+        env:
+          # `github.token` is the same installation token as `secrets.GITHUB_TOKEN`,
+          # but this job never needs a repository secret: keep the secret namespace
+          # reserved for the signed release job.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p release-assets
+          # This job deliberately has no checkout, so tell gh which repository
+          # to use instead of making it discover one from .git.
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --clobber
+
+      - name: Write SHA256SUMS
+        working-directory: release-assets
+        run: |
+          # Never hash a previous SHA256SUMS on a re-run; hash only the assets.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 -r sha256sum > SHA256SUMS
+
+      - name: Upload SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" release-assets/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
 
   payload-smoke:
     # The check that catches a *plausible* but broken installer: it boots the

@@ -63,6 +63,7 @@ enum ViewType {
   CALENDAR
   TIMELINE
   CHART
+  FORM
 }
 
 enum SharePermission {
@@ -91,6 +92,8 @@ model User {
   avatarUrl    String?
   locale       String   @default("en")
   theme        String   @default("system")
+  /// When the user dismissed the first-run workspace checklist.
+  onboardingDismissedAt DateTime?
   notificationPrefs Json?
   // B05: a sealed `v1:` envelope (AES-256-GCM), never the raw base32 seed.
   twoFactorSecret  String?
@@ -126,6 +129,8 @@ model User {
   ticketViews      TicketView[]
   chatThreads     ChatThread[]       @relation("ChatThreadCreatedBy")
   chatMessages    ChatMessage[]
+  workspacePrompts WorkspacePrompt[]
+  automations     Automation[]
 
   @@index([email])
 }
@@ -162,8 +167,69 @@ model Workspace {
   chatThreads    ChatThread[]
   calendarFeeds  CalendarFeed[]
   calendarEvents CalendarEvent[]
+  ssoConnections SsoConnection[]
+  verifiedDomains VerifiedDomain[]
+  prompts        WorkspacePrompt[]
+  automations    Automation[]
+  aiBudget       AiBudget?
+  aiUsage        AiUsage[]
 
   @@index([ownerId])
+}
+
+/// Per-workspace SAML connection (M2). The env-level `AUTH_SAML_*` connection
+/// remains the deployment default; a row here lets one workspace point at its
+/// own IdP. Secrets (private keys) are not stored in this first slice.
+model SsoConnection {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  name            String
+  protocol        String   @default("saml")
+  idpEntityId     String
+  ssoUrl          String
+  certificate     String
+  metadataUrl     String?
+  metadataFetchedAt DateTime?
+  /// Previous IdP certificate during a rotation overlap window (R10.17).
+  prevCertificate String?
+  prevCertificateExpiresAt DateTime?
+  spEntityId      String?
+  callbackUrl     String?
+  emailAttribute  String?
+  nameAttribute   String?
+  groupsAttribute String?
+  roleRules       Json?
+  enabled         Boolean  @default(true)
+  /// SCIM 2.0 provisioning token, stored only as a SHA-256 hash (R10.20).
+  scimEnabled     Boolean  @default(false)
+  scimTokenHash   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  verifiedDomains VerifiedDomain[]
+
+  @@index([workspaceId])
+}
+
+/// A DNS-verified email domain that may auto-join a workspace on SAML login.
+/// A row exists before verification so the admin can read the TXT token; only
+/// `verifiedAt != null` participates in auto-join.
+model VerifiedDomain {
+  id           String    @id @default(cuid())
+  workspaceId  String
+  connectionId String?
+  domain       String
+  verifyToken  String
+  verifiedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  workspace  Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  connection SsoConnection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  @@unique([workspaceId, domain])
+  @@index([domain, verifiedAt])
+  @@index([connectionId])
 }
 
 model WorkspaceMember {
@@ -198,6 +264,17 @@ model Invite {
   @@index([email])
 }
 
+/// SAML assertion replay cache (R10.4/R10.16). The id is a stable digest of
+/// the signed response (or the assertion id when the library exposes one), so
+/// a byte-for-byte resubmission is rejected across restarts and instances.
+model SamlAssertionSeen {
+  id        String   @id
+  expiresAt DateTime
+  seenAt    DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
 // ---------------------------------------------------------------------------
 // Pages & blocks
 //
@@ -211,6 +288,9 @@ model Page {
   id          String   @id @default(cuid())
   workspaceId String
   parentId    String?
+  /// Optional sub-item parent inside the same database. Distinct from
+  /// `parentId`, which is the database page a row belongs to.
+  subOfId     String?
   teamspaceId String?
   projectId   String?
   type        PageType @default(PAGE)
@@ -238,6 +318,8 @@ model Page {
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   parent    Page?     @relation("PageChildren", fields: [parentId], references: [id], onDelete: Cascade)
   children  Page[]    @relation("PageChildren")
+  subOf     Page?     @relation("PageSubItems", fields: [subOfId], references: [id], onDelete: SetNull)
+  subItems  Page[]    @relation("PageSubItems")
   teamspace Teamspace? @relation(fields: [teamspaceId], references: [id], onDelete: SetNull)
   project   Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
   chatThreads ChatThread[]
@@ -249,16 +331,36 @@ model Page {
   templates      Template[]
   versions       PageVersion[]
   comments       Comment[]
+  suggestionSession PageSuggestionSession?
   shareLinks     ShareLink[]
   favorites      Favorite[]
   followers      PageFollow[]
   permissions    PagePermission[]
   assets         Asset[]
+  /** Blocking edges where this row is the blocker / the blocked row. */
+  dependenciesFrom RowDependency[] @relation("DepBlocker")
+  dependenciesTo   RowDependency[] @relation("DepBlocked")
 
   @@index([workspaceId])
   @@index([parentId])
+  @@index([subOfId])
   @@index([deletedAt])
   @@index([type])
+}
+
+/// A blocking edge between two rows of the same database (R89.31). `blocker`
+/// must finish before `blocked` can start; the write action rejects cycles and
+/// cross-database or self edges, so the stored graph is a DAG.
+model RowDependency {
+  id        String   @id @default(cuid())
+  blockerId String
+  blockedId String
+  blocker   Page     @relation("DepBlocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked   Page     @relation("DepBlocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([blockerId, blockedId])
+  @@index([blockedId])
 }
 
 model PageVersion {
@@ -275,6 +377,20 @@ model PageVersion {
   page Page @relation(fields: [pageId], references: [id], onDelete: Cascade)
 
   @@index([pageId])
+}
+
+/// One in-progress track-changes (Suggestions mode) session per page. `base`
+/// is the committed block snapshot the live document is diffed against; the
+/// pending suggestion list is derived, so reloading a page recomputes it from
+/// this snapshot instead of persisting every edit row.
+model PageSuggestionSession {
+  id        String   @id @default(cuid())
+  pageId    String   @unique
+  base      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  page Page @relation(fields: [pageId], references: [id], onDelete: Cascade)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +438,7 @@ model DatabaseView {
   updatedAt      DateTime @updatedAt
 
   databasePage Page @relation(fields: [databasePageId], references: [id], onDelete: Cascade)
+  shareLinks   ShareLink[]
 
   @@index([databasePageId])
 }
@@ -334,15 +451,49 @@ model Template {
   content        Json?
   config         Json?
   recurrence     String?
+  /// A paused schedule keeps its cadence and next run for display, but the
+  /// cron materializer never selects it (R31.22 pause/resume).
+  paused         Boolean   @default(false)
   isDefault      Boolean   @default(false)
   position       Float     @default(0)
   nextRunAt      DateTime?
+  /// When the scheduler last materialized a row for this template.
+  lastRunAt      DateTime?
+  /// Attribution for rows the scheduler creates; falls back to the database
+  /// creator when absent (R31.1/R89.17).
+  createdById    String?
   createdAt      DateTime  @default(now())
 
-  databasePage Page @relation(fields: [databasePageId], references: [id], onDelete: Cascade)
+  databasePage Page          @relation(fields: [databasePageId], references: [id], onDelete: Cascade)
+  runs         TemplateRun[]
 
   @@index([databasePageId])
   @@index([nextRunAt])
+  @@index([paused, nextRunAt])
+}
+
+/// Durable idempotency record for one `(template, scheduled occurrence)` pair.
+///
+/// The unique key is what makes a retried cron tick safe: whichever
+/// transaction inserts the row first owns the occurrence, so a concurrent or
+/// replayed tick can never materialize the same scheduled row twice. The row
+/// is written in the same transaction as the page, its values and the
+/// `nextRunAt` advance, so a crash rolls all four back together.
+model TemplateRun {
+  id            String   @id @default(cuid())
+  templateId    String
+  /// `${templateId}:${scheduledFor.toISOString()}`.
+  occurrenceKey String
+  /// The schedule instant this run materializes.
+  scheduledFor  DateTime
+  /// The row this run created; `null` when the claim is mid-transaction.
+  pageId        String?
+  ranAt         DateTime @default(now())
+
+  template Template @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@unique([templateId, occurrenceKey])
+  @@index([templateId, ranAt])
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +508,10 @@ model Comment {
   body      String
   blockId   String?
   quote     String?
+  /// Exact selection range inside `blockId`'s plain text (UTF-16 offsets).
+  /// Root comments only; replies resolve the anchor through their parent.
+  anchorFrom Int?
+  anchorTo   Int?
   resolved  Boolean  @default(false)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -415,6 +570,8 @@ model Asset {
 model ShareLink {
   id           String          @id @default(cuid())
   pageId       String
+  /// When set, the link publishes one FORM view instead of the whole page.
+  viewId       String?
   token        String          @unique
   permission   SharePermission @default(READ)
   passwordHash String?
@@ -424,9 +581,11 @@ model ShareLink {
   exportRestricted Boolean     @default(false)
   createdAt    DateTime        @default(now())
 
-  page Page @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  page Page          @relation(fields: [pageId], references: [id], onDelete: Cascade)
+  view DatabaseView? @relation(fields: [viewId], references: [id], onDelete: Cascade)
 
   @@index([pageId])
+  @@index([viewId])
 }
 
 model CommentReaction {
@@ -584,6 +743,75 @@ model AiProviderConfig {
   updatedAt       DateTime @updatedAt
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+/// Per-workspace monthly AI token budget (R25.13). One row per workspace;
+/// `monthlyTokenLimit = 0` disables the ceiling. `warnPercent` is the soft
+/// warning threshold and `hardStop` decides whether the transport refuses a
+/// dispatch once the period is over the limit (it may also be switched off to
+/// observe spend without blocking work). The window is the UTC calendar month.
+model AiBudget {
+  id                String   @id @default(cuid())
+  workspaceId       String   @unique
+  monthlyTokenLimit Int      @default(0)
+  warnPercent       Int      @default(80)
+  hardStop          Boolean  @default(true)
+  /// The admin who last changed the ceiling, for the audit trail.
+  updatedById       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+}
+
+/// Durable token usage counters (R25.12), keyed by workspace, UTC calendar
+/// month and surface. The unique key makes accumulation atomic: every call
+/// increments its row in place, so concurrent instances cannot lose a write.
+/// `failures` counts calls that ended in an error and therefore contributed no
+/// tokens. Transcription reports characters rather than tokens, so its output
+/// is the documented `chars / 4` estimate.
+model AiUsage {
+  id          String   @id @default(cuid())
+  workspaceId String
+  /// `YYYY-MM` in UTC — the same period key the budget window uses.
+  period      String
+  /// chat | chat-stream | ask | summarize | skill | autofill | transcribe | test
+  surface     String
+  tokensIn    Int      @default(0)
+  tokensOut   Int      @default(0)
+  requests    Int      @default(0)
+  failures    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, period, surface])
+  @@index([workspaceId, period])
+}
+
+/// A reusable prompt template (R25.22). `scope = "workspace"` rows are shared
+/// with every member; `scope = "personal"` rows are visible only to their
+/// creator. The body may carry `{{variable}}` tokens; run-time rendering stays
+/// in `@/lib/ai-prompt-library` (the pure engine this table stores data for).
+model WorkspacePrompt {
+  id          String   @id @default(cuid())
+  workspaceId String
+  createdById String
+  name        String
+  body        String
+  scope       String   @default("workspace")
+  tags        Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User      @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, scope])
+  @@index([createdById])
 }
 
 // ---------------------------------------------------------------------------
@@ -959,4 +1187,64 @@ model WebhookDelivery {
   webhook Webhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
 
   @@index([webhookId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Automations (event rules + recurring ticket schedules) and their runs
+// ---------------------------------------------------------------------------
+
+/// One workspace-authored automation.
+///
+/// `kind = "rule"` stores a canonical trigger (`triggerConfig`) plus an ordered
+/// `action` list; `kind = "recurring_ticket"` stores a normalized
+/// `RecurrenceRule` in `triggerConfig.rule` and one `create_ticket` template in
+/// `action`. Keeping both in one table means a schedule is exactly the same
+/// rule shape as an event automation, and the cron query has one source.
+model Automation {
+  id            String    @id @default(cuid())
+  workspaceId   String
+  createdById   String
+  /// Display name — a ticket title for a recurring schedule.
+  name          String
+  /// `"rule"` (event automation) or `"recurring_ticket"` (schedule).
+  kind          String    @default("rule")
+  enabled       Boolean   @default(true)
+  /// Trigger DSL for a rule, or `{ rule: RecurrenceRule }` for a schedule.
+  triggerConfig Json?
+  /// Ordered ButtonActions for a rule, or `{ kind: "create_ticket", template }`.
+  action        Json?
+  /// Baseline the next spawn is measured from (cron schedules).
+  lastRunAt     DateTime?
+  /// Where the schedule is headed; refreshed on save, pause, resume and each run.
+  nextRunAt     DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  createdBy User            @relation(fields: [createdById], references: [id], onDelete: Cascade)
+  runs      AutomationRun[]
+
+  @@index([workspaceId, kind, enabled])
+  @@index([enabled, nextRunAt])
+  @@index([createdById])
+}
+
+/// Durable idempotency record for one `(automation, occurrence)` pair.
+///
+/// The unique key is what makes a cron retry safe: whichever transaction
+/// inserts the row first owns the occurrence, so a second tick can never
+/// create the same ticket twice. `createdTicketIds` records what that run
+/// materialized (a run may create more than one catch-up ticket).
+model AutomationRun {
+  id               String   @id @default(cuid())
+  automationId     String
+  /// Deterministic `templateId:occurrenceISO` key from `ticketKey`.
+  occurrenceKey    String
+  ranAt            DateTime @default(now())
+  createdTicketIds Json?
+
+  automation Automation @relation(fields: [automationId], references: [id], onDelete: Cascade)
+
+  @@unique([automationId, occurrenceKey])
+  @@index([automationId, ranAt])
 }

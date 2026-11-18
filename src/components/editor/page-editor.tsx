@@ -1,6 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
+import { useRouter } from "next/navigation";
 
 import {
   useCallback,
@@ -11,7 +12,7 @@ import {
   useState
 } from "react";
 import { EditorContent, useEditor, type Editor } from "@tiptap/react";
-import { Extension } from "@tiptap/core";
+import { Extension, type JSONContent } from "@tiptap/core";
 import { BubbleMenu } from "@tiptap/react/menus";
 import DragHandle from "@tiptap/extension-drag-handle-react";
 import StarterKit from "@tiptap/starter-kit";
@@ -20,24 +21,60 @@ import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import {
   ImageBlock,
-  mediaKindOf,
-  type MediaKind,
 } from "@/components/editor/extensions/image-block";
+import { DOCUMENT_ATTACHMENT_ACCEPT } from "@/lib/file-type";
 import { BlockColors } from "@/components/editor/extensions/block-colors";
+import { Autocorrect } from "@/components/editor/extensions/autocorrect";
+import { CalendarBlock } from "@/components/editor/extensions/calendar-block";
 import { CodeBlock } from "@/components/editor/extensions/code-block";
+import { UmlDiagram } from "@/components/editor/extensions/uml-diagram";
+import { DiagramPresenceProvider } from "@/components/editor/diagram-presence";
 import { TextStyle } from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
 import Highlight from "@tiptap/extension-highlight";
 import TextAlign from "@tiptap/extension-text-align";
 import { TableKit } from "@tiptap/extension-table/kit";
-import { Mathematics } from "@tiptap/extension-mathematics";
+import { Mathematics } from "@/components/editor/extensions/math-node";
 import "katex/dist/katex.min.css";
 import { toast } from "sonner";
 import { BlockContextMenu } from "@/components/editor/block-context-menu";
-import { EQUATION_EVENT } from "@/lib/editor-events";
+import {
+  AUTOCORRECT_EVENT,
+  COMMENT_ANCHOR_STATE_EVENT,
+  COMMENT_JUMP_EVENT,
+  EQUATION_EVENT,
+  FOCUS_PAGE_BODY_EVENT,
+  readAutocorrectPreference,
+  type CommentAnchorStateRequest,
+  type CommentJumpRequest,
+} from "@/lib/editor-events";
+const PageSourceDialog = dynamic(
+  () =>
+    import("@/components/editor/source-dialog").then((mod) => ({
+      default: mod.PageSourceDialog,
+    })),
+  { ssr: false },
+);
+import { useUndoRedo } from "@/components/providers/undo-redo-provider";
+import {
+  CommentHighlights,
+  setActiveCommentHighlight,
+  setCommentHighlightAnchors,
+  type CommentHighlightAnchor,
+} from "@/components/editor/extensions/comment-highlights";
+import {
+  blockContentStart,
+  rangeFromAnchor,
+  staleAnchorIds,
+} from "@/components/editor/comment-anchor";
 import { MathAutoDetect } from "@/components/editor/extensions/math-input";
 import { Fragment, Slice, type Node as PMNode } from "@tiptap/pm/model";
-import { Plugin, PluginKey, Selection } from "@tiptap/pm/state";
+import {
+  Plugin,
+  PluginKey,
+  Selection,
+  type SelectionBookmark,
+} from "@tiptap/pm/state";
 import { dropCursor } from "@tiptap/pm/dropcursor";
 import type { EditorView } from "@tiptap/pm/view";
 import { normalizePasteHtml, pastePlan } from "@/lib/paste";
@@ -106,8 +143,16 @@ const editEquation = (node: { type: { name: string }; attrs: { latex?: string } 
   );
 };
 import { actionError, safeAction } from "@/lib/actions-client";
+import {
+  clearDraft,
+  readDraft,
+  writeDraft,
+  type RecoverableDraft,
+} from "@/lib/draft-store";
 import { updatePageAction } from "@/server/actions/pages";
 import { uploadFile } from "@/lib/upload-client";
+import { planUploadedAssetRender } from "@/lib/uploaded-media";
+import { extractClipboardImageFiles } from "@/lib/clipboard-files";
 import { DUR, EASE, Z } from "@/lib/design-tokens";
 import {
   Callout,
@@ -133,10 +178,8 @@ import {
   AnimatedImage,
   prefersReducedMotion,
   resolveAnimatedMediaAttrs,
-  looksAnimatedByExtension,
 } from "@/components/editor/extensions/animated-image";
 import { LinkedDatabase } from "@/components/editor/extensions/linked-database";
-import { GIF_MIME } from "@/lib/animated-media";
 import {
   collectBlocks,
   copyReference,
@@ -220,19 +263,36 @@ function isOffline(): boolean {
   return typeof navigator !== "undefined" && navigator.onLine === false;
 }
 
+/** Resolve a live selection bookmark, clamped to the current document. */
+function resolveInsertion(
+  editor: Editor,
+  marker: SelectionBookmark | null | undefined,
+): { from: number; to: number } | null {
+  if (!marker) return null;
+  try {
+    const selection = marker.resolve(editor.state.doc);
+    const max = editor.state.doc.content.size;
+    const from = Math.min(Math.max(0, selection.from), max);
+    const to = Math.min(Math.max(from, selection.to), max);
+    return { from, to };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Pick the media variant an uploaded asset should render as in the image
- * block. The asset's own MIME type wins (uploads always report one); an
- * untyped asset falls back to the URL-extension inference of `mediaKindOf`,
- * and anything still unrecognised becomes a downloadable file block rather
- * than a broken picture. Images never reach here (the caller keeps the plain
- * `setImage` path).
+ * Snapshot the current selection as a mapped bookmark. The bookmark survives
+ * the asynchronous upload: when it resolves it is mapped through every
+ * transaction that happened meanwhile, so the picture lands where the caret
+ * was at paste/drop time rather than at the caret when the request settles.
  */
-function uploadedMediaKind(asset: { url: string; mimeType: string }): MediaKind {
-  if (asset.mimeType.startsWith("video/")) return "video";
-  if (asset.mimeType.startsWith("audio/")) return "audio";
-  const inferred = mediaKindOf(asset.url);
-  return inferred === "image" ? "file" : inferred;
+function selectionMarker(editor: Editor | null | undefined): SelectionBookmark | null {
+  if (!editor || !editor.state?.selection) return null;
+  try {
+    return editor.state.selection.getBookmark();
+  } catch {
+    return null;
+  }
 }
 
 /** Resolve a presence palette name (`assignColor`) to its avatar CSS colour. */
@@ -472,12 +532,16 @@ const SuggestionsControls = dynamic(
   { ssr: false },
 );
 
+const EMPTY_COMMENT_ANCHORS: CommentHighlightAnchor[] = [];
+
 export type PageEditorProps = {
   pageId: string;
   workspaceId: string;
   workspaceSlug: string;
   breadcrumbTrail?: BreadcrumbCrumb[];
   initialContent: unknown;
+  /** Persisted exact-range comment anchors for the decoration layer. */
+  commentAnchors?: CommentHighlightAnchor[];
   editorPlaceholder?: string;
   locale?: string;
   editable?: boolean;
@@ -557,14 +621,45 @@ function PageEditorBody({
   breadcrumbTrail = [],
   /** Localised empty-paragraph hint. */
   initialContent,
+  commentAnchors = EMPTY_COMMENT_ANCHORS,
   editable = true,
   collab,
 }: PageEditorProps & { collab: CollaborationSession | null }) {
+  const router = useRouter();
   const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const undoRedo = useUndoRedo();
+  const undoRedoRef = useRef(undoRedo);
+  useEffect(() => {
+    undoRedoRef.current = undoRedo;
+  }, [undoRedo]);
+  const [recoverableDraft, setRecoverableDraft] =
+    useState<RecoverableDraft | null>(null);
+  const draftCheckedRef = useRef(false);
   const [bubblePanelOpen, setBubblePanelOpen] = useState(false);
   const [snapshotDepth, setSnapshotDepth] = useState({ undoable: 0, redoable: 0 });
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const editorRef = useRef<Editor | null>(null);
+  const initialBodyJson = useMemo(
+    () =>
+      JSON.stringify(
+        (initialContent as object) ?? {
+          type: "doc",
+          content: [{ type: "paragraph" }],
+        },
+      ),
+    [initialContent],
+  );
+  /**
+   * Global history bridge. The topbar undo/history surfaces use the app-wide
+   * command stack, while the body used to live only in TipTap's local history.
+   * This records a coalesced body command after a short typing pause and
+   * restores the exact before/after document from the topbar.
+   */
+  const historyBaseRef = useRef(initialBodyJson);
+  const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const historyApplyingRef = useRef(false);
+  const historySeqRef = useRef(0);
   /**
    * Shadow document-snapshot history (F8). TipTap owns the live undo/redo —
    * its `undoRedo` plugin, or the collaboration extension in a shared session —
@@ -717,12 +812,22 @@ function PageEditorBody({
     }
     lastSavedRef.current = payload;
     pendingPayloadRef.current = null;
+    try {
+      clearDraft(window.localStorage, pageId);
+    } catch {
+      // storage unavailable
+    }
     setSaveState("saved");
   }, [pageId, bufferSave, collab]);
 
   const persist = useCallback(
     (payload: string) => {
       pendingPayloadRef.current = payload;
+      try {
+        writeDraft(window.localStorage, pageId, payload);
+      } catch {
+        // storage unavailable
+      }
       if (saveTimer.current) clearTimeout(saveTimer.current);
       setSaveState("saving");
       saveTimer.current = setTimeout(() => {
@@ -752,58 +857,120 @@ function PageEditorBody({
     );
   }, []);
 
-  const insertFiles = useCallback(    async (files: File[]) => {
+  /**
+   * Record the body's next state into the global undo stack after a typing
+   * pause. The before snapshot is the last recorded state, so a burst of
+   * keystrokes is one entry rather than one per character. A collaborator's
+   * session stays on Yjs history and does not write this local stack.
+   */
+  const recordGlobalHistory = useCallback(
+    (after: string) => {
+      if (collab || historyApplyingRef.current) return;
+      if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+      historyTimerRef.current = setTimeout(() => {
+        historyTimerRef.current = null;
+        const before = historyBaseRef.current;
+        if (before === after) return;
+        const restore = (payload: string) => {
+          if (historyTimerRef.current) {
+            clearTimeout(historyTimerRef.current);
+            historyTimerRef.current = null;
+          }
+          historyApplyingRef.current = true;
+          try {
+            editorRef.current?.commands.setContent(JSON.parse(payload));
+          } catch {
+            // A malformed snapshot is already unreachable via the editor, so
+            // there is nothing safe to restore.
+          } finally {
+            historyApplyingRef.current = false;
+            historyBaseRef.current = payload;
+          }
+        };
+        undoRedoRef.current.push({
+          id: `${pageId}:body:${Date.now()}:${historySeqRef.current++}`,
+          label: "Edit page body",
+          apply: (state) => ({ ...state, [`body:${pageId}`]: after }),
+          invert: (state) => ({ ...state, [`body:${pageId}`]: before }),
+          coalesceKey: `body:${pageId}`,
+          at: Date.now(),
+          onUndo: () => restore(before),
+          onRedo: () => restore(after),
+        });
+        historyBaseRef.current = after;
+      }, 650);
+    },
+    [collab, pageId],
+  );
+
+  const insertFiles = useCallback(
+    async (files: File[], options: { at?: SelectionBookmark | null } = {}) => {
       const editor = editorRef.current;
       if (!editor) return;
       const reducedMotion = prefersReducedMotion();
+      // Upload first, then insert every successful asset in one transaction at
+      // the selection captured by the caller. Uploads are slow and the caret
+      // may have moved (or the document changed) by the time they settle; a
+      // captured bookmark is mapped through those transactions, so pasted
+      // pictures land where the user pasted them, in paste order, exactly once.
+      const contents: JSONContent[] = [];
       for (const file of files) {
         try {
           const asset = await uploadFile(file, workspaceId);
-          if (asset.mimeType.startsWith("image/")) {
-            if (asset.mimeType === GIF_MIME || looksAnimatedByExtension(asset.url)) {
-              // A GIF is sniffed for real frames (`isAnimatedGif`) and rendered
-              // through the playback policy (`playbackPolicy`), which refuses to
-              // autoplay under `prefers-reduced-motion`.
-              let bytes: Uint8Array | undefined;
-              try {
-                bytes = new Uint8Array(await file.arrayBuffer());
-              } catch {
-                bytes = undefined;
-              }
-              const { attrs } = resolveAnimatedMediaAttrs({
-                src: asset.url,
-                alt: asset.name,
-                mimeType: asset.mimeType,
-                ...(bytes === undefined ? {} : { bytes }),
-                reducedMotion,
-                autoplay: true,
-              });
-              editor.chain().focus().insertContent({ type: "animatedImage", attrs }).run();
-            } else {
-              editor.chain().focus().setImage({ src: asset.url, alt: asset.name }).run();
+          const plan = planUploadedAssetRender(asset);
+          if (plan.type === "animatedImage") {
+            // A GIF keeps its original bytes. The playback decision is made by
+            // `isAnimatedGif` + `playbackPolicy`; the node's `src` is the
+            // original URL with any lossy transform params stripped.
+            let bytes: Uint8Array | undefined;
+            try {
+              bytes = new Uint8Array(await file.arrayBuffer());
+            } catch {
+              bytes = undefined;
             }
+            const { attrs } = resolveAnimatedMediaAttrs({
+              src: plan.src,
+              alt: asset.name,
+              mimeType: plan.mimeType,
+              ...(bytes === undefined ? {} : { bytes }),
+              reducedMotion,
+              autoplay: true,
+            });
+            contents.push({ type: "animatedImage", attrs });
+          } else if (plan.type === "image") {
+            contents.push({ type: "image", attrs: { src: plan.src, alt: asset.name } });
+          } else if (plan.mimeType === "application/pdf") {
+            // Uploaded PDFs get the real inline viewer rather than a generic
+            // file row. The serving path is same-origin and authenticated.
+            contents.push({
+              type: "pdfPreview",
+              attrs: { url: plan.src, title: asset.name },
+            });
           } else {
             // Non-image uploads render through the image block's media
             // variants (video/audio/file); the explicit `mediaType` keeps the
             // element from being inferred wrong off the stored URL.
-            editor
-              .chain()
-              .focus()
-              .insertContent({
-                type: "image",
-                attrs: {
-                  src: asset.url,
-                  alt: asset.name,
-                  mediaType: uploadedMediaKind(asset),
-                },
-              })
-              .run();
+            contents.push({
+              type: "image",
+              attrs: {
+                src: plan.src,
+                alt: asset.name,
+                mediaType: plan.mediaType,
+              },
+            });
           }
           toast.success(`${t(locale, "uploadedPrefix")} ${asset.name}`);
         } catch (error) {
           toast.error(error instanceof Error ? error.message : t(locale, "uploadFailed"));
         }
       }
+      if (contents.length === 0) return;
+
+      const range = resolveInsertion(editor, options.at);
+      const chain = editor.chain().focus();
+      if (range) chain.insertContentAt(range, contents);
+      else chain.insertContent(contents);
+      chain.run();
     },
     [workspaceId, locale],
   );
@@ -811,18 +978,26 @@ function PageEditorBody({
   /**
    * Upload the images a paste plan accepted (real files first, otherwise the
    * HTML data URL `extractDataUrl` recovered) through the normal attachment
-   * pipeline, and report anything `inspectClipboardItem` refused.
+   * pipeline, and report anything `inspectClipboardItem` refused. All accepted
+   * files are inserted in one batch at the paste-time bookmark, so a clipboard
+   * that exposes the same image through `files` and `items` cannot insert it
+   * twice.
    */
   const uploadClipboardImages = useCallback(
-    async (plan: ClipboardImagePlan, files: File[]) => {
+    async (
+      plan: ClipboardImagePlan,
+      files: File[],
+      at?: SelectionBookmark | null,
+    ) => {
+      const ready: File[] = [];
       for (const upload of plan.uploads) {
         const file =
           upload.source === "data-url"
             ? dataUrlUploadFile(upload)
             : files[upload.fileIndex ?? -1] ?? null;
-        if (!file) continue;
-        await insertFiles([file]);
+        if (file) ready.push(file);
       }
+      if (ready.length > 0) await insertFiles(ready, { at });
       if (plan.skipped.length > 0) {
         toast.error(`${plan.skipped.length} clipboard image(s) skipped`);
       }
@@ -926,6 +1101,23 @@ function PageEditorBody({
     settle.addEventListener("finish", () => settle.cancel());
   }, [setDraggingFlag]);
 
+  /** Append an empty paragraph after the block the hover chrome targets. */
+  const addBlockBelow = useCallback(() => {
+    const current = editorRef.current;
+    const pos = chromePosRef.current;
+    if (!current || pos === null) return;
+    const node = current.state.doc.nodeAt(pos);
+    if (!node) return;
+    const insertAt = pos + node.nodeSize;
+    current
+      .chain()
+      .focus()
+      .insertContentAt(insertAt, { type: "paragraph" })
+      .setTextSelection(insertAt + 1)
+      .scrollIntoView()
+      .run();
+  }, []);
+
   const [peers, setPeers] = useState(1);
   /** Transport status, surfaced so a dropped link is visible in the chrome. */
   const [collabStatus, setCollabStatus] = useState<CollabStatus>("connecting");
@@ -1016,6 +1208,8 @@ function PageEditorBody({
       }),
       TaskList,
       TaskItem.configure({ nested: true }),
+      Autocorrect,
+      CalendarBlock.configure({ locale }),
       ImageBlock.configure({ inline: false, allowBase64: true, locale }),
       TextStyle,
       Color,
@@ -1024,8 +1218,8 @@ function PageEditorBody({
       TextAlign.configure({ types: ["heading", "paragraph"] }),
       TableKit.configure({ table: { resizable: true } }),
       MathAutoDetect,
+      // Shared node views: bounded macros + inline errors (see math-tex.ts).
       Mathematics.configure({
-        katexOptions: { throwOnError: false },
         inlineOptions: { onClick: editEquation },
         blockOptions: { onClick: editEquation },
       }),
@@ -1041,12 +1235,13 @@ function PageEditorBody({
       MapBlock.configure({ locale }),
       Breadcrumb.configure({ trail: breadcrumbTrail, workspaceSlug, locale }),
       PageEmbed.configure({ workspaceId, workspaceSlug, locale }),
-      TemplateButton.configure({ locale }),
-      ButtonBlock.configure({ locale }),
+      TemplateButton.configure({ locale, workspaceId, pageId }),
+      ButtonBlock.configure({ locale, workspaceId, pageId }),
       AskAi.configure({ workspaceId, locale, pageId }),
-      SyncedBlock.configure({ locale }),
+      SyncedBlock.configure({ locale, pageId, workspaceSlug }),
       AnimatedImage.configure({ locale }),
       LinkedDatabase.configure({ workspaceId, workspaceSlug, locale }),
+      UmlDiagram,
       // B18: `1)` lists, `| a | b |` + Enter tables, `:smile:` emoji.
       InputRules,
       // Math engine guard: strips banned TeX commands from every equation node.
@@ -1054,6 +1249,9 @@ function PageEditorBody({
       // Presentation: block enter/leave motion + a 2px accent drop indicator.
       BlockMotion,
       DropIndicator,
+      // Inline comment ranges, projected from persisted anchors as
+      // decorations (never document marks).
+      CommentHighlights.configure({ anchors: commentAnchors }),
       ...(collab?.extensions ?? []),
     ],
     content: (initialContent as object) ?? {
@@ -1066,6 +1264,13 @@ function PageEditorBody({
         // Labels the editable block list for assistive tech (the element keeps
         // TipTap's default `role="textbox"`, so the description is announced).
         "aria-roledescription": t(locale, "editorRoleDescription"),
+        // Native spellcheck is always on, so a misspelling is underlined and
+        // the browser's right-click suggestions work. The optional automatic
+        // layer is the small Autocorrect extension below; the native
+        // autocorrect attribute stays off to avoid double rewrites.
+        spellcheck: "true",
+        autocorrect: "off",
+        autocapitalize: "sentences",
       },
       /**
        * Multi-block range selection (block-selection engine). Shift-click starts
@@ -1144,12 +1349,98 @@ function PageEditorBody({
         },
       },
       /**
+       * Links and @-mentions are real navigation surfaces. TipTap disables its
+       * own link click handler so editing does not navigate by accident; this
+       * restores the expected behaviour: external links open in a new tab and
+       * internal page mentions go to that page in the current tab.
+       */
+      handleClick(_view, _pos, event) {
+        const target = event.target;
+        if (!(target instanceof Element)) return false;
+
+        const mention = target.closest("[data-mention]");
+        if (mention?.getAttribute("data-mention") === "page") {
+          const id = mention.getAttribute("data-id");
+          if (id) {
+            event.preventDefault();
+            router.push(`/w/${workspaceSlug}/${id}`);
+            return true;
+          }
+        }
+
+        const anchor = target.closest("a[href]");
+        if (!(anchor instanceof HTMLAnchorElement)) return false;
+        const href = anchor.getAttribute("href") ?? "";
+        if (href === "" || href.startsWith("#")) return false;
+        event.preventDefault();
+        if (href.startsWith("/")) {
+          router.push(href);
+          return true;
+        }
+        try {
+          const url = new URL(href, window.location.href);
+          if (url.origin === window.location.origin) {
+            router.push(`${url.pathname}${url.search}${url.hash}`);
+          } else {
+            window.open(url.href, "_blank", "noopener,noreferrer");
+          }
+          return true;
+        } catch {
+          // mailto:, tel: and other non-HTTP schemes are safe to hand to the OS.
+          window.open(href, "_blank", "noopener,noreferrer");
+          return true;
+        }
+      },
+      /**
        * Keyboard path for the same range (R84.10 a11y): only once a range is
        * active, Shift-ArrowUp/Down moves its head block by block, Escape clears
        * it and Backspace/Delete removes every selected block in one transaction.
        * Without an active range every key falls through to normal editing.
        */
       handleKeyDown(view, event) {
+        // Tab is block indentation outside lists/tables/code. Inside a list the
+        // StarterKit sink/lift commands keep their stock behaviour; a paragraph
+        // gets four non-breaking spaces per press, so repeated Tab presses
+        // actually add more spacing (the old path let only one through).
+        if (event.key === "Tab" && !blockRangeRef.current) {
+          const { $from, empty } = view.state.selection;
+          let structural = false;
+          for (let depth = $from.depth; depth > 0; depth -= 1) {
+            const name = $from.node(depth).type.name;
+            if (
+              name === "listItem" ||
+              name === "taskItem" ||
+              name === "tableCell" ||
+              name === "tableHeader" ||
+              $from.node(depth).type.spec.code
+            ) {
+              structural = true;
+              break;
+            }
+          }
+          if (!structural) {
+            event.preventDefault();
+            if (!empty) return true;
+            const from = view.state.selection.from;
+            if (event.shiftKey) {
+              const start = Math.max(0, from - 4);
+              const before = view.state.doc.textBetween(start, from, undefined, "\ufffc");
+              if (before.endsWith("\u00a0\u00a0\u00a0\u00a0")) {
+                view.dispatch(view.state.tr.delete(from - 4, from));
+              } else if (before.endsWith("\u00a0")) {
+                view.dispatch(view.state.tr.delete(from - 1, from));
+              }
+              return true;
+            }
+            view.dispatch(
+              view.state.tr
+                .insertText("\u00a0\u00a0\u00a0\u00a0", from)
+                .scrollIntoView(),
+            );
+            return true;
+          }
+        }
+
         const range = blockRangeRef.current;
         if (!range) return false;
         if (event.key === "Escape") {
@@ -1184,9 +1475,11 @@ function PageEditorBody({
         const clipboard = event.clipboardData;
         if (!clipboard) return false;
 
-        // Clipboard images: gate every real file and any `data:` image embedded
-        // in the HTML flavour through the clipboard-image engine before upload.
-        const files = Array.from(clipboard.files ?? []);
+        // Clipboard images: the bitmap may arrive as `files`, as `items` (some
+        // Safari/WebView shells) or both. Extract/dedupe first, then gate every
+        // real file and any `data:` image embedded in the HTML flavour through
+        // the clipboard-image engine before upload.
+        const files = extractClipboardImageFiles<File>(clipboard);
         const html = clipboard.getData("text/html");
         const imagePlan = planClipboardImages({
           files: files.map((file) => ({
@@ -1197,7 +1490,10 @@ function PageEditorBody({
           html,
         });
         if (files.length > 0 || imagePlan.uploads.length > 0) {
-          void uploadClipboardImages(imagePlan, files);
+          // Snapshot the caret before the async upload: a bookmark is mapped
+          // through later transactions, so the image lands at the paste point.
+          const at = view.state.selection.getBookmark();
+          void uploadClipboardImages(imagePlan, files, at);
           return true;
         }
 
@@ -1243,7 +1539,19 @@ function PageEditorBody({
         const files = Array.from(dragEvent.dataTransfer?.files ?? []);
         if (files.length > 0) {
           event.preventDefault();
-          void insertFiles(files);
+          // Same paste-time guarantee as `handlePaste`: capture a mapped
+          // bookmark at the drop point before the async upload starts.
+          let at: SelectionBookmark | null = null;
+          const found = view.posAtCoords({ left: dragEvent.clientX, top: dragEvent.clientY });
+          if (found) {
+            try {
+              at = Selection.near(view.state.doc.resolve(found.pos)).getBookmark();
+            } catch {
+              at = null;
+            }
+          }
+          if (!at) at = selectionMarker(editorRef.current);
+          void insertFiles(files, { at });
           return true;
         }
         const dragging = view.dragging as {
@@ -1323,6 +1631,7 @@ function PageEditorBody({
       const json = JSON.stringify(e.getJSON());
       persist(json);
       recordSnapshot(json);
+      recordGlobalHistory(json);
       // Any content change invalidates the whole-block range (ids may be gone).
       if (blockRangeRef.current) paintBlockRange(null);
       // Block-reference integrity: a reference whose target block is gone is
@@ -1335,6 +1644,61 @@ function PageEditorBody({
   useEffect(() => {
     editorRef.current = editor;
   }, [editor]);
+
+  useEffect(() => {
+    historyBaseRef.current = initialBodyJson;
+    if (historyTimerRef.current) {
+      clearTimeout(historyTimerRef.current);
+      historyTimerRef.current = null;
+    }
+  }, [initialBodyJson, pageId]);
+
+  useEffect(
+    () => () => {
+      if (historyTimerRef.current) clearTimeout(historyTimerRef.current);
+    },
+    [],
+  );
+
+  // The title and body are sibling surfaces. Enter in the title dispatches this
+  // event; the editor owns the actual focus/caret so the user lands in the
+  // first body block instead of on `document.body`.
+  useEffect(() => {
+    if (!editor) return;
+    const onFocusBody = () => {
+      editor.commands.focus("start");
+    };
+    window.addEventListener(FOCUS_PAGE_BODY_EVENT, onFocusBody);
+    return () => window.removeEventListener(FOCUS_PAGE_BODY_EVENT, onFocusBody);
+  }, [editor]);
+
+  // Restore the per-page autocorrect preference and keep it in sync with the
+  // header toggle. The preference is deliberately off on a new page.
+  useEffect(() => {
+    if (!editor) return;
+    const apply = (event: Event) => {
+      const detail = (event as CustomEvent<{ enabled?: boolean }>).detail;
+      editor.commands.setAutocorrect(detail?.enabled === true);
+    };
+    editor.commands.setAutocorrect(readAutocorrectPreference(pageId));
+    window.addEventListener(AUTOCORRECT_EVENT, apply);
+    return () => window.removeEventListener(AUTOCORRECT_EVENT, apply);
+  }, [editor, pageId]);
+
+  // Recover a crash/refresh draft once per page. We offer it, never apply it
+  // silently: the server copy may be newer than the local one.
+  useEffect(() => {
+    if (!editor || draftCheckedRef.current) return;
+    draftCheckedRef.current = true;
+    try {
+      const draft = readDraft(window.localStorage, pageId);
+      if (draft && draft.payload !== JSON.stringify(editor.getJSON())) {
+        setRecoverableDraft(draft);
+      }
+    } catch {
+      // storage unavailable
+    }
+  }, [editor, pageId]);
 
   // Mirror each top-level block's stable id onto `data-flip-id`, and feed the
   // ordered ids to the shared FLIP hook. The mirror runs synchronously in the
@@ -1410,6 +1774,82 @@ function PageEditorBody({
     };
   }, [editor]);
 
+  // Keep the decoration layer in step with a refreshed comment list. The
+  // extension filters stale ranges against the live doc, so a local edit cannot
+  // repaint text that no longer matches the persisted quote.
+  useEffect(() => {
+    if (!editor || editor.isDestroyed) return;
+    setCommentHighlightAnchors(editor.view, commentAnchors);
+  }, [editor, commentAnchors]);
+
+  /**
+   * Tell the panel when a local edit invalidates a persisted range. The quote is
+   * kept; only the "exact range" claim is withdrawn. Reporting on every editor
+   * update (not just mount) keeps the badge honest while typing, before the
+   * next server refresh.
+   */
+  useEffect(() => {
+    if (!editor || typeof window === "undefined") return;
+    const report = () => {
+      if (editor.isDestroyed) return;
+      const detail: CommentAnchorStateRequest = {
+        staleIds: staleAnchorIds(editor.state.doc, commentAnchors),
+      };
+      window.dispatchEvent(
+        new CustomEvent(COMMENT_ANCHOR_STATE_EVENT, { detail }),
+      );
+    };
+    report();
+    editor.on("update", report);
+    return () => {
+      editor.off("update", report);
+    };
+  }, [editor, commentAnchors]);
+
+  /**
+   * Panel → editor jump. A valid range selects and scrolls to the exact words
+   * and flashes its decoration; a stale/legacy anchor still lands on the block
+   * (jumping stays useful without pretending the range is intact).
+   */
+  useEffect(() => {
+    if (!editor) return;
+    let timer: number | null = null;
+    const onJump = (event: Event) => {
+      const detail = (event as CustomEvent<CommentJumpRequest>).detail;
+      if (!detail || typeof detail.blockId !== "string") return;
+      const doc = editor.state.doc;
+      const range =
+        detail.from !== undefined &&
+        detail.from !== null &&
+        detail.to !== undefined &&
+        detail.to !== null
+          ? rangeFromAnchor(doc, {
+              blockId: detail.blockId,
+              from: detail.from,
+              to: detail.to,
+              quote: detail.quote,
+            })
+          : null;
+      if (range !== null) {
+        editor.chain().focus().setTextSelection(range).scrollIntoView().run();
+      } else {
+        const start = blockContentStart(doc, detail.blockId);
+        if (start === null) return;
+        editor.chain().focus().setTextSelection(start).scrollIntoView().run();
+      }
+      setActiveCommentHighlight(editor.view, detail.commentId);
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        if (!editor.isDestroyed) setActiveCommentHighlight(editor.view, null);
+      }, 2400);
+    };
+    window.addEventListener(COMMENT_JUMP_EVENT, onJump);
+    return () => {
+      if (timer !== null) window.clearTimeout(timer);
+      window.removeEventListener(COMMENT_JUMP_EVENT, onJump);
+    };
+  }, [editor]);
+
   // Seed the shadow history with the document's initial state, once per editor
   // instance, so the first user edit yields exactly one undoable step.
   useEffect(() => {
@@ -1468,6 +1908,26 @@ function PageEditorBody({
     return <div className="h-40 animate-pulse rounded-card bg-surface" />;
   }
 
+  const restoreDraft = () => {
+    if (!recoverableDraft) return;
+    try {
+      editor.commands.setContent(JSON.parse(recoverableDraft.payload));
+      persist(recoverableDraft.payload);
+      setRecoverableDraft(null);
+    } catch {
+      setRecoverableDraft(null);
+    }
+  };
+
+  const discardDraft = () => {
+    try {
+      clearDraft(window.localStorage, pageId);
+    } catch {
+      // storage unavailable
+    }
+    setRecoverableDraft(null);
+  };
+
   // The bottom breathing room (30vh) belongs to the editable area itself — see
   // `.noema-page-canvas .ProseMirror` in globals.css — so a click in it is a click
   // in the document and `clickUnderContent` can start the paragraph there. The
@@ -1517,17 +1977,55 @@ function PageEditorBody({
           >
             <EditorRowChrome
               state={{ hovered: chromeVisible, focused: editorFocused }}
+              onAdd={addBlockBelow}
             />
           </DragHandle>
 
-          <HistoryControls editor={editor} locale={locale} />
-          <SuggestionsControls editor={editor} locale={locale} />
+          <HistoryControls
+            editor={editor}
+            locale={locale}
+            onOpenSource={() => setSourceOpen(true)}
+          />
+          <SuggestionsControls editor={editor} locale={locale} pageId={pageId} />
         </>
       )}
 
-      <BlockContextMenu editor={editor} editable={editable} workspaceId={workspaceId} locale={locale}>
-        <EditorContent editor={editor} />
-      </BlockContextMenu>
+      <DiagramPresenceProvider awareness={collab?.provider.awareness ?? null}>
+        <BlockContextMenu editor={editor} editable={editable} workspaceId={workspaceId} pageId={pageId} locale={locale}>
+          <EditorContent editor={editor} />
+        </BlockContextMenu>
+      </DiagramPresenceProvider>
+
+      {recoverableDraft && (
+        <div
+          role="status"
+          className="mt-3 flex flex-wrap items-center gap-2 rounded-control border border-border bg-surface px-3 py-2 text-sm"
+        >
+          <span>Unsaved changes from a previous session were recovered.</span>
+          <button
+            type="button"
+            onClick={restoreDraft}
+            className="focus-ring rounded-control bg-action px-2 py-1 text-xs text-action-fg"
+          >
+            {t(locale, "restore")}
+          </button>
+          <button
+            type="button"
+            onClick={discardDraft}
+            className="focus-ring rounded-control border border-border px-2 py-1 text-xs"
+          >
+            {t(locale, "cancel")}
+          </button>
+        </div>
+      )}
+
+      {editable && (
+        <PageSourceDialog
+          editor={editor}
+          open={sourceOpen}
+          onOpenChange={setSourceOpen}
+        />
+      )}
 
       {dropRejection && (
         <div
@@ -1555,7 +2053,7 @@ function PageEditorBody({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*,.pdf,.txt,.md,.json,.zip"
+            accept={`video/*,audio/*,${DOCUMENT_ATTACHMENT_ACCEPT}`}
             className="hidden"
             onChange={(event) => {
               const files = Array.from(event.target.files ?? []);

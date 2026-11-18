@@ -13,12 +13,20 @@ import { toast } from "sonner";
 import {
   clearAiProviderAction,
   listAiModelsAction,
+  resetAiUsageAction,
+  saveAiBudgetAction,
   saveAiProviderAction,
   testAiProviderAction,
+  type AiBudgetSummary,
   type AiProviderSummary,
 } from "@/server/actions/ai-settings";
 import { runAiAutofillAction } from "@/server/actions/ai-autofill";
-import { AI_PROVIDERS, providerDefaultBaseUrl, type ProviderDefinition } from "@/lib/ai-providers";
+import {
+  AI_PROVIDERS,
+  classifyAiBaseUrl,
+  providerDefaultBaseUrl,
+  type ProviderDefinition,
+} from "@/lib/ai-providers";
 import { AI_SKILLS } from "@/lib/ai-skills";
 import { SKILL_CATALOG } from "@/lib/ai-writing";
 import {
@@ -41,6 +49,7 @@ import { Stepper } from "@/components/ui/stepper";
 import { Switch } from "@/components/ui/switch";
 import { Tag } from "@/components/ui/tag";
 import {
+  AiBudgetPanel,
   BudgetUsageBar,
   ProviderCard,
   providerRowStatus,
@@ -84,7 +93,7 @@ const DEFAULT_CONTEXT_BUDGET = 2048;
 const MAX_CONTEXT_BUDGET = 200_000;
 
 /** Which async action is in flight, so only its control shows a spinner. */
-type BusyAction = "models" | "test" | "save" | "clear" | "local" | "autofill" | null;
+type BusyAction = "models" | "test" | "save" | "clear" | "local" | "autofill" | "budget" | "reset" | null;
 
 /** The result of the last action, tagged with the action that produced it. */
 type ActionStatus = { ok: boolean; message: string; action: Exclude<BusyAction, null> };
@@ -102,10 +111,12 @@ type ActionStatus = { ok: boolean; message: string; action: Exclude<BusyAction, 
 export function AiSettings({
   workspaceId,
   summary,
+  budget,
   locale,
 }: {
   workspaceId: string;
   summary: AiProviderSummary;
+  budget?: AiBudgetSummary | null;
   locale: string;
 }) {
   const router = useRouter();
@@ -132,6 +143,11 @@ export function AiSettings({
   const [localApiKey, setLocalApiKey] = useState("");
   const [autofillPropertyId, setAutofillPropertyId] = useState("");
   const [autofillRowId, setAutofillRowId] = useState("");
+  const [monthlyTokenLimit, setMonthlyTokenLimit] = useState(
+    String(budget?.monthlyTokenLimit ?? 0),
+  );
+  const [warnPercent, setWarnPercent] = useState(String(budget?.warnPercent ?? 80));
+  const [hardStop, setHardStop] = useState(budget?.hardStop ?? true);
 
   // Preview the sizing layer (`@/lib/ai-context`) for the current sample/budget.
   const contextPreview = useMemo(() => {
@@ -179,6 +195,24 @@ export function AiSettings({
   const definition: ProviderDefinition | undefined = AI_PROVIDERS.find(
     (entry) => entry.id === provider,
   );
+
+  // The endpoint decides both facts the form must state: whether plain http is
+  // allowed and whether a key is required. `classifyAiBaseUrl` is the same
+  // check the server action runs, so the UI cannot promise something the save
+  // will refuse.
+  const endpointCheck = useMemo(() => classifyAiBaseUrl(baseUrl), [baseUrl]);
+  const endpointLocal = endpointCheck.ok && endpointCheck.local;
+  const keyMissingForRemote =
+    !useLocal && !endpointLocal && !apiKey.trim() && !summary.hasKey;
+  const saveBlockedReason = useLocal
+    ? null
+    : !endpointCheck.ok
+      ? endpointCheck.error
+      : enabled && !model.trim()
+        ? "Choose a model before enabling this provider."
+        : enabled && keyMissingForRemote
+          ? "Add an API key — a remote provider cannot be enabled keyless."
+          : null;
 
   // Local-provider support (`@/lib/local-models`): parse the endpoint into the
   // canonical config, then validate it (scheme, model, key requirement) so the
@@ -260,7 +294,9 @@ export function AiSettings({
               provider: "custom",
               baseUrl: localBaseUrl,
               model: localModel,
-              apiKey: localApiKey || "local",
+              // Keyless local runtimes get no key at all; the transport omits
+              // the Authorization header rather than sending a placeholder.
+              apiKey: localApiKey.trim() || undefined,
             }
           : { workspaceId, provider, baseUrl, model, apiKey },
       );
@@ -310,9 +346,9 @@ export function AiSettings({
     setStatus(null);
   };
 
-  // Store a keyless self-hosted endpoint. The existing provider action requires
-  // a key when enabled, so keyless runtimes send the conventional `local`
-  // placeholder that OpenAI-compatible and Ollama servers ignore.
+  // Store a keyless self-hosted endpoint. The action allows an empty key only
+  // while the endpoint is loopback/private; the token field is optional and
+  // stays empty for runtimes that do not expect one.
   const saveLocal = () =>
     run("local", t(locale, "aiProviderSaved"), async () => {
       const result = await saveAiProviderAction({
@@ -320,11 +356,15 @@ export function AiSettings({
         provider: "custom",
         baseUrl: localBaseUrl,
         model: localModel,
-        apiKey: localApiKey || "local",
+        apiKey: localApiKey.trim() || undefined,
         enabled: true,
       });
       if ("error" in result) return { ok: false, message: result.error };
       if (!result.ok) return { ok: false, message: t(locale, "somethingWentWrong") };
+      // Saving the local form makes the local endpoint the workspace provider:
+      // switch the UI into local mode so the form reflects what was stored.
+      setUseLocal(true);
+      setEnabled(true);
       router.refresh();
       return { ok: true, message: t(locale, "savedWord") };
     });
@@ -357,6 +397,38 @@ export function AiSettings({
       setBusy(null);
     });
   };
+
+  // Save the monthly token budget (R25.13). The server validates the numbers
+  // again; the client only parses the two text fields into integers.
+  const saveBudget = () =>
+    run("budget", "AI budget saved", async () => {
+      const limit = Number(monthlyTokenLimit.replace(/[\s,]/g, ""));
+      const warn = Number(warnPercent);
+      const result = await saveAiBudgetAction({
+        workspaceId,
+        monthlyTokenLimit: limit,
+        warnPercent: warn,
+        hardStop,
+      });
+      if ("error" in result) return { ok: false, message: result.error };
+      if (!result.ok) return { ok: false, message: t(locale, "somethingWentWrong") };
+      router.refresh();
+      return { ok: true, message: "AI budget saved" };
+    });
+
+  // Reset this month's counters only (period-keyed rows, so the next month
+  // starts at zero on its own).
+  const resetUsage = () =>
+    run("reset", "AI usage reset", async () => {
+      const result = await resetAiUsageAction(workspaceId);
+      if ("error" in result) return { ok: false, message: result.error };
+      if (!result.ok) return { ok: false, message: t(locale, "somethingWentWrong") };
+      router.refresh();
+      return {
+        ok: true,
+        message: `AI usage reset (${result.removed} counter${result.removed === 1 ? "" : "s"} cleared)`,
+      };
+    });
 
   const providerOptions: SelectOption[] = useMemo(
     () =>
@@ -392,7 +464,9 @@ export function AiSettings({
           local: false,
           active,
           enabled,
-          hasKey: active && summary.hasKey,
+          // A local endpoint needs no key: mark the active row configured
+          // rather than "missing key".
+          hasKey: active && (summary.hasKey || endpointLocal),
           source: summary.source,
         }),
         baseUrl: active ? baseUrl : entry.defaultBaseUrl || undefined,
@@ -419,13 +493,23 @@ export function AiSettings({
       } satisfies ProviderCardData;
     });
     return [...cloud, ...local];
-  }, [useLocal, provider, enabled, summary.hasKey, summary.source, baseUrl, model, localProviderId, localBaseUrl, localModel]);
+  }, [useLocal, provider, enabled, summary.hasKey, summary.source, endpointLocal, baseUrl, model, localProviderId, localBaseUrl, localModel]);
 
   const testStatus = status?.action === "test" ? status : null;
   const testState: ProviderTestState =
     testStatus === null ? "idle" : testStatus.ok ? "success" : "error";
   const sourceStatus: ProviderStatus =
     summary.source === "workspace" || summary.source === "env" ? "configured" : "unconfigured";
+
+  const budgetLimitNumber = Number(monthlyTokenLimit.replace(/[\s,]/g, ""));
+  const budgetWarnNumber = Number(warnPercent);
+  const budgetInvalid =
+    !Number.isInteger(budgetLimitNumber) ||
+    budgetLimitNumber < 0 ||
+    budgetLimitNumber > 1_000_000_000 ||
+    !Number.isInteger(budgetWarnNumber) ||
+    budgetWarnNumber < 1 ||
+    budgetWarnNumber > 100;
 
   return (
     <div className="mt-10 flex flex-col gap-12">
@@ -503,11 +587,33 @@ export function AiSettings({
           })}
         </div>
 
-        {!summary.envAvailable && !summary.hasKey && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted">
+          <Badge tone={summary.processing === "local" ? "accent" : "neutral"}>
+            {summary.processing === "local"
+              ? "Local-only processing"
+              : summary.processing === "remote"
+                ? "Remote provider"
+                : "No provider"}
+          </Badge>
+          <span>
+            {summary.processing === "local"
+              ? "Prompts and completions stay on this machine or private network."
+              : summary.processing === "remote"
+                ? "Prompts and completions are sent to the configured provider. See docs/AI-BOUNDARIES.md."
+                : "No model is configured yet."}
+          </span>
+        </div>
+
+        {!summary.envAvailable && !summary.hasKey && !summary.local && (
           <p className="flex items-center gap-1.5 text-xs text-muted">
             <TriangleAlert className="h-3.5 w-3.5" aria-hidden /> {t(locale, "aiNoProviderHint")}
           </p>
         )}
+        {summary.endpointError ? (
+          <p className="flex items-center gap-1.5 text-xs text-danger">
+            <TriangleAlert className="h-3.5 w-3.5" aria-hidden /> {summary.endpointError}
+          </p>
+        ) : null}
       </Section>
 
       {/* Models — model id, endpoint, key, enable, save. */}
@@ -554,7 +660,13 @@ export function AiSettings({
             <Field
               id="ai-api-key"
               label={t(locale, "apiKeyLabel")}
-              hint={summary.hasKey ? t(locale, "savedKeyHint") : definition?.keyHint}
+              hint={
+                summary.hasKey
+                  ? t(locale, "savedKeyHint")
+                  : endpointLocal
+                    ? "Optional — this endpoint is loopback/private."
+                    : "Required for a remote provider."
+              }
             >
               <Input
                 id="ai-api-key"
@@ -564,12 +676,22 @@ export function AiSettings({
                 placeholder={
                   summary.hasKey
                     ? t(locale, "savedKeyHint")
-                    : definition?.keyHint ?? t(locale, "apiKeyLabel")
+                    : endpointLocal
+                      ? "No key needed for a local runtime"
+                      : definition?.keyHint ?? t(locale, "apiKeyLabel")
                 }
                 onChange={(event) => setApiKey(event.target.value)}
               />
             </Field>
           </div>
+
+          <p className="text-xs text-muted">
+            {endpointCheck.ok
+              ? endpointLocal
+                ? "Local endpoint: plain http is allowed and the API key is optional. Nothing is sent to a Noema server."
+                : "Remote endpoint: TLS is required and the API key is mandatory."
+              : endpointCheck.error}
+          </p>
 
           <Switch
             checked={enabled}
@@ -590,13 +712,102 @@ export function AiSettings({
             <Button
               loading={busy === "save"}
               onClick={save}
-              disabled={busy !== null && busy !== "save"}
+              disabled={(busy !== null && busy !== "save") || Boolean(saveBlockedReason)}
             >
               {t(locale, "save")}
             </Button>
           </div>
+          {saveBlockedReason ? (
+            <p role="status" className="flex items-center gap-1.5 text-xs text-muted">
+              <TriangleAlert className="h-3.5 w-3.5" aria-hidden /> {saveBlockedReason}
+            </p>
+          ) : null}
         </Section>
       )}
+
+      {/* AI usage & budget — the durable meter and the ceiling (R25.12–R25.14). */}
+      <Section
+        level={2}
+        title="AI usage & budget"
+        description="Every model call is metered against the workspace's monthly token budget (UTC calendar month). The guard runs in the transport before dispatch, so an exhausted budget refuses new calls instead of discovering the overspend afterwards."
+      >
+        {budget ? (
+          <AiBudgetPanel summary={budget} locale={locale} />
+        ) : (
+          <p className="text-xs text-muted">
+            Usage is not available yet. Save a budget to create the workspace meter.
+          </p>
+        )}
+
+        <div className="grid gap-4 sm:grid-cols-3">
+          <Field
+            id="ai-budget-limit"
+            label="Monthly token limit"
+            hint="0 disables the ceiling; usage is still recorded."
+          >
+            <Input
+              id="ai-budget-limit"
+              inputMode="numeric"
+              value={monthlyTokenLimit}
+              aria-label="Monthly token limit"
+              onChange={(event) => setMonthlyTokenLimit(event.target.value)}
+            />
+          </Field>
+          <Field
+            id="ai-budget-warn"
+            label="Warn at %"
+            hint="Amber from this share of the limit."
+          >
+            <Input
+              id="ai-budget-warn"
+              inputMode="numeric"
+              value={warnPercent}
+              aria-label="Warning threshold percent"
+              onChange={(event) => setWarnPercent(event.target.value)}
+            />
+          </Field>
+          <div className="flex items-end">
+            <Switch
+              checked={hardStop}
+              onCheckedChange={setHardStop}
+              label="Refuse calls over budget"
+              aria-label="Refuse AI calls over budget"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            loading={busy === "budget"}
+            disabled={(busy !== null && busy !== "budget") || budgetInvalid}
+            onClick={saveBudget}
+          >
+            Save budget
+          </Button>
+          <Button
+            variant="danger"
+            tone="soft"
+            loading={busy === "reset"}
+            disabled={busy !== null && busy !== "reset"}
+            onClick={resetUsage}
+          >
+            Reset this month
+          </Button>
+        </div>
+
+        {budgetInvalid ? (
+          <p role="status" className="flex items-center gap-1.5 text-xs text-muted">
+            <TriangleAlert className="h-3.5 w-3.5" aria-hidden /> Use a whole number ≥ 0 for the
+            limit and a whole number from 1 to 100 for the warning threshold.
+          </p>
+        ) : (
+          <p className="text-xs text-muted">
+            {hardStop
+              ? "Calls are refused once this month's tokens would exceed the limit."
+              : "Soft mode: calls still run over the limit; the dashboard turns red."}
+          </p>
+        )}
+      </Section>
 
       {/* Budget — a Stepper bound to a usage Progress bar. */}
       <Section
@@ -687,8 +898,14 @@ export function AiSettings({
       <Section
         level={2}
         title="Data boundaries"
-        description="Point the workspace at a self-hosted runtime. Requests stay on your infrastructure and a key is usually unnecessary."
+        description="Point the workspace at a self-hosted runtime. A loopback/private endpoint keeps every prompt and completion on your infrastructure and needs no API key."
       >
+        <ul className="grid gap-1 text-xs text-muted">
+          <li>• Prompts and completions are not written to application logs by default.</li>
+          <li>• Noema adds no training or telemetry forwarding to the AI transport.</li>
+          <li>• Keys are encrypted at rest and never returned to the browser.</li>
+          <li>• The written policy and its enforcement points live in docs/AI-BOUNDARIES.md.</li>
+        </ul>
         {localDescriptor && (
           <p className="text-xs text-muted">
             {describeProvider(localDescriptor)} · {isLocal(localDescriptor) ? "local" : "cloud"}

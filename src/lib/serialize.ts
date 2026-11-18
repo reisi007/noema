@@ -7,6 +7,7 @@
 
 import { docToMarkdown, type BlockDoc, type RichNode } from "./blocks";
 import { formatCaption } from "./code-block";
+import { diagramToMermaid } from "./diagrams/uml";
 import { markColor } from "./mark-colors";
 import { DEFAULT_PULL_QUOTE_SIZE, isPullQuoteSize } from "./pull-quote";
 import { sanitizeHref } from "./validation";
@@ -268,10 +269,12 @@ function escapeHtml(value: string): string {
 }
 
 /**
- * The colours a `style` attribute may carry: the design system's tag
- * foreground tokens (`var(--tag-<hue>-fg)`) the editor writes, and a plain
- * hex value for a document stored before the token migration.
+ * Alias for the shared mark-colour rule. Both the export path and the renderer
+ * must use the one allowlist, so a stored mark can never push a `url()` into a
+ * `style` attribute — `mark-colors.ts` owns that decision.
  */
+export const styleColor = markColor;
+
 function inlineHtml(nodes: RichNode[] = []): string {
   return nodes
     .map((node) => {
@@ -371,6 +374,8 @@ function blockHtml(node: RichNode): string {
       return `<th>${(node.content ?? []).map(blockHtml).join("")}</th>`;
     case "tableCell":
       return `<td>${(node.content ?? []).map(blockHtml).join("")}</td>`;
+    case "umlDiagram":
+      return `<pre data-uml-diagram="" data-uml-data="${escapeHtml(JSON.stringify(node.attrs?.data ?? {}))}"><code class="language-mermaid">${escapeHtml(diagramToMermaid(node.attrs?.data))}</code></pre>`;
     case "blockMath":
       return `<div class="math">${escapeHtml(String(node.attrs?.latex ?? ""))}</div>`;
     case "bookmark":
@@ -427,3 +432,4 @@ ${docToHtml(doc)}
 </html>
 `;
 }
+

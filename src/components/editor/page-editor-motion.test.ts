@@ -7,7 +7,10 @@ import { DUR, EASE } from "@/lib/design-tokens";
 // action; stub both so the pure motion mapping can be imported under vitest's
 // node environment (the same seam `page-editor-engines.test.ts` uses).
 vi.mock("katex/dist/katex.min.css", () => ({}));
-vi.mock("@/server/actions/pages", () => ({ updatePageAction: vi.fn() }));
+vi.mock("@/server/actions/pages", () => ({
+  updatePageAction: vi.fn(),
+  getPageContentAction: vi.fn(),
+}));
 
 import {
   EditorRowChrome,
@@ -122,6 +125,18 @@ describe("EditorRowChrome (renderToStaticMarkup)", () => {
     expect(html).toContain("data-row-chrome");
     expect(html).toContain("<svg");
     expect(html).not.toContain("⋮⋮");
+  });
+
+  it("renders the add affordance as a real, labelled button when wired", () => {
+    const html = renderToStaticMarkup(
+      createElement(EditorRowChrome, {
+        state: { hovered: true },
+        onAdd: () => {},
+      }),
+    );
+    expect(html).toContain('aria-label="Add a block below"');
+    expect(html).toMatch(/<button[^>]*noema-row-add/);
+    expect(html.match(/<button/g)).toHaveLength(1);
   });
 
   it("is visible in the hover state", () => {

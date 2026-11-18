@@ -295,7 +295,7 @@ export function pageRowClass({
  */
 export function pageRowLinkClass(renaming = false): string {
   return cn(
-    "focus-ring flex min-w-0 flex-1 items-center gap-2 rounded-control py-1 text-sm",
+    "focus-ring flex min-w-0 flex-1 items-center gap-2 rounded-control py-1.5 text-sm font-medium",
     renaming && "hidden",
   );
 }
@@ -777,6 +777,31 @@ export function PageTree({
       router.refresh();
     });
 
+  /**
+   * Trash a page. If it is the page currently on screen, leave the dead route
+   * before the server refresh can paint a 404: fall back to the parent when
+   * there is one, otherwise the workspace home.
+   */
+  const archive = (node: PageTreeNode) =>
+    startTransition(async () => {
+      const outcome = await safeAction(() => archivePageAction(node.id));
+      if (!outcome.ok) {
+        toast.error(outcome.error);
+        return;
+      }
+      toast.success("Moved to trash");
+      const href = `/w/${workspace.slug}/${node.id}`;
+      if (pathname === href) {
+        router.push(
+          node.parentId
+            ? `/w/${workspace.slug}/${node.parentId}`
+            : `/w/${workspace.slug}`,
+        );
+      } else {
+        router.refresh();
+      }
+    });
+
   /** id → node, for the drag helpers' parent lookups. */
   const byId = useMemo(() => new Map(tree.map((node) => [node.id, node])), [tree]);
 
@@ -1161,8 +1186,9 @@ export function PageTree({
                     <button
                       type="button"
                       aria-label={t(locale, "addSubPage")}
+                      disabled={pending}
                       onClick={() => addPage(node.id, "PAGE")}
-                      className="focus-ring u-interactive flex h-6 w-6 items-center justify-center rounded-control text-muted hover:bg-bg"
+                      className="focus-ring u-interactive flex h-6 w-6 items-center justify-center rounded-control text-muted hover:bg-bg disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       <Plus className="h-3.5 w-3.5" />
                     </button>
@@ -1203,14 +1229,7 @@ export function PageTree({
                         <Copy className="h-4 w-4 text-muted" /> Duplicate
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        onSelect={() =>
-                          remote(
-                            () => archivePageAction(node.id),
-                            "Moved to trash",
-                          )
-                        }
-                      >
+                      <DropdownMenuItem onSelect={() => archive(node)}>
                         <Trash2 className="h-4 w-4 text-muted" /> Move to trash
                       </DropdownMenuItem>
                     </DropdownMenuContent>
@@ -1226,6 +1245,9 @@ export function PageTree({
                     onSelect={() => window.open(href, "_blank", "noopener,noreferrer")}
                   >
                     <FileText className="h-4 w-4 text-muted" /> Open in new tab
+                  </ContextMenuItem>
+                  <ContextMenuItem onSelect={() => addPage(node.id, "PAGE")}>
+                    <Plus className="h-4 w-4 text-muted" /> {t(locale, "addSubPage")}
                   </ContextMenuItem>
                   <ContextMenuItem onSelect={() => discuss(node.id)}>
                     <MessagesSquare className="h-4 w-4 text-muted" /> Discuss in chat
@@ -1362,10 +1384,7 @@ export function PageTree({
                     </ContextMenuSubContent>
                   </ContextMenuSub>
                   <ContextMenuSeparator />
-                  <ContextMenuItem
-                    destructive
-                    onSelect={() => remote(() => archivePageAction(node.id), "Moved to trash")}
-                  >
+                  <ContextMenuItem destructive onSelect={() => archive(node)}>
                     <Trash2 className="h-4 w-4" /> Move to trash
                   </ContextMenuItem>
                 </ContextMenuContent>
@@ -1417,7 +1436,7 @@ export function PageTree({
             className="absolute left-0 right-0"
             style={{ top: item.top, height: item.height }}
           >
-            <p className="truncate px-1 pt-1 text-2xs font-medium text-muted/90">
+            <p className="truncate px-1 pt-1 text-xs font-semibold text-fg-subtle">
               {item.header.kind === "teamspace" ? `${item.header.icon ?? "👥"} ` : ""}
               {truncateEnd(
                 item.header.kind === "private"
@@ -1443,7 +1462,7 @@ export function PageTree({
   return (
     <>
     <div className="mt-4 flex items-center justify-between px-3">
-      <p className="px-1 text-2xs font-medium text-muted/90">
+      <p className="px-1 text-xs font-semibold text-fg-subtle">
         {t(locale, "pages")}
       </p>
       <Tooltip label={t(locale, "newPage")}>
@@ -1481,7 +1500,7 @@ export function PageTree({
             if (roots.length === 0) return null;
             return (
               <div key={teamspace.id} className="mt-3">
-                <p className="truncate px-1 pb-1 text-2xs font-medium text-muted/90">
+                <p className="truncate px-1 pb-1 text-xs font-semibold text-fg-subtle">
                   {teamspace.icon ?? "👥"}{" "}
                   {truncateEnd(teamspace.name, SECTION_LABEL_MAX)}
                 </p>
@@ -1490,7 +1509,7 @@ export function PageTree({
             );
           })}
           <div className="mt-4">
-            <p className="px-1 pb-1 text-2xs font-medium text-muted/90">
+            <p className="px-1 pb-1 text-xs font-semibold text-fg-subtle">
               {t(locale, "privatePages")}
             </p>
             {renderNodes(null, 0, (node) => !node.teamspaceId)}
@@ -1499,7 +1518,7 @@ export function PageTree({
       )}
       {subPages.length > 0 && (
         <div className="mt-4">
-          <p className="px-1 pb-1 text-2xs font-medium text-muted/90">
+          <p className="px-1 pb-1 text-xs font-semibold text-fg-subtle">
             Sub-pages
           </p>
           <ul className="space-y-px">
@@ -1530,7 +1549,7 @@ export function PageTree({
       )}
       {recentNodes.length > 0 && (
         <div className="mt-4">
-          <p className="px-1 pb-1 text-2xs font-medium text-muted/90">
+          <p className="px-1 pb-1 text-xs font-semibold text-fg-subtle">
             Recent
           </p>
           <ul className="space-y-px">

@@ -1,14 +1,20 @@
 import type { CSSProperties, ReactNode } from "react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { MermaidDiagram } from "@/components/diagrams/mermaid-diagram";
-import { isMermaidLanguage } from "@/lib/diagrams/mermaid-policy";
+import { UmlDiagramView } from "@/components/diagrams/uml-diagram-view";
+import { PlantUmlDiagram } from "@/components/diagrams/plantuml-diagram";
+import { isPlantUmlLanguage } from "@/lib/diagrams/plantuml-policy";
+import { isMermaidBlock } from "@/lib/diagrams/mermaid-policy";
 import { formatCaption, numberLines } from "@/lib/code-block";
 import { tagClass, tagStyle, type TagHue } from "@/lib/design-tokens";
-import { embedMeta, resolveEmbed } from "@/lib/embeds";
+import { embedMeta, isSafePdfUrl, resolveEmbed } from "@/lib/embeds";
+import { resolveDeviceId } from "@/lib/animated-media";
+import { DevicePreview } from "@/components/device-preview";
 import { externalImageSrc } from "@/lib/external-image";
 import { t } from "@/lib/i18n";
-import { markColor } from "@/lib/mark-colors";
 import { alignOf, alignStyle } from "@/lib/media";
+import { mediaKindOfSource, planUploadedAssetRender } from "@/lib/uploaded-media";
+import { contentDirProps, inlineBidiProps } from "@/lib/bidi";
 import {
   blocksToQuote,
   formatPullQuote,
@@ -19,6 +25,10 @@ import {
 import { buildTocItems, tocAnchorId, type TocHeading, type TocItem } from "@/lib/toc";
 import { truncateMiddle } from "@/lib/truncate";
 import { cn } from "@/lib/utils";
+import { styleColor } from "@/lib/serialize";
+import { validateLatex } from "@/lib/math-render";
+import { describeButton, parseButtonBlock, parseTemplateButton } from "@/lib/template-blocks";
+import { templateDefinition, type TemplateId } from "@/lib/templates";
 import { sanitizeHref } from "@/lib/validation";
 
 /**
@@ -63,16 +73,16 @@ function applyMarks(node: PMNode, children: ReactNode, key: string): ReactNode {
         );
         break;
       case "highlight": {
-        const color = markColor(mark.attrs?.color);
+        const color = styleColor(mark.attrs?.color);
         element = (
-          <mark key={key} style={color ? { backgroundColor: color } : undefined}>
+          <mark key={key} style={color ? { background: color } : undefined}>
             {element}
           </mark>
         );
         break;
       }
       case "textStyle": {
-        const color = markColor(mark.attrs?.color);
+        const color = styleColor(mark.attrs?.color);
         element = color ? (
           <span key={key} style={{ color }}>
             {element}
@@ -115,13 +125,21 @@ function renderInline(nodes: PMNode[] = []): ReactNode {
     if (node.type === "mention") {
       const type = String(node.attrs?.type ?? "page");
       const glyph = type === "user" ? "👤" : type === "date" ? "🗓" : "📄";
+      const label = String(node.attrs?.label ?? "");
+      const direction = inlineBidiProps(label);
       return (
         <span
           key={key}
-          className={cn("noema-mention", docClasses("mention"), mentionClass(type))}
+          dir={direction.dir}
+          className={cn(
+            "noema-mention",
+            docClasses("mention"),
+            mentionClass(type),
+            direction.className,
+          )}
           style={mentionStyle(type)}
         >
-          {glyph} {String(node.attrs?.label ?? "")}
+          {glyph} {label}
         </span>
       );
     }
@@ -132,15 +150,22 @@ function renderInline(nodes: PMNode[] = []): ReactNode {
       // rasterisation would need a raw-HTML injection sink, which this read path
       // deliberately does not have — tracked as a follow-up.
       const latex = String(node.attrs?.latex ?? "");
+      const issue = validateLatex(latex)[0];
       return (
         <span
           key={key}
           className="noema-math-inline"
           data-latex={latex}
+          data-math-error={issue?.message}
           role="math"
           aria-label={latex}
         >
           {latex}
+          {issue ? (
+            <span role="alert" className="noema-math-error">
+              {issue.message}
+            </span>
+          ) : null}
         </span>
       );
     }
@@ -459,11 +484,17 @@ function resolvePullQuote(
 
 /** Display-scale pull quote — the read-side twin of the editor's decoration. */
 function renderPullQuote(quote: PullQuote, node: PMNode, key: string): ReactNode {
+  const direction = contentDirProps(quote.text);
   return (
     <blockquote
       key={key}
       {...colorProps(node)}
-      className={cn("noema-pull-quote text-[1.5em] font-semibold leading-[1.45]", DOC_PRINT_CLASS.block)}
+      dir={direction.dir}
+      className={cn(
+        "noema-pull-quote text-[1.5em] font-semibold leading-[1.45]",
+        DOC_PRINT_CLASS.block,
+        direction.className,
+      )}
       data-pull-quote=""
       data-size="large"
       title={formatPullQuote(quote)}
@@ -474,7 +505,7 @@ function renderPullQuote(quote: PullQuote, node: PMNode, key: string): ReactNode
           className="noema-pull-quote-attribution text-end text-[0.9em] font-normal opacity-75"
         >
           {"\u2014 "}
-          {quote.attribution}
+          <bdi>{quote.attribution}</bdi>
         </footer>
       )}
     </blockquote>
@@ -662,6 +693,64 @@ function renderTable(node: PMNode, key: string, locale: string, ctx: RenderConte
   );
 }
 
+/**
+ * Read-only twin of the editor's Ask-AI atom. The read path cannot run a
+ * provider, so it shows the configured prompt, the last answer (or the error)
+ * and nothing clickable — an unconfigured or unavailable AI leaves a readable
+ * record instead of an empty gap.
+ */
+function renderAskAiBlock(node: PMNode, key: string, locale: string): ReactNode {
+  const prompt = String(node.attrs?.prompt ?? "").trim();
+  const answer = String(node.attrs?.answer ?? "").trim();
+  const error = String(node.attrs?.error ?? "").trim();
+  const status = String(node.attrs?.status ?? "idle");
+  const mode = node.attrs?.mode === "summarize" ? "summarize" : "ask";
+  const direction = contentDirProps(answer);
+  return (
+    <div
+      key={key}
+      className={cn(
+        DOC_PRINT_CLASS.block,
+        "my-2 rounded-card border border-border bg-surface p-4",
+      )}
+      data-ask-ai=""
+      data-ask-ai-read=""
+      data-mode={mode}
+      data-status={status}
+    >
+      <p className="mb-1 text-xs font-semibold uppercase tracking-[0.04em] text-muted">
+        {t(locale, "askAI")} ·{" "}
+        {mode === "summarize" ? t(locale, "askSummarizePage") : t(locale, "askWord")}
+        {node.attrs?.stale === true ? ` · ${t(locale, "askAiStale")}` : ""}
+      </p>
+      <p className="my-1 whitespace-pre-wrap text-sm text-fg">
+        {prompt === "" ? t(locale, "askAiPlaceholder") : prompt}
+      </p>
+      {status === "pending" && (
+        <p role="status" className="mt-1 text-xs text-muted">
+          {t(locale, "chatThinking")}
+        </p>
+      )}
+      {error !== "" && (
+        <p role="alert" className="mt-2 text-sm text-danger">
+          {error}
+        </p>
+      )}
+      {answer !== "" && (
+        <div
+          dir={direction.dir}
+          className={cn(
+            "mt-2 whitespace-pre-wrap border-t border-border pt-2 text-sm leading-[1.6] text-fg",
+            direction.className,
+          )}
+        >
+          {answer}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function renderBlock(
   node: PMNode,
   key: string,
@@ -670,23 +759,35 @@ function renderBlock(
   quote?: PullQuote,
 ): ReactNode {
   switch (node.type) {
-    case "paragraph":
+    case "paragraph": {
+      // User-authored prose: its own first strong character sets the base
+      // direction, so mixed text never inherits the wrong side from the
+      // document locale. `dir-mixed` isolates the run from its neighbours.
+      const direction = contentDirProps(nodeText(node));
       return (
-        <p key={key} {...colorProps(node)} className={docClasses("paragraph")}>
+        <p
+          key={key}
+          {...colorProps(node)}
+          dir={direction.dir}
+          className={cn(docClasses("paragraph"), direction.className)}
+        >
           {renderInline(node.content)}
         </p>
       );
+    }
     case "heading": {
       const level = Math.min(Math.max(Number(node.attrs?.level ?? 1), 1), 6);
       const Tag = `h${level}` as "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
       // Stamp the view-local anchor so TOC deep links land on the heading; the
       // id is derived at render time and never written back to the document.
       const slug = ctx.headings.slugByNode.get(node);
+      const direction = contentDirProps(nodeText(node));
       return (
         <Tag
           key={key}
           {...colorProps(node)}
-          className={docClasses("heading")}
+          dir={direction.dir}
+          className={cn(docClasses("heading"), direction.className)}
           id={slug ? tocAnchorId(slug) : undefined}
         >
           {renderInline(node.content)}
@@ -728,12 +829,14 @@ function renderBlock(
       // paragraph) renders at display scale; everything else is unchanged.
       const pullQuote = quote ?? pullQuoteOf(node);
       if (pullQuote) return renderPullQuote(pullQuote, node, key);
+      const direction = contentDirProps(nodeText(node));
       return (
         <blockquote
           key={key}
           {...colorProps(node)}
-          className={docClasses("blockquote")}
-          style={{ borderLeft: "3px solid var(--border-strong)", ...colorProps(node).style }}
+          dir={direction.dir}
+          className={cn(docClasses("blockquote"), direction.className)}
+          style={{ borderInlineStart: "3px solid var(--border-strong)", ...colorProps(node).style }}
         >
           {(node.content ?? []).map((c, i) => renderBlock(c, `${key}.${i}`, locale, ctx))}
         </blockquote>
@@ -745,9 +848,19 @@ function renderBlock(
       // this on the same node is what makes the existing collaboration,
       // import/export and version-history paths work unchanged.
       const language = String(node.attrs?.language ?? "").trim();
-      if (isMermaidLanguage(language)) {
+      const source = nodeText(node);
+      if (isMermaidBlock(language, source)) {
         return (
           <MermaidDiagram
+            key={key}
+            source={source}
+            caption={formatCaption(typeof node.attrs?.caption === "string" ? node.attrs.caption : "")}
+          />
+        );
+      }
+      if (isPlantUmlLanguage(language)) {
+        return (
+          <PlantUmlDiagram
             key={key}
             source={nodeText(node)}
             caption={formatCaption(typeof node.attrs?.caption === "string" ? node.attrs.caption : "")}
@@ -811,8 +924,109 @@ function renderBlock(
         </div>
       );
     }
+    case "umlDiagram":
+      return <UmlDiagramView key={key} data={node.attrs?.data} diagramId={String(node.attrs?.id ?? key)} readOnly />;
     case "horizontalRule":
       return <hr key={key} className={docClasses("divider")} />;
+    case "animatedImage": {
+      // Animated-media blocks were silently dropped here because the node type
+      // had no read-side case. Resolve the stored source through the same
+      // upload policy the editor uses: a GIF keeps its original URL (transform
+      // params stripped) and is painted by a plain <img>, so the browser runs
+      // the animation; the frame never re-encodes it.
+      const plan = planUploadedAssetRender({
+        url: String(node.attrs?.src ?? ""),
+        name: String(node.attrs?.alt ?? ""),
+      });
+      const src = externalImageSrc(plan.src);
+      if (src === "") return null;
+
+      const alt = String(node.attrs?.alt ?? "");
+      const mediaType = mediaKindOfSource(plan.src, node.attrs?.mediaType);
+      let media: ReactNode = null;
+      if (mediaType === "image") {
+        media = (
+          /* eslint-disable-next-line @next/next/no-img-element -- user upload; animation must stay on the original bytes */
+          <img
+            src={src}
+            alt={alt}
+            className="noema-image"
+            style={{ maxWidth: "100%", height: "auto", borderRadius: "var(--radius-md)" }}
+          />
+        );
+      } else if (mediaType === "video") {
+        media = (
+          <video
+            src={src}
+            controls
+            preload="metadata"
+            className="noema-media-video block max-w-full rounded-md"
+            aria-label={alt || undefined}
+          />
+        );
+      } else if (mediaType === "audio") {
+        media = (
+          <audio
+            src={src}
+            controls
+            preload="metadata"
+            className="noema-media-audio block w-full max-w-full"
+            aria-label={alt || undefined}
+          />
+        );
+      } else {
+        const href = sanitizeHref(src);
+        const name =
+          alt ||
+          plan.src.split(/[?#]/)[0].split("/").filter(Boolean).pop() ||
+          plan.mimeType;
+        media =
+          href === null ? null : (
+            <a
+              href={href}
+              download={name}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="noema-media-file inline-flex max-w-full items-center gap-2 rounded-control border border-border px-3 py-2 text-sm text-fg"
+            >
+              {name}
+            </a>
+          );
+      }
+      if (media === null) return null;
+
+      return (
+        <figure
+          key={key}
+          className={cn("noema-animated-block", docClasses("image"))}
+          data-animated-image=""
+          data-animated={node.attrs?.animated === true ? "true" : "false"}
+          data-static-fallback={node.attrs?.staticFallback === true ? "true" : "false"}
+        >
+          <DevicePreview
+            device={node.attrs?.device}
+            scale={node.attrs?.deviceScale}
+            label={alt || undefined}
+          >
+            {media}
+          </DevicePreview>
+        </figure>
+      );
+    }
+    case "pdfPreview": {
+      const raw = String(node.attrs?.url ?? "");
+      if (!raw || !isSafePdfUrl(raw)) return null;
+      return (
+        <div key={key} className={cn("noema-pdf", docClasses("image"))} data-pdf-preview="">
+          <iframe
+            src={raw}
+            title={String(node.attrs?.title ?? "PDF preview")}
+            className="h-[70vh] w-full rounded-control border border-border"
+            loading="lazy"
+          />
+        </div>
+      );
+    }
     case "image": {
       const caption = String(node.attrs?.caption ?? "").trim();
       const width = typeof node.attrs?.width === "number" ? node.attrs.width : null;
@@ -825,13 +1039,39 @@ function renderBlock(
       // all renders nothing.
       const src = externalImageSrc(node.attrs?.src);
       if (src === "") return null;
+      const mediaType = String(node.attrs?.mediaType ?? "");
+      if (mediaType === "file" || mediaType === "pdf") {
+        const href = sanitizeHref(String(node.attrs?.src ?? ""));
+        if (href === null) return null;
+        return (
+          <div key={key} className={cn("my-2", docClasses("image"))}>
+            <a
+              href={href}
+              download={String(node.attrs?.alt ?? node.attrs?.title ?? "") || undefined}
+              className="inline-flex max-w-full items-center gap-2 rounded-control border border-border px-3 py-2 text-sm hover:bg-surface-2"
+            >
+              <span aria-hidden>📎</span>
+              <span className="truncate">
+                {String(node.attrs?.alt ?? node.attrs?.title ?? "Attachment")}
+              </span>
+            </a>
+          </div>
+        );
+      }
       return (
         <figure
           key={key}
           className={cn("noema-image-block", docClasses("image"))}
           data-width={width === null ? undefined : `${width}%`}
           data-align={align}
-          style={{ width: width === null ? undefined : `${width}%`, ...alignStyle(align) }}
+          // Shrink-wrap when no width is set. A full-width figure would make
+          // `margin: auto` a no-op and every centered/right image would still
+          // sit on the left edge in the read-only/export renderer.
+          style={{
+            width: width === null ? "fit-content" : `${width}%`,
+            maxWidth: "100%",
+            ...alignStyle(align),
+          }}
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
@@ -885,17 +1125,25 @@ function renderBlock(
       return renderTable(node, key, locale, ctx);
     case "blockMath": {
       // LaTeX preview, block form: centred, mono-styled (`.noema-math-block`),
-      // with the source mirrored onto `data-latex`/`aria-label`.
+      // with the source mirrored onto `data-latex`/`aria-label`. Structural
+      // errors are reported inline; this path never injects authored HTML.
       const latex = String(node.attrs?.latex ?? "");
+      const issue = validateLatex(latex)[0];
       return (
         <div
           key={key}
           className={cn("noema-math-block", DOC_PRINT_CLASS.block)}
           data-latex={latex}
+          data-math-error={issue?.message}
           role="math"
           aria-label={latex}
         >
           {latex}
+          {issue ? (
+            <p role="alert" className="noema-math-error">
+              {issue.message}
+            </p>
+          ) : null}
         </div>
       );
     }
@@ -905,6 +1153,68 @@ function renderBlock(
       const attrsCrumbs = crumbsFromAttrs(node);
       const crumbs = attrsCrumbs.length > 0 ? attrsCrumbs : ctx.breadcrumb.trail;
       return renderBreadcrumb(crumbs, ctx.breadcrumb.workspaceSlug, locale, key);
+    }
+    case "askAi":
+      return renderAskAiBlock(node, key, locale);
+    case "templateButton": {
+      // Read-only twin of the editor atom. There is no editor to insert into
+      // here, so the card shows what the button would insert instead of
+      // pretending to be clickable.
+      const parsed = parseTemplateButton({
+        id: String(node.attrs?.id ?? "templateButton"),
+        templateId: String(node.attrs?.templateId ?? ""),
+        label: String(node.attrs?.label ?? ""),
+      });
+      const templateId = parsed?.templateId ?? String(node.attrs?.templateId ?? "");
+      const label =
+        parsed?.label?.trim() ||
+        templateDefinition(templateId as TemplateId)?.label ||
+        t(locale, "blockTemplateButton");
+      return (
+        <div
+          key={key}
+          className={cn(
+            DOC_PRINT_CLASS.block,
+            "my-2 inline-flex items-center gap-2 rounded-control border border-border bg-surface px-3 py-1.5 text-sm text-fg",
+          )}
+          data-template-button=""
+          data-template-id={parsed?.templateId}
+          aria-label={t(locale, "blockTemplateButton")}
+        >
+          <span aria-hidden="true">📄</span>
+          <span>{label}</span>
+        </div>
+      );
+    }
+    case "button": {
+      // A Button block is interactive in the editor only. The read path renders
+      // its label and configured action as a disabled, honest summary.
+      const parsed = parseButtonBlock({
+        id: String(node.attrs?.id ?? "button"),
+        label: String(node.attrs?.label ?? ""),
+        style: node.attrs?.style,
+        confirm: node.attrs?.confirm,
+        action: node.attrs?.action,
+      });
+      const label = parsed?.label?.trim() || t(locale, "blockButton");
+      const description = parsed ? describeButton(parsed) : t(locale, "configureButtonFirst");
+      return (
+        <div
+          key={key}
+          className={cn(DOC_PRINT_CLASS.block, "my-2 flex flex-wrap items-center gap-2 text-sm")}
+          data-button-block=""
+        >
+          <button
+            type="button"
+            disabled
+            aria-label={`${label}: ${description}`}
+            className="rounded-control border border-border bg-surface px-3 py-1.5 text-sm text-fg opacity-70"
+          >
+            {label}
+          </button>
+          <span className="text-xs text-muted">{description}</span>
+        </div>
+      );
     }
     case "bookmark": {
       const url = String(node.attrs?.url ?? "");
@@ -966,20 +1276,37 @@ function renderBlock(
         );
       }
       const meta = embedMeta(resolved.provider);
+      const device = resolveDeviceId(node.attrs?.device);
+      // A stored device preview renders the live provider iframe inside the
+      // frame registry; the sandbox/allow/src still come from `resolveEmbed`
+      // above, so no third-party embed escapes the existing policy.
       return (
-        <iframe
+        <DevicePreview
           key={key}
-          src={resolved.embedUrl}
-          data-provider={resolved.provider}
-          title={meta?.title ?? t(locale, "embeddedContent")}
-          className={cn("noema-embed-frame", DOC_PRINT_CLASS.hide)}
-          loading="lazy"
-          referrerPolicy="strict-origin-when-cross-origin"
-          sandbox={resolved.sandbox}
-          allow={resolved.allow}
-          allowFullScreen
-          style={meta ? { aspectRatio: meta.aspectRatio } : undefined}
-        />
+          device={device}
+          scale={node.attrs?.deviceScale}
+          label={meta?.title ?? t(locale, "embeddedContent")}
+          className={DOC_PRINT_CLASS.hide}
+        >
+          <iframe
+            src={resolved.embedUrl}
+            data-provider={resolved.provider}
+            title={meta?.title ?? t(locale, "embeddedContent")}
+            className={cn("noema-embed-frame", DOC_PRINT_CLASS.hide)}
+            loading="lazy"
+            referrerPolicy="strict-origin-when-cross-origin"
+            sandbox={resolved.sandbox}
+            allow={resolved.allow}
+            allowFullScreen
+            style={
+              device
+                ? { width: "100%", height: "100%", aspectRatio: "auto" }
+                : meta
+                  ? { aspectRatio: meta.aspectRatio }
+                  : undefined
+            }
+          />
+        </DevicePreview>
       );
     }
     default:

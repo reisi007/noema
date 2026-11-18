@@ -623,6 +623,18 @@ body {
   background: var(--selection-soft);
 }
 
+/* Persisted inline-comment range (decoration only, no document mark). */
+.noema-editor .ProseMirror .noema-comment-highlight {
+  background: var(--selection-soft);
+  border-bottom: 1px solid var(--selection-strong);
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.noema-editor .ProseMirror .noema-comment-highlight-active {
+  background: var(--selection);
+  box-shadow: 0 0 0 2px var(--selection-strong);
+}
+
 /* Highlight mark default. */
 .noema-editor .ProseMirror mark {
   background: var(--mark-bg);
@@ -769,6 +781,33 @@ body {
 }
 .noema-editor .ProseMirror [data-type="block-math"] {
   margin: 6px 0;
+}
+.noema-math-node {
+  cursor: text;
+  border-radius: var(--radius-xs);
+}
+.noema-math-node:focus-visible,
+.noema-math-node.is-selected {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.noema-math-node[data-equation-state="error"] {
+  padding: 0 var(--space-1);
+  background: var(--surface-2);
+}
+.noema-math-source {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  white-space: pre-wrap;
+}
+.noema-math-error {
+  margin-inline-start: var(--space-1);
+  color: var(--danger);
+  font-size: 0.75em;
+  overflow-wrap: anywhere;
+}
+.noema-math-empty {
+  color: var(--muted);
+  font-size: 0.875em;
 }
 .noema-drag-handle:hover {
   background: var(--surface-2);
@@ -1581,6 +1620,22 @@ body {
 .dir-auto {
   unicode-bidi: plaintext;
 }
+/* Inline user fragments (<bdi> / inlineBidiProps): isolate the run so its
+   punctuation and strong characters cannot reorder the surrounding sentence.
+   Direction stays content-derived, exactly like the native <bdi> element. */
+.bidi-isolate {
+  unicode-bidi: isolate;
+}
+
+/* User-authored prose in the editing surface. `plaintext` applies the Unicode
+   P2/P3 first-strong rule per paragraph, so a paragraph or heading typed in
+   Arabic inside an English page (or a Latin path inside an Arabic page) is laid
+   out on its own base direction while the surrounding document/chrome keeps
+   the locale's `dir`. Block placement stays in normal flow — no physical
+   left/right rules are involved. */
+.noema-editor .ProseMirror :is(p, h1, h2, h3, h4, h5, h6, blockquote) {
+  unicode-bidi: plaintext;
+}
 
 /* ---------------------------------------------------------------------------
    Suggestions (track changes)
@@ -1978,6 +2033,36 @@ body {
   align-items: center;
   gap: 6px;
   }
+@utility noema-ask-config{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  }
+@utility noema-ask-select{
+  height: 30px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  }
+@utility noema-ask-source{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  }
+@utility noema-ask-pending{
+  color: var(--muted);
+  font-size: 12px;
+  }
+@utility noema-ask-error{
+  color: var(--danger);
+  font-size: 13px;
+  }
 @utility noema-ask-btn{
   display: inline-flex;
   align-items: center;
@@ -2015,6 +2100,12 @@ body {
   padding: var(--space-0-5);
   border-radius: var(--radius-sm);
   color: var(--muted);
+  }
+@utility noema-linked-view{
+  max-width: 10rem;
+  padding-inline: var(--space-1);
+  background: transparent;
+  font-size: var(--text-xs);
   }
 @utility noema-linked-body{
   overflow-x: auto;

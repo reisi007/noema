@@ -34,6 +34,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | To-do list | Checkbox list with checked state. | ✅ | Click-to-toggle; state persisted as node attribute. |
 | Collapsible list item | List item that can hold nested children and collapse. | ✅ | Notion's collapsible item IS the toggle block; its state persists in the document (covered by the toggle e2e). |
 | Toggle block | Header line that reveals/hides child blocks. | ✅ | Open/closed is a node attribute, saved with the document; an e2e test collapses a toggle and reloads to prove it persists. |
+| Draft recovery | Recover unsaved work after a refresh or crash. | ✅ | The editor mirrors every debounced payload into `localStorage` (`noema:draft:<pageId>`, 7-day TTL); a valid draft is offered — never auto-applied — with Restore/Cancel. Successful server saves clear it. |
 | Toggle heading | Heading that doubles as a toggle. | ✅ | Composite of heading + toggle planned. |
 | Quote block | Styled quotation block. | ✅ | Left rule styling; supports nested blocks. |
 | Callout block | Emphasized box with icon and background. | ✅ | Renders with icon + background colour; the in-block emoji picker ships (the earlier "picker pending" note was stale). |
@@ -45,15 +46,15 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
-| Mermaid / UML diagrams | Render diagrams from code blocks. | ? | `mermaid` language with preview/source switch, `/mermaid` templates for flowchart, UML class/sequence/state, ER and gantt; read-only/shared rendering; 50k source cap and strict SVG sanitisation. Live source collaboration uses the existing Yjs room. See `docs/MERMAID.md`. |
+| Mermaid / PlantUML / UML diagrams | Render and create diagrams. | ? | `mermaid` language with preview/source switch, `/mermaid` templates for flowchart, UML class/sequence/state, ER and gantt; visual React Flow UML canvas with class/actor/use-case/component/note nodes and UML relations; read-only/shared rendering; PlantUML browser rendering via `@plantuml/core` and local `viz-global.js` (no Java/CDN); per-node collaborator presence; 50k source cap and strict SVG sanitisation. Live source/canvas collaboration uses the existing Yjs room. See `docs/MERMAID.md`. |
 | Code block | Monospaced block that preserves whitespace. | ✅ | Uses a code-highlighting extension. |
 | Code language selector | Set the language for highlighting. | ✅ | Notion-style searchable corner picker (35 languages via `src/lib/code-languages.ts`); language persists in document JSON and survives reload. |
 | Syntax highlighting | Tokenizes code by language. | ✅ | lowlight + highlight.js *common* grammars (~30) wired through `@tiptap/extension-code-block-lowlight`; token styles for light/dark themes; unknown fence languages fall back to auto-detect. |
 | Code block line numbers | Optional gutter numbering. | ✅ | Planned as a code-block setting. |
 | Code block caption | Caption text under a code block. | ✅ | Planned. |
-| Inline equation | Small LaTeX expression inside a text line. | 🟡 | KaTeX renderer wired; editing UX rough. |
-| Block equation | Centered display equation. | 🟡 | Renders via KaTeX; edit/preview split unstable. |
-| KaTeX/LaTeX support | Math syntax engine for equations. | 🟡 | KaTeX chosen; macro support limited. |
+| Inline equation | Small LaTeX expression inside a text line. | ✅ | The dialog keeps one textarea mounted across LaTeX/Preview so caret, selection and undo survive; it captures the live editor selection on open and replaces it on apply, renders a live preview, and reports errors inside a contenteditable=false node view. |
+| Block equation | Centered display equation. | ✅ | Explicit LaTeX/Preview state with a live preview; Escape, Cancel, scrim click and focus-out preserve the existing source. Slash insertion removes the `/equation` query first and replaces the empty paragraph, and auto-detect/paste insert at block level. |
+| KaTeX/LaTeX support | Math syntax engine for equations. | ✅ | One renderer with a documented bounded macro table (`MATH.md`), input/output/depth budgets, KaTeX `maxExpand`/`maxSize`, `trust: false`, banned/unsafe command rejection and non-throwing inline errors. See `src/lib/math-tex.ts`. |
 | Math editor UX | Popover to compose equations with symbols. | ✅ | Planned composer with symbol palette. |
 
 ### Layout blocks
@@ -68,12 +69,12 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Table merge/split cells | Combine or split cells. | ⛔ | High complexity for low demand; revisit if requested. |
 | Table of contents | Auto-generated page outline with links. | ✅ | Lists headings; scroll-spy navigation partial. Spec detail: docs/specs/editor-deep.md §5 (R84.16); live close: B96 (e2e/toc.spec.ts). |
 | Breadcrumb block | Shows the page's ancestor path. | ✅ | Renders path; deep-tree linking rough. |
-| Synced block | Mirror one block's content in many places. | 🟡 | Planned via reference ids; editing propagation needs care. |
-| Synced block source marker | Visual marker of the canonical source. | 🟡 | Planned. |
-| Template button block | Reusable set of blocks inserted on click. | 🟡 | Planned; depends on template subsystem. |
-| Button block | Interactive button triggering configured actions. | 🟡 | Planned; depends on automations. |
-| Ask-AI block | Prompt-driven AI block inside a page. | 🟡 | Planned; depends on AI layer and provider keys. |
-| Two-column page property layout | Place properties side by side. | 🟡 | Planned with property panel rework. |
+| Synced block | Mirror one block's content in many places. | ✅ | Same-page mirrors propagate live through a TipTap plugin; cross-page mirrors refresh on mount (and via the card's refresh action); detaching re-ids the copied subtree. |
+| Synced block source marker | Visual marker of the canonical source. | ✅ | Each mirror shows a "Synced" badge and a deep link to its source page/block; broken sources keep the last snapshot and show a warning. |
+| Template button block | Reusable set of blocks inserted on click. | ✅ | The node persists its chosen template id/label, lists built-ins plus workspace saved templates, and on click resolves the template server-side (workspace + page-edit + deletion checks), materializes variables and inserts fresh block ids after the button. Missing/foreign templates are disabled with an honest error. |
+| Button block | Interactive button triggering configured actions. | ✅ | Configurable label/style/confirm and the shared ButtonAction vocabulary (`open_url`, `set_property`, `insert_template`, `notify`). Server execution re-checks membership, page edit and lock; property writes delegate to the canonical `setPropertyValueAction`, template inserts re-authorize the template, links re-check the URL allowlist, and unsupported notifications fail explicitly. |
+| Ask-AI block | Prompt-driven AI block inside a page. | ✅ | Persists mode (ask/summarize), prompt, output destination and page-context source; runs through the existing `/api/ai` transport with inline pending/error states and inserts/replaces per configuration. The route derives page text server-side after membership + page-read + guest-scope checks, ignoring client context when a page id is named. Read-only rendering shows the stored answer. |
+| Two-column page property layout | Place properties side by side. | ✅ | A persisted single/two-column layout with order/full-width/divider controls, responsive collapse on narrow widths, and a shared adapter that reconciles saved order with the live schema without dropping properties. Stored in the active database view config. |
 
 ### Media blocks
 
@@ -101,8 +102,8 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
-| Inline database block | A database rendered inside a page. | 🟡 | Renders a collection view inline; view config incomplete. |
-| Linked view of a database | Re-display an existing database elsewhere. | 🟡 | Planned; requires stable view model. |
+| Inline database block | A database rendered inside a page. | ✅ | Persists display type (table/list/board/gallery), visible properties, group-by, filters and sorts per node; config is resolved against the live source schema with safe stale-view fallback, read-only editors cannot reconfigure, and board rendering is included. |
+| Linked view of a database | Re-display an existing database elsewhere. | ✅ | The editor node binds to a chosen source view, applies that view’s filters/sorts, and persists synced/detached overrides per node; a stale view id falls back to the source’s first view. A detached instance has an in-block filter/sort editor, and row create/edit/delete writes through the source database’s authz. |
 | Page link mention | Inline link to another page. | ✅ | `@` picker inserts a page link node. |
 | Block reference / mention | Inline reference to a specific block. | ✅ | Planned; block-id resolution needed. |
 | Date mention | Inline date chip. | ✅ | Mention menu inserts weekday-style chips; `dateMention` supports short/long/weekday styles + explicit locale, id stays ISO (unit-tested). |
@@ -203,7 +204,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Calendar view | Rows on a month/week calendar. | ✅ | Planned; needs date property engine. Month grid landed but single-day only (B15); week scale + multi-day spans + date-property picker spec'd: docs/specs/database-deep.md (R89.10). |
 | Timeline view | Rows on a horizontal time axis. | ✅ | Planned. Static bars landed (B15, fixed window); zoom/drag/dates spec'd: docs/specs/database-deep.md (R89.11). |
 | Chart view | Aggregate charts over the database. | ✅ | Planned; aggregation dependency. Count-only bars landed (B15); chart type/measure/group-by over ROLLUP_FUNCTIONS spec'd: docs/specs/database-deep.md (R89.12). |
-| Form view | Public/Internal form that creates rows. | ✅ | Planned. No ViewType.FORM exists yet; builder + submit path spec'd: docs/specs/database-deep.md (R89.29). |
+| Form view | Public/Internal form that creates rows. | 🟡 | The internal FORM view is wired end-to-end: ViewType.FORM (schema, canonical type list, view menu and action guards), the respondent renderer, validation, an inline builder (title/description/questions/required/order/accepting/submit copy) and atomic row creation through submitFormAction (server re-authorization, stored-schema revalidation, per-user/per-address throttles, row + cells in one transaction). Public forms publish one view through ShareLink.viewId at /s/<token>: the builder creates/copies/revokes the link and shows response count, the route handles password/expiry/unlock, and submitPublicFormAction applies per-address/link throttles plus stored-schema revalidation and an atomic row+cells write. Public links intentionally hide PEOPLE/FILES/VERIFICATION questions because those editors need a signed-in session; internal forms keep them. |
 | View tabs | Multiple named views per database. | ✅ | Tabs switch views, the active tab is remembered per database across reloads, and each tab keeps its own configuration. e2e: *keeps the active view tab across a reload*. |
 | Per-view configuration | Each view keeps independent settings. | ✅ | Filters, sorts, group, colour rules, visible columns and the frozen-column toggle all live in that view's `config` (normalised on write, parsed on read) and survive reloads. e2e: *persists show/hide properties and filters across a reload*; red-first unit tests for `normalizeViewConfig`/`parseViewConfig`. |
 | Add/rename/duplicate view | Manage tabs. | ✅ | Add, rename (prompt dialog) and duplicate — `duplicateViewAction` copies type + configuration and focuses the copy. e2e: *duplicates a view into its own tab with the configuration copied*. |
@@ -214,16 +215,16 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
 | Filters | Restrict rows by property conditions. | ✅ | Multiple flat conditions per view with *Match all/any* (the nested AND/OR tree is unit-tested and ready for the groups UI), operator catalogue per property type, each filter row persisted in the view config. e2e: *filters with a long-tail operator (starts with)*. |
-| AND/OR filter groups | Boolean combination of filters. | 🟡 | Planned as a filter tree. FilterNode tree already evaluates (database-query.ts:66); tree UI spec'd: docs/specs/database-deep.md (R89.2). |
-| Nested filter groups | Arbitrary-depth boolean nesting. | 🟡 | Planned after flat groups. Spec'd with the tree UI: docs/specs/database-deep.md (R89.2). |
+| AND/OR filter groups | Boolean combination of filters. | ✅ | The `filter-tree-ui` builder is exposed from the view toolbar (Builder) and persisted as `config.filterBuilder`; `applyView` gives it precedence and lowers it through `toQueryExpr`, so a saved group really filters. The editor adds conditions/groups, switches each group's AND/OR, moves nodes between groups, validates and normalizes the tree; ids stay stable across edits. Unit-tested in `filter-tree-ui.test.ts`, `view-settings.*.test.ts` and `database-query.test.ts`. |
+| Nested filter groups | Arbitrary-depth boolean nesting. | ✅ | Nested `FilterGroup` nodes are edited recursively (`BuilderGroupRows`), with add-group/add-condition, drag-to-group, normalize and depth/unknown-property validation. A root group can mix leaves and groups at any depth; `applyView` evaluates the whole tree. Covered by the same builder tests plus the pure tree suite. |
 | Filter operators | Equals, contains, before, is empty, etc. | ✅ | Text: contains / does not contain / starts with / ends with / is / is not / is empty / is not empty. Number: > ≥ < ≤ + the text set. Date: is before / is after + the numeric set, target parsed chronologically. Checkbox: is checked / is unchecked. Unparseable targets never match (unit-tested). |
 | Sorts | Order rows by one or more properties. | ✅ | Any number of sort keys in priority order with ↑/↓ reordering, one key per property, and rows without a value always sorted last in both directions. e2e: *applies two sorts and shows the order both keys produce*; unit tests for `compareBySorts`/`moveSort`. |
 | Sort ascending/descending | Direction per sort key. | ✅ | Direction toggle works. |
 | Groups | Bucket rows by a property. | ✅ | Planned; mainly for board/list. groupRows() exists (database-query.ts:580); generalized grouping + order/collapse spec'd: docs/specs/database-deep.md (R89.3). |
 | Group aggregation | Show a summary per group. | ✅ | Planned. Spec'd over rollup aggregate(): docs/specs/database-deep.md (R89.4). |
 | Hidden groups | Collapse or hide groups. | ✅ | Planned. Persisted collapse spec'd: docs/specs/database-deep.md (R89.3). |
-| Conditional formatting | Color rows/cells by rule. | 🟡 | Planned. ColorRule already modelled in view config (database-query.ts:68); rule editor + evaluation spec'd: docs/specs/database-deep.md (R89.5). |
-| Row color rules | Two-tone row backgrounds. | 🟡 | Planned subset of conditional formatting. Spec'd: docs/specs/database-deep.md (R89.5). |
+| Conditional formatting | Color rows/cells by rule. | ✅ | Colour rules are authored in the view toolbar (property, operator, value, palette colour, row vs cell target, optional text colour, reorder/remove) and persisted in `ViewConfig.colorRules`; `evaluateRowColors`/`cellColorFor` reuse the flat filter engine so rule semantics match view filters. The render path paints Table, List, Board, Gallery and Peek; malformed/deleted-property rules stay inert and are reported by `validateRules`. Unit-tested in `conditional-format.test.ts`, `row-color-rules.test.ts` and the view-settings suites. |
+| Row color rules | Two-tone row backgrounds. | ✅ | A `target: "row"` rule applies `backgroundColor` plus optional `textColor` to the whole row; cell rules paint only their property cell. Rules are priority-ordered (first match wins for the background, all matches reported) and edited from the same Colour popover. Covered by `row-color-rules.test.ts` and the database render tests. |
 | Quick filter from header | Filter directly from a column header. | ✅ | Planned. Spec'd as an entry point into the filter panel: docs/specs/database-deep.md (R89.6). |
 
 ### Rows, opening & layout
@@ -235,8 +236,8 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Open row in side peek | Preview row in a side drawer. | ✅ | Planned; needs drawer shell. Spec: docs/specs/navigation-ux.md. |
 | Inline database | Database embedded in a page body. | ✅ | Renders through the editor's linked-database node view; its height/scroll shell lives in `src/components/editor/**` (editor slot), so the scroll fix is queued there rather than patched from B15. |
 | Full-page database | Database as its own page. | ✅ | One toolbar above the table: view tabs + per-view menu (rename / duplicate / change type), Filter, Sort, Group, Colour and Properties controls, New row, Templates, New property, Deleted rows, Export/Import CSV and a live row count. |
-| Linked database | Reuse a database elsewhere. | 🟡 | Planned; requires view identity model. Read-only node exists (linked-database.tsx, attrs = databasePageId only); view identity, per-instance overrides and synced mode spec'd: docs/specs/database-deep.md (R89.14, R89.15). |
-| Load limit / row pagination | Limit rows shown per view. | ✅ | The ticket tracker loads **100 rows per page** with keyset pagination (`getTicketsPage` + `loadMoreTicketsAction`) and a *Load more* control that disappears at the end; an e2e with 120 tickets proves no row is repeated or dropped. Databases load a bounded set. |
+| Linked database | Reuse a database elsewhere. | ✅ | Source-view binding, view picker, synced/detached mode, stale-id fallback, and a detached-only in-block filter/sort editor (AND/OR builder + sorts) ship. A detached instance offers New row plus a row editor that reuses the database `Cell` renderer for every property type; create/edit/delete call `createRowAction`/`setPropertyValueAction`/`deleteRowAction`, and the primary title mirrors through `updatePageAction`. The server returns `canEdit` from the reader's page capabilities, so guests and explicit READ/COMMENT grants see no write affordances; synced instances stay read-only in the UI. Covered by `linked-overrides.test.ts`, `linked-database.fix04.test.ts`, `linked-view.test.ts` and the guest-scope action tests (R89.14/R89.15). |
+| Load limit / row pagination | Limit rows shown per view. | ✅ | Database pages load **100 rows** per keyset window (`(position, id)` cursor) with a *Load more* control; the ticket tracker loads 100/page with keyset pagination, and search loads 50/window. Covered by `database-pagination.test.ts` and the tracker/search e2e suites. |
 | Show/hide properties | Choose visible columns. | ✅ | The Properties menu toggles columns per view (primary column pinned, hidden count shown) and the list is stored in the view config, so the same columns come back after a reload. e2e: *persists show/hide properties and filters across a reload* + `visibleColumns` unit tests. |
 | Freeze columns | Pin leading columns while scrolling. | ✅ | First column pinned with `position: sticky` while the table scrolls horizontally — on by default and toggled per view from the Properties menu (multi-column pinning not offered). e2e asserts the sticky header after reload. |
 | Row reordering | Drag rows in a view order. | ✅ | Planned with manual order property. Page.position already orders rows (queries.ts:155-157); drag UI + moveRowAction spec'd: docs/specs/database-deep.md (R89.19). |
@@ -251,16 +252,16 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
-| Sub-items / sub-tasks | Parent-child rows inside a database. | 🟡 | Planned; tree ordering needed. Page.subOfId (depth cap 1) spec'd independent of relations: docs/specs/database-deep.md (R89.30). |
-| Dependencies | Blocking/blocked-by between rows. | 🟡 | Planned; mainly for timeline. RowDependency join model with cycle guard spec'd: docs/specs/database-deep.md (R89.31). |
-| Timeline dependencies | Draw dependency arrows on timeline. | 🟡 | Planned. Arrow rendering inside the gantt depth spec: docs/specs/database-deep.md (R89.31 with R89.11). |
+| Sub-items / sub-tasks | Parent-child rows inside a database. | ✅ | `Page.subOfId` (a self-relation distinct from the database `parentId`) persists a one-level row tree, with a migration and index. `setSubItemParentAction` checks the row/database workspace, page-level edit rights, same-database parent, deleted parents, self-parenting and the one-level cap; it logs `row.edited`. The database query/`DBRow` projection carries `subOfId` and `position`; the "Sub-tickets" toggle lays rows out through the `@/lib/sub-issues` engine, the peek can nest a row under the preceding top-level row and promote it back, and every move is optimistic with a server rollback. Covered by `database-subitems.test.ts`, `database-view.fix04.test.ts`, `sub-issues.test.ts` and `sub-ticket-rollup.test.ts`. |
+| Dependencies | Blocking/blocked-by between rows. | ✅ | `RowDependency` persists directed `blockerId`→`blockedId` edges with a migration, a unique pair and a blocked-id index. `getDatabase` projects only edges whose endpoints are visible rows of that database, and `setRowDependencyAction` checks same-database live rows, edit rights on both rows, self-edges, the 500-edge cap, idempotent add/remove and `wouldCreateCycle`. The row peek shows direct blocked-by/blocks chips with add/remove pickers; the table gets a derived dependency column. Covered by `database-dependencies.test.ts`, `parent-scope.test.ts`, `database-view.fix04.test.ts` and `row-dependencies.test.ts`. |
+| Timeline dependencies | Draw dependency arrows on timeline. | ✅ | The page route passes persisted blocking edges into `DatabaseView`; `toTimelineEdges` gives each pair a stable id and `TimelineView` routes orthogonal arrows between dated bars in its time window. Covered by `timeline-chart-views.test.ts` and `database-view.fix04.test.ts`. |
 | Calendar multi-day events | Span events across days. | ✅ | Planned. Span-day expansion replaces today's single-day match (view-renderers.tsx:624-634): docs/specs/database-deep.md (R89.10). |
 | Gallery previews | Show cover or page content on cards. | ✅ | Planned. First-image banner landed (B15); cover property + page-content preview spec'd: docs/specs/database-deep.md (R89.9). |
 | Board grouping | Group board columns by property. | ✅ | Planned. groupBy + status buckets landed (B15); group-by picker, order, collapse and per-column create spec'd: docs/specs/database-deep.md (R89.7). |
 | Buttons in databases | Row actions via buttons. | ✅ | Planned; depends on automations. Property shell (label/style/config) spec'd: docs/specs/database-deep.md (R89.26); action execution owned by docs/specs/automations.md (R27.x). |
 | Database templates | Pre-filled row templates. | ✅ | Planned. Minimal CRUD shipped (save row as template / instantiate / recurrence, database.ts:464-588); depth (default, preview, edit) integration spec'd: docs/specs/database-deep.md (R89.16) with docs/specs/templates.md (R31.x). |
 | Default template | Auto-apply a template to new rows. | ✅ | Planned. Flag + semantics owned by docs/specs/templates.md (R31.13); createRowAction application + New-row split button spec'd: docs/specs/database-deep.md (R89.16). |
-| Recurring templates | Create rows on a schedule. | 🟡 | Planned; depends on a scheduler. Core (resolver/nextRun/cron driver) owned by docs/specs/templates.md (R31.18-R31.23); database-side surfacing + system-actor materialization spec'd: docs/specs/database-deep.md (R89.17). |
+| Recurring templates | Create rows on a schedule. | ✅ | Row templates store recurrence/nextRunAt/lastRunAt/paused and a durable `TemplateRun` occurrence claim. The cron route materializes due rows through the same shared planner as manual template application, with system-actor attribution, variable resolution at run time, pause/resume and idempotent retries. The Templates menu exposes the schedule editor. Specs: docs/specs/templates.md (R31.18-R31.23), docs/specs/database-deep.md (R89.17). |
 | CSV import | Import rows from CSV. | ✅ | Planned; header mapping UI. Mapping step + create-database import owned by docs/specs/import-export.md (R23.1, R23.2); database-toolbar wiring spec'd: docs/specs/database-deep.md (R89.20). |
 | CSV export | Export rows to CSV. | ✅ | Planned. Toolbar entry + GET /api/export/database/:id already exist; round-trip contract owned by docs/specs/import-export.md (R23.5); wiring spec'd: docs/specs/database-deep.md (R89.20). |
 | Unique ID property | Human-readable per-row id. | ✅ | Planned; see Properties. Today derived as row.id.slice(-8) (database-view.tsx:424); monotonic Property.seq + prefix/pad spec'd: docs/specs/database-deep.md (R89.25). |
@@ -287,22 +288,22 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | URL property | Link value. | ✅ | Stored; click-to-open. |
 | Email property | Email value. | ✅ | Stored; `mailto:` link. |
 | Phone property | Phone number value. | ✅ | Stored; `tel:` link. |
-| Formula property | Computed value from an expression. | ✅ | Planned; see Formulas. |
-| Relation property | Link rows across databases. | 🟡 | Planned. Spec: docs/specs/relations-rollups.md. |
-| Relation (single) | One linked row. | 🟡 | Planned. Spec: docs/specs/relations-rollups.md. |
-| Relation (multi) | Many linked rows. | 🟡 | Planned. Spec: docs/specs/relations-rollups.md. |
-| Two-way relation | Reciprocal relation property. | 🟡 | Planned; requires pair metadata. Spec: docs/specs/relations-rollups.md. |
-| Rollup property | Aggregate across a relation. | 🟡 | Planned; depends on relations. Spec: docs/specs/relations-rollups.md. |
-| Rollup functions | Count, sum, average, min/max, join, etc. | 🟡 | Planned function set. Spec: docs/specs/relations-rollups.md. |
+| Formula property | Computed value from an expression. | ✅ | Expression is parsed on save; see Formulas. |
+| Relation property | Link rows across databases. | ✅ | Target and target rows are validated server-side; the picker searches with cursor paging. |
+| Relation (single) | One linked row. | ✅ | The column stores `multi: false` and clamps every write to one id. |
+| Relation (multi) | Many linked rows. | ✅ | De-duplicated, validated and capped by the target database. |
+| Two-way relation | Reciprocal relation property. | ✅ | Pair metadata, create/reuse, backfill, disable and atomic source/inverse writes. |
+| Rollup property | Aggregate across a relation. | ✅ | Config is validated; computed in table and side peek. Target rows are still loaded eagerly (server projection remains future work). |
+| Rollup functions | Count, sum, average, min/max, join, etc. | ✅ | 15 functions including percent empty and show-original with a custom separator. |
 | Created time | Row creation timestamp. | ✅ | Stored automatically; surfaced in table, side peek, board cards and gallery. |
 | Created by | Row creator. | ✅ | Stored; surfaced with the same coverage as Created time. |
 | Last edited time | Last modification timestamp. | ✅ | Stored (updatedAt); surfaced with the same coverage as Created time. |
-| Last edited by | Last editor. | 🟡 | Tracked from property/table edits via the activity log (falls back to creator); content/title edits outside the database view not yet recorded. |
+| Last edited by | Last editor. | ✅ | `row.edited` activity lines are written by both property-cell writes (`setPropertyValueAction`) and real title/body edits of database-row pages (`updatePageAction`, when the page's parent is `DATABASE`); the database query resolves the newest actor per row and falls back to the creator when no edit is recorded. Covered by `pages-follow-notify.test.ts` and the database query tests. |
 | Unique ID property | Monotonic per-database id. | ✅ | Planned. |
 | Button property | Trigger actions from a row. | ✅ | Planned. |
 | Place/location property | Address with map preview. | ✅ | Planned. |
 | Verification property | Verified-by-owner marker. | ✅ | Planned; wiki-oriented. |
-| AI autofill property | AI-generated value per row. | 🟡 | Planned; depends on AI layer. |
+| AI autofill property | AI-generated value per row. | ✅ | `AI_AUTOFILL` property config (prompt, max tokens, temperature) is edited in the property dialog, validated by `@/lib/ai-autofill`, and the table cell renders an Autofill button wired to `runAiAutofillAction`; the server checks workspace/page access, frames the row context and writes the generated value. |
 | Property reorder/hide | Arrange and hide properties. | ✅ | Hide per view; drag a column header onto another to reorder — positions persist server-side. |
 | Property delete | Remove a property and its data. | ✅ | Confirmation dialog names the property and warns about its values before deleting. |
 | Property type change | Convert a property's type. | ⛔ | Lossy conversions; only safe transforms planned later. |
@@ -312,7 +313,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
-| Formula editor | Author expressions with autocomplete. | 🟡 | Planned; expression parser first. Spec: docs/specs/formula-engine.md. |
+| Formula editor | Author expressions with autocomplete. | ✅ | `src/components/editor/formula-editor.tsx` + `src/lib/formula-editor.ts` provide a monospace source box, ranked function/property completions, signature help, live syntax/unknown-name diagnostics, Apply/Format and keyboard handling; persisted through the property editor after parse validation. Covered by the formula-editor and property-option suites. |
 | Arithmetic operators | `+ - * / %` and precedence. | ✅ | Planned. Spec: docs/specs/formula-engine.md. |
 | Comparison operators | `== != < <= > >=`. | ✅ | Planned. Spec: docs/specs/formula-engine.md. |
 | Boolean operators | `and`, `or`, `not`. | ✅ | Planned. Spec: docs/specs/formula-engine.md. |
@@ -334,14 +335,14 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
-| Page templates | Duplicate a page for reuse. | 🟡 | Duplicate-page works; gallery UI missing. Spec: docs/specs/templates.md. |
+| Page templates | Duplicate a page for reuse. | ✅ | The workspace home gallery lists saved workspace templates (`listWorkspaceTemplatesAction`), renders them with the pure `PageTemplate` projection/preview model, instantiates them into real pages and links quick-start templates. Template capture/use is covered by the template-gallery and home-gallery suites. |
 | Template gallery | Browse workspace templates. | ✅ | Home gallery: empty page/database + 6 workflow templates with previews and “Other templates”. |
 | Database templates | Pre-filled rows from a template. | ✅ | Planned. Spec: docs/specs/templates.md. |
 | Template button | Insert template content in a page. | ✅ | Planned. Spec: docs/specs/templates.md. |
 | Default template | Auto-apply to new rows. | ✅ | Planned. Spec: docs/specs/templates.md. |
-| Recurring templates | Scheduled row creation. | 🟡 | Planned; needs scheduler. Spec: docs/specs/templates.md. |
+| Recurring templates | Scheduled row creation. | ✅ | Same durable schedule/materializer as above: a scheduled tick creates one row per announced occurrence (catch-up bounded per tick), records a `TemplateRun` claim so replays lose the unique insert, and advances the stored next run transactionally. |
 | Save page as template | Convert a page into a template. | ✅ | Planned. Spec: docs/specs/templates.md. |
-| Template duplication | Clone a template into a page. | 🟡 | Planned. Spec: docs/specs/templates.md. |
+| Template duplication | Clone a template into a page. | ✅ | `duplicateWorkspaceTemplateAction` clones a row template in its source database (fresh id/position, same content/config, no recurrence/default inheritance), checks workspace + page edit access, and the home gallery exposes a Duplicate button. Covered by the action suite. |
 | Template locking | Keep templates read-only. | ✅ | Planned. Spec: docs/specs/templates.md. |
 | Template from selection | Turn a block selection into a template. | ⛔ | Uncommon flow; skip initially. B80 blocked-row triage: docs/specs/templates.md:308 + docs/specs/workspaces-structure.md §4 (editor-slot dependency). |
 
@@ -355,25 +356,25 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Presence | See who is viewing a page. | 🟡 | Planned. |
 | Live cursors | Remote carets and selections. | 🟡 | Planned; needs presence transport. |
 | Avatars | Per-user avatars in the UI. | ✅ | Avatar field exists; presence UI pending. |
-| Page comments | Comment threads on a page. | ✅ | Data model basic; UI minimal. B79 audit: threads/resolve/reactions/mentions all live; deepest gaps are server-side depth validation, block anchors and dispatch scoping (see rows below). Spec: docs/specs/collaboration-deep.md. |
-| Inline comments | Comments anchored to a text range. | ✅ | Selecting text and commenting stores the quote (`blockId` + `quote`) and renders it above the thread. B79 audit: quote-only in practice — both entry points dispatch `{ quote }` only (`bubble-toolbar.tsx:276`, `block-context-menu.tsx:348`), the panel never forwards `blockId` and no stable block id exists, so `Comment.blockId` stays NULL; no scroll-to-block, no notification deep link. R79.3. |
-| Comment threads | Replies within a comment. | ✅ | One level of replies with their own composer, author and timestamp; replying notifies the parent author. B79 audit: depth 1 is enforced only by the UI and the read query (`queries.ts:121` `parentId: null`); the server writes before validating the parent (`comments.ts:43-59`) so a depth-2 or cross-page `parentId` creates a silently unreachable row, and replies render author+time+body only (no reactions/edit/delete). R79.1, R79.2. |
+| Page comments | Comment threads on a page. | ✅ | Threads, replies, resolve/reopen, edit/delete, reactions and `@mentions` all live on the page route. The server validates thread depth before writing (one reply level), stores stable top-level block anchors, and scopes mention notifications so a guest outside the page's read scope never receives a payload naming it. Spec: docs/specs/collaboration-deep.md. |
+| Inline comments | Comments anchored to a text range. | ✅ | Root comments persist block id plus UTF-16/plain-text `anchorFrom`/`anchorTo`; the server re-validates the range and quote against stored block content before writing. The panel jumps to and flashes the exact range, reloaded comments render as ProseMirror decorations without mutating the document, and changed text is marked stale instead of highlighting the wrong words. Cross-block selections clamp to the starting block. R79.3. |
+| Comment threads | Replies within a comment. | ✅ | One level of replies with their own composer, author, timestamp and reactions; replying notifies the parent author while they still belong to the workspace. `addCommentAction` walks the prospective parent chain and runs `validateThreadDepth` **before** `comment.create`, rejecting a missing parent, a cross-page parent, a cycle and a depth-2 reply with a specific message. The reply UI hides the affordance where the server would reject it. Root replies still expose edit/delete through their own menu; reply edit/delete is deliberately not offered. R79.1, R79.2. |
 | Workspace chat | Discussions with messages. | ✅ | **AI conversations**: docked panel in the main area, workspace tools (notes, members, projects/milestones, tasks), clickable note references, tool activity + model shown per answer; sidebar keeps the list; `GET/POST /api/chat`. |
 | Chat answer actions | Act on an AI answer. | ✅ | Right-click **and** a visible ⋯ button (plus Shift+F10): copy answer, copy as plain text, **save as a new note** (creates a real page from the Markdown and links it back), ask a follow-up, open the discussed note. |
 | Notification read state | Clear a notification. | ✅ | Per-item *Mark read* in the inbox plus *Mark all read*; the sidebar badge follows. |
 | Page re-parenting | Move a page in the tree. | ✅ | Sidebar context menu → **Move to** (top level or any page), with descendant filtering in the UI and cycle guards in the action. |
 | Trash and restore | Recover deleted pages. | ✅ | `/w/<slug>/trash`: every archived page with *Restore*, *Delete forever* (inline confirm) and *Empty trash*; restoring a child whose parent is still trashed re-attaches it at the root. |
-| Resolve comment | Mark a thread resolved. | ✅ | Resolve/Reopen per thread, with a "Resolved" marker. B79 audit: flips `resolved` on the one row (`comments.ts:173-192`) with no `logActivity` — `comment.resolved` is in the `ActivityAction` union with zero writers and no Settings label, and resolved threads stay in the default list (`queries.ts:121` has no filter). R79.2d, R79.6. |
+| Resolve comment | Mark a thread resolved. | ✅ | Resolve/Reopen per thread, with a "Resolved" marker and an All/Open/Resolved filter in the panel. The action flips the root row and writes `comment.resolved` through `logActivity`; the audit feed labels it. Root replies inherit the thread state. R79.2d, R79.6. |
 | Comment edit | Fix a typo in your comment. | ✅ | Authors (and admins) edit inline with Save/Cancel. |
-| Comment reactions | Emoji reactions on comments. | ✅ | 👍🎉❤️😄🙌👀❓ picker with optimistic chips, per-user counts and a `CommentReaction` row per person. B79 audit: reply reactions are accepted by the action and computed at render (`page.tsx:106`) but `CommentNode.replies` has no `reactions` field, so chips never show on replies. R79.2a. |
-| Comment mentions | Mention people in comments. | ✅ | `@Name`, `@first`, `@ada@example.com` notify matching workspace members (`page.mention`); matching is a tested pure helper. B79 audit: dispatch runs only in `addCommentAction` (edits never notify), targets are every `workspaceMember` with no page-visibility check (guests/revoked members get a payload leaking `pageId`), no coalescing, and inline `@user` nodes in page content dispatch nothing. R79.4. |
-| Suggestions mode | Propose edits for approval. | ✅ | Planned; diff overlay needed. |
-| Accept/reject suggestion | Resolve proposed changes. | ✅ | Planned. |
-| Following pages | Follow a page for updates. | ✅ | Planned. B79 audit: the page-follow bell already ships (row state from `PageFollow` via `page-title.tsx:338-356`, toggle `pages.ts:463-481`, read `page.tsx:58-61`) but no mutation ever consults `PageFollow` — following dispatches zero notifications (see Notification inbox). R79.5. |
-| Notification inbox | Central list of notifications. | ✅ | Planned. B79 audit: route already exists at `/w/<slug>/inbox` (`inbox/page.tsx:17-99`, newest-first `take 50`, unread dot, sidebar badge) fed by `comment.reply`/`page.mention`; the `page.shared` label has no writer, labels are hardcoded English, and links stop at the page (no `commentId`/anchor). Glyph left as-is (Notes-only) — a manual re-baseline candidate (O79.5). R79.3e, R79.4f-g. B82 spec `docs/specs/notifications.md` owns delivery: rows gain `workspaceId`/`actorId`/payload actor+title (D2/D9), inbox gets workspace filter + cursor paging + `t()` labels (D3), badge semantics frozen — R82.2, R82.21-R82.26. |
-| Notification preferences | Control what triggers alerts. | ✅ | Planned. B82 spec `docs/specs/notifications.md`: `NotificationPreference` rows resolved page → workspace → user default, gate enforced inside the dispatcher itself (`none` cannot be bypassed, `always`-class exceptions documented) — R82.15-R82.20. |
+| Comment reactions | Emoji reactions on comments. | ✅ | 👍🎉❤️😄🙌👀❓ picker with optimistic chips, per-user counts and a `CommentReaction` row per person. The page query groups reactions for roots and replies, and `CommentNode.replies[].reactions` renders the same chip row under a reply. R79.2a. |
+| Comment mentions | Mention people in comments. | 🟡 | `@Name`, `@first`, `@ada@example.com` notify matching workspace members (`page.mention`); matching is a tested pure helper. Targets are the current `workspaceMember` rows, the author is skipped, and a guest target is filtered through `guestReadablePageIds` so a guest outside the page read scope receives neither the notification nor its `pageId`. Still open: no cross-event coalescing, edits do not re-dispatch, and inline `@user` nodes in page content dispatch nothing. R79.4. |
+| Suggestions mode | Propose edits for approval. | ✅ | A block-level track-changes session: suggesting toggle, pending list, insert/replace decorations, deleted-block markers, and accept/reject one/all. The committed base snapshot persists per page (`PageSuggestionSession`), so reloading recomputes pending suggestions. Diff granularity is block-level; character spans and live cross-user session propagation remain follow-ups. |
+| Accept/reject suggestion | Resolve proposed changes. | ✅ | Accept advances the persisted base snapshot and reject rebuilds the affected block from it; structural blocks are decorated but not surgically revertible. |
+| Following pages | Follow a page for updates. | ✅ | The page-follow bell toggles `PageFollow`; `notifyPageUpdated` is the consumer: it resolves followers, honours each follower's per-type `page.updated` preference and quiet hours, dedupes within 24 h, and writes one `page.updated` row per deliverable recipient. Covered by `notifications.test.ts`, `pages-follow-notify.test.ts` and `follow-cross-workspace.test.ts`; the cross-workspace cleanup tests pin the stale-follow case. |
+| Notification inbox | Central list of notifications. | ✅ | `/w/<slug>/inbox` reads the newest notifications, folds them into the pure inbox engine and renders day buckets, unread counts, page grouping, mark-read/mark-all-read, a quiet-hours banner and links to the page or ticket. Delivery preferences (`ALL`/`MENTIONS`/`NONE`, digest cadence, quiet hours) are applied in `buildInbox`; `page.updated` and `ticket.assigned` are both written. Comment notifications deep-link to `?comment=<id>#<blockId>` and the comment panel scrolls to and briefly highlights the exact thread. Covered by `notification-inbox.test.ts`, `comments-reply-notify.test.ts`, `labels.test.ts`, `notification-preferences-form.test.ts` and the digest route tests. |
+| Notification preferences | Control what triggers alerts. | ✅ | Settings → Notifications renders the per-user form for every notification type (ALL/MENTIONS/NONE), digest cadence and quiet hours, backed by `getNotificationPrefs`/`updateNotificationPrefs` and the validated `notification-prefs-engine` (page → workspace → user-default resolution, `NONE` cannot be bypassed). The digest cron reads the same blob. Covered by `prefs-view.test.ts`, `notification-prefs-engine.test.ts`, `notification-preferences-form.test.ts` and `digest/route.test.ts`. |
 | Lock editing | Freeze a page while editing. | ✅ | Planned; permission-linked. |
-| Activity trail (audit log) | Who changed what, workspace-wide. | ✅ | The `Activity` model is written by workspace, member, page, share and comment mutations and rendered in Settings → Activity with human labels. B79 audit: comment coverage stops at creation — resolve/edit/delete log nothing (`comment.resolved` union member has zero writers), `row.edited` writes directly outside the `ActivityAction` union (`database.ts:206-215`), and `ACTIVITY_KEYS` (`settings/page.tsx:41-54`) is missing entries for several union members. R79.6. |
+| Activity trail (audit log) | Who changed what, workspace-wide. | ✅ | `/w/<slug>/audit` is a manager-gated workspace feed over the real `Activity` rows, with actor/action/category/target/search/date filters, flat or day-grouped views, keyset paging, a redacted payload for non-owners and a CSV export that uses the same query. `audit-log-engine` supplies human action labels, categories/severity and the filter/sort/page model. Comment create/edit/resolve/delete and database-row property edits now all log through `logActivity` (the comment lifecycle has a dedicated audit test). Covered by `audit-log.test.ts`, `audit-log-engine.test.ts`, `audit-feed.test.ts`, `comments-audit.test.ts` and the route tests. |
 | Guests | Limited external collaborators. | ✅ | A `GUEST` is scoped to the pages shared with them: the sidebar tree, search results and **the page route itself** all filter through the guest scope (`guestScope` in `src/lib/guest-access.ts`: explicit `PagePermission`, their teamspaces, their own pages, plus ancestors so the tree still renders). The workspace shell's workspace-wide datasets — the chat log, the calendar subscriptions and their events, the projects, the open-ticket count — are not shared page by page, so a guest receives none of them: `getWorkspaceShellDatasets` (`src/server/workspace-shell.ts`) hands a guest empty sets and never runs the queries behind them. The teamspace names are scoped instead of withheld: a guest sees the teamspaces their own pages live in (the sidebar draws a branch under that name and would drop a shared page otherwise) and not the workspace's other teamspaces — in the shell and in the page route alike. The private calendar feed URL (`icsUrl`) never leaves the server. The sidebar offers a guest no action the server refuses (no new discussion, no calendar subscription). Guests cannot edit, invite or upload. Proven by an e2e that signs in as a guest: the shared page opens, the private one is a 404 and never appears in search. |
 | Coarse edit locks | Prevent simultaneous structural edits. | 🟡 | Planned fallback before full CRDT. |
 
@@ -383,7 +384,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Feature | What it does | Status | Notes |
 | --- | --- | --- | --- |
 | Workspace roles | Owner/admin/member/guest roles. | ✅ | Roles modeled; enforcement partial. |
-| Owner role | Full control of the workspace. | 🟡 | Modeled; transfer flows missing. |
+| Owner role | Full control of the workspace. | ✅ | Ownership transfer actions (start/accept/decline/cancel, recipient-only accept, password proof, lazy expiry), owner-only UI in the members manager, audit entry and role guards are implemented and covered by the ownership-transfer and workspace-role suites. |
 | Admin role | Manage members and settings. | ✅ | Modeled; UI partial. |
 | Member role | Standard collaborator. | ✅ | Default role enforced. |
 | Guest role | Limited-scope collaborator. | ✅ | Planned. |
@@ -420,9 +421,9 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Favorites | Pinned pages section. | ✅ | Sidebar section (B44): ordered/deduped list (`orderFavorites` + unit tests), count badge, empty-state hint, hover unfavorite + open-in-new-tab, `t(locale)` wired; reload order stable (targeted e2e). |
 | Recent pages | Recently visited list. | ✅ | Planned. B80: no visit source modeled (0 hits for `visitedAt`/`PageVisit`); server-side recency is R80.11 (schema, M3). Spec: docs/specs/workspaces-structure.md. |
 | Search entry point | Sidebar search. | ✅ | Sidebar search opening quick find, with the Ctrl K hint. |
-| Trash / recently deleted | Deleted pages list. | 🟡 | Soft delete exists; trash UI partial. |
-| Restore from trash | Undo a deletion. | 🟡 | Planned. |
-| Permanent delete | Permanently remove an item. | 🟡 | Planned; purge job needed. |
+| Trash / recently deleted | Deleted pages list. | ✅ | Soft-deleted pages load through `getTrash` with the guest read scope; `/w/<slug>/trash` renders the grouped list, retention badges, restore and empty-state UI (`trash-list.tsx`, `trash-view.ts`), with unit/render coverage. |
+| Restore from trash | Undo a deletion. | ✅ | `restorePageAction` re-attaches a trashed page at its parent or the workspace root when the parent is still trashed; the trash row restores it and offers Undo. Covered by the action and trash-list suites. |
+| Permanent delete | Permanently remove an item. | ✅ | `deletePageAction` and `emptyTrashAction` purge the explicit subtree in one transaction, clean stale uploads and write `page.deleted`; the trash UI exposes row delete and Empty trash. |
 | Quick find | Ctrl/Cmd+P page switcher. | ✅ | Planned. B80 audit: implemented and guest-scoped (`src/components/quick-find.tsx`, `search.ts:20-36`, sidebar `Ctrl K` at `sidebar.tsx:126-136`) — glyph stale, to reconcile by hand. Spec: docs/specs/workspaces-structure.md. |
 | Backlinks | Pages linking to this page. | ✅ | Planned; derived from page mentions. B80 audit: ships (`getBacklinks` `src/server/queries.ts:369-389`) but the page route omits guest scoping (`[pageId]/page.tsx:56`) — R80.12. Spec: docs/specs/workspaces-structure.md. |
 | Linked references | Grouped backlink list with context. | ✅ | Planned. B80 audit: panel renders (`src/components/backlinks.tsx`, `page.tsx:213`); grouping/context thin, glyph to reconcile. Spec: docs/specs/workspaces-structure.md. |
@@ -519,8 +520,8 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Google Drive integration | Link/preview Drive files. | ✅ | Planned. |
 | AI connectors | Connect model providers. | ✅ | Planned; BYO key. |
 | MCP server | Expose workspace to AI agents. | ✅ | 43 token-scoped tools over `/api/mcp`; read-first, write/admin opt-in. See `docs/MCP.md`. |
-| Inbound webhooks | Accept events from outside. | 🟡 | Planned. |
-| Public embed oEmbed | Resolve third-party link metadata. | 🟡 | Basic title/favicon fetch. |
+| Inbound webhooks | Accept events from outside. | ✅ | Signed inbound route `POST /api/webhooks/inbound` verifies the endpoint secret, refuses sealed/unreadable secrets, plans the stored rule list (never a caller-supplied list) and records bounded outcomes; covered by the route and rules tests. |
+| Public embed oEmbed | Resolve third-party link metadata. | ✅ | `src/lib/oembed.ts` discovers provider/protocol endpoints, validates JSON, sanitizes allow-listed iframe/blockquote HTML, parses OpenGraph and merges layers; the bookmark node uses the engine with a link-preview fallback. Hostile/truncated input degrades safely. |
 
 ## 14. AI
 <!-- AREA: 14. AI -->
@@ -529,20 +530,20 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | --- | --- | --- | --- |
 | AI writing assist | Draft, rewrite, and refine text. | ✅ | “Ask AI” skills submenu in the selection toolbar and block menu; BYO provider key. Spec: docs/specs/ai-surface.md. |
 | Q&A over workspace | Ask questions answered from your content. | ✅ | Prompt → keywords → relevance-scored pages feed the model (`src/lib/retrieval.ts`); verified against the live provider. |
-| AI autofill property | Generate row values. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
+| AI autofill property | Generate row values. | ✅ | The property editor exposes the prompt/sampling config, the row cell exposes Autofill, and `runAiAutofillAction` validates config, authorizes the row/property, frames other columns as context and writes the generated value. |
 | AI block | Prompt block that generates content. | ✅ | Planned. Spec: docs/specs/ai-surface.md. |
-| Summarization | Summarize a page or section. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Translation | Translate selection or page. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
+| Summarization | Summarize a page or section. | ✅ | `summarize` is reachable from the selection toolbar and the block/page AI menu. Selection/block results append below the target; a page-scoped summary appends at the end so it can never overwrite the page. Chunked map-reduce remains the route's long-text path. |
+| Translation | Translate selection or page. | ✅ | `translate` targets all five shipped locales, rejects unsupported targets with `400`, and is exposed per-locale in both AI menus. Selection/block translation rewrites; page translation appends. |
 | Transcription | Speech-to-text for audio. | ✅ | `POST /api/ai/transcribe` with its own provider config (`AI_TRANSCRIBE_API_KEY`); sidebar “Transcribe audio” creates a page. Spec: docs/specs/ai-surface.md. |
 | Meeting notes | Capture and structure meetings. | ✅ | Create a notes page from a calendar event (meeting template) or from a recording (transcription). |
 | Improve/Shorten/Expand | Tone and length actions. | ✅ | Presets: Improve writing, Make shorter, Reformat, Proofread, Explain, Summarize, Translate. |
-| Continue writing | Extend text from context. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| Explain/Simplify | Rewrite for clarity. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
+| Continue writing | Extend text from context. | ✅ | `continue` joins the continuation inline after the selection/block and appends a paragraph when invoked on the whole page, preserving one separator space. Reachable from both editor AI menus. |
+| Explain/Simplify | Rewrite for clarity. | ✅ | `explain` appends an explanation for the target and `simplify` replaces it with a plain-language rewrite. Both are registry skills and appear in the selection toolbar and block menu. |
 | AI connectors config | Choose provider/model per workspace. | ✅ | Settings → AI: OpenAI / DeepSeek / Gemini / OpenCode Go / custom, live **model list**, **encrypted** key (AES-256-GCM), connection test; env vars remain the fallback. Every request carries the product's user agent (`noema/<version>`); OpenCode Go additionally gets a stable `x-opencode-session` per conversation. |
-| Local model support | Run models without a cloud. | 🟡 | Planned; aligns with self-hosting. Spec: docs/specs/ai-surface.md. |
-| Prompt library | Reusable saved prompts. | 🟡 | Seven built-in AI skills with server-side prompts (`src/lib/ai-skills.ts`); user-defined prompts pending. Spec: docs/specs/ai-surface.md. |
-| AI cost controls | Token budgets per workspace. | 🟡 | Planned. Spec: docs/specs/ai-surface.md. |
-| AI data boundaries | Guarantee no training on your data. | 🟡 | Planned; documented policy. Spec: docs/specs/ai-surface.md. |
+| Local model support | Run models without a cloud. | ✅ | Local OpenAI-compatible endpoints (loopback/private/`.local`/`host.docker.internal`) can be saved, tested, listed and enabled without an API key; remote providers still require TLS and a key. Workspace → env precedence, key omission and encrypted-key preservation are tested. See `src/lib/ai-providers.ts` and the AI settings UI. |
+| Prompt library | Reusable saved prompts. | ✅ | `WorkspacePrompt` rows with workspace/personal scope, membership-gated CRUD/clone actions, a persisted settings manager and a chat-composer picker that inserts a prompt body into the draft without discarding typed text. Seven built-in AI skills stay code-owned. Spec: docs/specs/ai-surface.md (R25.22). |
+| AI cost controls | Token budgets per workspace. | ✅ | Durable `AiBudget`/`AiUsage` rows meter per workspace/month/surface. One transport guard refuses over-budget calls with `503 AI_BUDGET_EXCEEDED`, captures JSON/SSE usage (falling back to the documented estimate), records failures, and covers chat, ask, skills, autofill and transcription. Admin settings edit the ceiling/warn/hard-stop and reset/show per-surface usage. |
+| AI data boundaries | Guarantee no training on your data. | ✅ | `docs/AI-BOUNDARIES.md` documents the per-surface data flow. The transport enforces a payload-stripping diagnostic sink (no prompts/responses unless `AI_LOG_PROMPTS=true`), adds no training/telemetry forwarding, refuses providers flagged as training-on-data unless explicitly allowed, and derives local-only processing from the effective endpoint. Transcription uses the same guard. |
 
 ## 15. Media & embeds
 <!-- AREA: 15. Media & embeds -->
@@ -558,7 +559,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Image alt text | Accessibility description. | ✅ | Alt-text editor in the block; uploads still seed it from the filename and the read-only renderer passes it to `alt`. |
 | Image resize | Change displayed dimensions. | ✅ | Drag handle stores a clamped percent `width` on the node (15-100, double-click resets); persists across reload and renders read-only; pure maths red-first in `src/lib/media.ts`. |
 | Alignment controls | Left/center/right media. | ✅ | Align buttons on the image block (the only media node with chrome today) store `align` and apply auto margins in the editor and the doc renderer; survives save/reload. |
-| Paste image from clipboard | Insert a copied image. | 🟡 | Works for many sources. |
+| Paste image from clipboard | Insert a copied image. | ✅ | Paste reads `clipboardData.files` and `items`, resolves blank/generic MIME types from the filename, deduplicates a bitmap exposed twice, uploads through the existing pipeline, and inserts at the paste-time selection after async upload. |
 | Drag-drop files | Drop files onto a page. | ✅ | Uploads show a progress indicator: `uploadFile` now drives the request through XHR and a `Uploading <name> — N%` toast from `xhr.upload.onprogress` (dismissed on settle), so drop, paste, the file picker and the database attach flow all report progress. |
 | PDF preview | Inline PDF viewing. | ✅ | Planned. |
 | Code embed | Embed executable snippets. | ✅ | Planned. |
@@ -567,8 +568,8 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Tweet embed | Embed a post. | ✅ | Planned. |
 | YouTube/Vimeo embeds | Video embeds by URL. | ✅ | Provider-specific path in `src/lib/embeds.ts`: `EMBED_HOST_ALLOWLIST` gates `detectEmbed()`, which canonicalises every YouTube/Vimeo URL shape (incl. start times) and `embedMeta()` feeds the editor iframe and the read-only renderer (title, aspect ratio, `allow`, provider badge). |
 | Figma embeds | Live design embed. | ✅ | Planned. |
-| Animated GIF/devices | Play GIFs and device previews. | 🟡 | Planned. |
-| Media storage backend | Pluggable object storage. | ✅ | `src/lib/storage.ts`: **local filesystem** (default) or any **S3-compatible** endpoint (AWS, MinIO, R2, Garage) signed with Signature V4 over `fetch` — no SDK. Selected by `S3_BUCKET`; `npm run check:storage` proves the round trip. |
+| Animated GIF/devices | Play GIFs and device previews. | ✅ | GIF uploads/renders bypass lossy transform params, read-only rendering includes the previously dropped animated-image case, and a server-safe device frame renders live GIF/video/embed children at desktop/tablet/phone/watch sizes with guarded scaling. |
+| Media storage backend | Pluggable object storage. | ✅ | `src/lib/storage.ts`: **local filesystem** (default) or any **S3-compatible** endpoint (AWS, MinIO, R2, Garage) signed with Signature V4 over `fetch` — no SDK. Selected by `S3_BUCKET`; `npm run check:storage` proves the live round trip and `storage.test.ts` proves the signed S3 driver against a fake endpoint. |
 | Media garbage collection | Remove orphaned assets. | ✅ | Planned. |
 
 ## 16. Navigation & UX
@@ -598,11 +599,12 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Custom fonts | Choose font pairing. | ✅ | Planned. |
 | Coherent timestamps | Dates that survive hydration. | ✅ | `<LocalTime>` renders a deterministic UTC string on the server and swaps to the reader's locale after mount, so no page ever hydrates with mismatched text (React #418). |
 | Accessibility (WCAG) | Keyboard and screen-reader support. | ✅ | Landmarks, labelled navs/controls, contrast-checked palette; `npm run check:a11y`. |
-| Focus management | Visible focus and traps. | 🟡 | Global `:focus-visible` ring everywhere; B45 hardened `ui/dialog` — Tab/Shift+Tab cycle inside with wrap, explicit `aria-modal="true"`, initial focus in-dialog, and focus restored to the invoker even for trigger-less controlled dialogs — plus `ui/dropdown-menu` (Escape → focus back to its trigger); both locked by `e2e/focus.spec.ts`. Still partial: hand-rolled feature overlays bypass the primitive entirely — `topbar/actions-menu`, `who-has-access`, `version-history`, `tickets/ticket-drawer`, `editor/equation-editor` have no Tab trap, Escape only works in the actions menu and equation editor, and `version-history` / `ticket-drawer` also lack `aria-modal` → feature-level follow-up (feature components are off-limits to B45). |
+| First-run onboarding | Guided path to a useful workspace. | ✅ | The workspace home shows a dismissible checklist for first page, first database, teammate invite and first file, derived from real workspace counts; `User.onboardingDismissedAt` persists dismissal. |
+| Focus management | Visible focus and traps. | ✅ | Global `:focus-visible` ring; `ui/dialog` and `ui/dropdown-menu` own focus trap/restore; the hand-rolled `topbar/actions-menu`, `who-has-access`, `version-history`, `tickets/ticket-drawer` (sheet) and `editor/equation-editor` all use the shared `src/lib/focus-trap.ts` kernel (`trapPlan`, initial focus, wrapping Tab/Shift+Tab, Escape) with `aria-modal` where applicable. Locked by `e2e/focus.spec.ts` and the overlay-wiring tests. |
 | Localization / i18n | Translatable UI. | ✅ | 5 locales (en/fr/es/de/ar incl. RTL) with a **coverage ratchet in the coherence gate** (27 of 63 client files consume `t()`: chrome, chat, tickets, cycles, settings, inbox, search, trash, projects board, comments, the workspace/member/danger/share/access dialogs, the database toolbar, the editor bubble toolbar and the Notion import dialog); long-tail settings strings and secondary forms remain English. |
-| RTL support | Right-to-left layouts. | 🟡 | Arabic sets `dir="rtl"` and logical CSS; mixed-direction blocks untested. |
+| RTL support | Right-to-left layouts. | ✅ | Arabic sets `dir="rtl"` and logical CSS; user-authored paragraphs, headings, quotes, titles, comments, mentions, links and search snippets now derive their own base direction from content, isolate mixed runs with `<bdi>`/`unicode-bidi`, and use logical borders. Covered by bidi/render tests for doc, title, comment and search surfaces. |
 | Notifications / toasts | Transient status messages. | ✅ | Planned. B82 spec `docs/specs/notifications.md` §9 standardizes the surface (202 `toast.*` sites / 41 files audited): one `<Toaster>`, `toast.info` banned by `check:coherence`, all strings via `t()` (51 literals → 0), shared catalog + `check-toasts.mjs`, durations 4 s/8 s — R82.30-R82.36. |
-| Undo/redo (global) | App-wide undo beyond editor. | 🟡 | Planned. |
+| Undo/redo (global) | App-wide undo beyond editor. | ✅ | Page metadata/move/archive/layout commands persist through the server. Bulk ticket archive/restore/property edits and database table row trash/restore now record one invertible command with per-row inverse patches; permanent delete stays non-undoable. A visible history popover lists recent local and collaborator actions, with undo/redo for entries this session can invert and correct stack ordering for multi-step undo/redo. |
 | Offline mode | Work without connectivity. | ✅ | Planned; core to local-first goal. |
 | Reduced-motion support | Respect motion preferences. | ✅ | Planned. |
 | High-contrast support | Stronger contrast theme. | ✅ | Planned. |
@@ -633,19 +635,19 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | --- | --- | --- | --- |
 | Block-based storage | Content stored as blocks. | ✅ | TipTap JSON persisted per page. |
 | Stable block ids | Every block has a durable id. | ✅ | Ids exist; not enforced on all operations. Spec: docs/specs/engineering-hardening.md. |
-| Page snapshots | Versioned page state. | 🟡 | Planned; basis for history. |
+| Page snapshots | Versioned page state. | ✅ | `PageSnapshot`/page-version helpers, snapshot actions, guest-scoped reads, retention and the version-history panel are implemented and tested (`page-snapshots`, `page-versions`, `snapshots-*` suites). |
 | Incremental syncing | Sync only changed blocks. | 🟡 | Planned; op-log approach. |
 | Offline cache | Local store for offline use. | 🟡 | Planned (IndexedDB/SQLite). |
 | Sync conflict handling | Merge concurrent edits. | 🟡 | Planned; CRDT. |
 | Transactions / atomic writes | All-or-nothing updates. | 🟡 | Planned; Prisma transactions. Spec: docs/specs/engineering-hardening.md. |
-| Audit log | Record sensitive actions. | ✅ | Planned. |
+| Audit log | Record sensitive actions. | ✅ | `Activity` rows are written by workspace/member/page/share/comment/ticket mutations, and the workspace audit route filters, groups, paginates, redacts and exports them (see Activity trail). |
 | Soft delete | Mark-deleted rather than purge. | ✅ | `deletedAt` columns used. |
 | Trash retention | Auto-purge after a window. | ✅ | Planned; scheduled job. |
 | Rate limiting | Throttle API/site traffic. | ✅ | Planned; middleware. The sign-in, sign-up and 2FA actions carry their own budgets and a temporary account lockout. |
 | Pagination | Bounded list responses. | ✅ | The tracker paginates server-side (100/page, no full-workspace scans); export and AI-context queries stay bounded by explicit `take` limits. |
 | Multi-tenancy | Isolate workspaces. | 🟡 | Workspace scoping modeled. |
-| Backups | Scheduled data backups. | ✅ | `npm run backup` dumps the database (via the `noema-db` container or a local `pg_dump`), **seals it with AES-256-GCM** under `BACKUP_ENCRYPTION_KEY` (mode `0600`, fail closed without a passphrase), **verifies every core table is present**, prunes to the last 5 and prints the restore command. |
-| Restore from backup | Recover data. | 🟡 | Planned. |
+| Backups | Scheduled data backups. | ✅ | `npm run backup` dumps the database (via the `noema-db` container or a local `pg_dump`) into `BACKUP_DIR`, **seals it with AES-256-GCM** under `BACKUP_ENCRYPTION_KEY` (mode `0600`, fail closed without a passphrase), **verifies every core table is present**, prunes to the last 5 and prints the restore command. Set `BACKUP_S3_BUCKET` (+ endpoint/keys) to upload the sealed dump and manifest to any S3-compatible endpoint, **read both back byte-for-byte**, and apply the same newest-N retention remotely; `/api/cron/backups` applies the GFS policy to local dumps. Run it from the host scheduler; a misconfigured offsite destination exits 1 instead of passing as a local-only backup. |
+| Restore from backup | Recover data. | ✅ | `npm run backup:restore -- <dump>` decrypts with the same `BACKUP_ENCRYPTION_KEY` and streams plain SQL to stdout (or `--out` at mode `0600`). A wrong key, tampered payload or plain dump is refused. `--remote <key>` / `--remote s3://bucket/key` downloads from the configured `BACKUP_S3_*` destination first. Covered by `scripts/backup.test.mjs` and the fake-S3 suite `scripts/backup-s3.test.mjs`. |
 | Schema migrations | Versioned DB changes. | ✅ | Prisma migrations. Spec: docs/specs/engineering-hardening.md. |
 | Observability | Logs, metrics, traces. | 🟡 | Planned; OpenTelemetry. |
 | Error tracking | Capture and triage errors. | 🟡 | Planned. |
@@ -653,7 +655,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Session management | Expire and revoke sessions. | 🟡 | Sessions stored; revocation partial. Spec: docs/specs/engineering-hardening.md. |
 | Password hashing | Secure credential storage. | ✅ | Strong hashing used. |
 | Two-factor auth (2FA) | TOTP second factor. | ✅ | Planned. |
-| SSO / SAML | Enterprise single sign-on. | ✅ | OIDC authorization-code + JWKS verification; JIT provisioning (`SSO_*` env). A provider sign-in links an existing account only when that account proved its address (`User.emailVerified`) — an unverified local account is refused with `?error=sso_email_taken`. Spec for the SAML half: docs/specs/saml-sso.md. |
+| SSO / SAML | Enterprise single sign-on. | 🟡 | OIDC authorization-code + JWKS verification, and an **env-level SAML 2.0 connection** (`AUTH_SAML_*`): start/ACS/metadata/SLO routes, `@node-saml/node-saml` signature/audience/destination/condition validation with 120 s skew, a Postgres assertion replay cache, signed RelayState (no SameSite-cookie dependency on the cross-site POST), JIT users and verified-only account linking (B07). Both refuse an unverified local account with `?error=sso_email_taken`. Env-level directory auto-join maps `AUTH_SAML_GROUPS_ATTRIBUTE` through `AUTH_SAML_ROLE_RULES` into `AUTH_SAML_WORKSPACE_ID` (highest rule wins, OWNER is never granted, an existing owner is never demoted). Per-workspace `SsoConnection` rows, admin CRUD actions, `?connection=` start/metadata/ACS resolution and `VerifiedDomain` DNS verification are implemented; a verified email domain auto-joins its workspace when the env connection has no fixed workspace. Metadata-URL refresh parses the IdP document and rotates the signing certificate with a 24-hour previous-certificate overlap. SLO validates POST/redirect logout messages while always ending the local session. The **SSO settings section** manages connections, metadata refresh and verified domains (admin-only). SCIM **Users** endpoints are implemented with hashed bearer tokens, JIT user/membership creation, pagination, lookup, active=false deprovisioning and owner protection. SCIM **Groups** map to teamspaces (list/get/create/add/remove/replace members/delete), and group membership recomputes the mapped workspace role from the connection's `roleRules` (OWNER is never demoted). Login email-domain chooser, invite precedence for JIT users and the recent-SSO activity view are implemented. Each connection has a dedicated setup page with copyable SP entity/ACS/metadata/SLO URLs and an admin-only dry **Test connection** report (required fields, certificate parse/validity, SP origin consistency, SSRF-guarded metadata reachability/entity/SSO/certificate checks); it never sends an AuthnRequest. Setup: docs/integrations/saml.md. |
 | OIDC support | OpenID Connect providers. | ✅ | Planned. |
 | Encryption at rest | Encrypt stored data. | ✅ | Planned; DB/disk encryption. |
 | Encryption in transit | TLS everywhere. | ✅ | Planned; reverse-proxy TLS. |
@@ -664,10 +666,10 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Reverse-proxy guidance | nginx/Caddy docs. | ✅ | Planned. Spec: docs/specs/engineering-hardening.md. |
 | Health checks | Liveness/readiness endpoints. | ✅ | Planned. |
 | Feature flags | Gate in-progress features. | ✅ | Planned. |
-| Background jobs | Async task runner. | 🟡 | Planned; queue for imports/AI. |
+| Background jobs | Async task runner. | ✅ | `src/lib/job-queue.ts` plus the cron jobs route implement enqueue → claim → complete/retry/dead-letter with backoff and registered-kind dispatch; route lifecycle tests cover success, retry, dead-letter and unregistered kinds. |
 | WebSocket/SSE gateway | Realtime transport. | ✅ | Planned for collaboration. |
 | Data export portability | Take your data out. | ✅ | Planned; see export. |
-| GDPR data controls | Delete/export personal data. | 🟡 | Planned; admin tooling. |
+| GDPR data controls | Delete/export personal data. | ✅ | `src/lib/gdpr.ts` + `src/server/actions/gdpr.ts` and the Data & privacy settings page implement export, erasure planning, legal holds, subject deletion/anonymisation and related notification/comment/share/link cleanup; covered by the GDPR suites. |
 
 ## 18. Pricing & plan-gated features
 <!-- AREA: 18. Pricing & plan-gated features -->
@@ -734,7 +736,7 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Ticket API | Automate the tracker. | ✅ | `GET/POST /api/tickets` (create/update/label/relation/comment/archive/bulk/move/from-page/label-*). |
 | Cron endpoint hardening | Materialize recurring templates safely. | ✅ | `POST /api/cron/templates` **fails closed** (503) when `CRON_SECRET` is unset, returns 401 on a wrong `x-cron-secret`, and is rate limited; `check:share-cron` asserts all three cases. |
 | Sub-tickets | Nested parent → child issues. | ✅ | Create a sub-ticket from the drawer, see the parent link, the child list with per-child estimates and a child roll-up; the list shows a sub-count badge. |
-| Roadmap view | Timeline across projects. | 🟡 | Project Gantt exists; a cross-project roadmap view is pending. |
+| Roadmap view | Timeline across projects. | ✅ | `/w/<slug>/roadmap` folds project milestones and tickets into one UTC-deterministic timeline: shared axis, week/month/quarter zoom, non-overlapping lane packing, overdue/milestone markers, per-project rollups and summary counts. Layout is covered by the roadmap engine tests. |
 | Saved views | Reusable filter/sort presets. | ✅ | Ticket tracker: save the current filters, search and view type as a named workspace view, apply it from the Views menu, delete it inline (`TicketView`). |
 | Cycles / sprints | Time-boxed iterations. | ✅ | `/w/<slug>/cycles`: named cycles with dates + goal, tickets scheduled from the drawer, committed vs completed estimate, a burndown chart (actual over ideal) and average velocity. `Cycle` model + 4 actions. |
 | Velocity & burndown | Estimation trend charts. | ✅ | Per-cycle burndown (daily remaining vs the ideal line) and a 6-cycle velocity average, both computed by tested pure functions in `src/lib/cycles.ts`. |
@@ -744,9 +746,9 @@ Row counts in the status summary at the end count **feature rows only**; legend 
 | Cycle goal (description) | Time-box description. | ✅ | `Cycle.goal` shown and edited in the cycles UI. |
 | Label description | Description on label catalogue entries. | ✅ | Label manager (Settings) edits name/colour/description. |
 | Milestone description | Note on a checkpoint. | ✅ | Editable in project detail. |
-| Recurring tickets | Repeat on a schedule. | 🟡 | Planned; template recurrence exists for page templates. Spec: docs/specs/automations.md. |
+| Recurring tickets | Repeat on a schedule. | ✅ | `Automation` (`kind = recurring_ticket`) and `AutomationRun` persist rules and per-occurrence claims; the cron route materializes due tickets in transactions with a unique `(automationId, occurrenceKey)` key. The tracker exposes create/list/pause/resume/delete in `RecurringTicketsManager`. Spec: docs/specs/automations.md. |
 | Workload & capacity | Per-person load planning. | ✅ | Planned; assignee + estimate data is available. |
-| Per-project role editor | Fine-grained project roles. | 🟡 | Planned; workspace roles exist today. |
+| Per-project role editor | Fine-grained project roles. | ✅ | `ProjectRoleEditor` on the project detail loads the workspace roster projected onto the project-role engine, lets managers re-role/remove members, and every change is re-checked server-side for the role ceiling and last-owner guard (`setProjectRoleAction` / `removeProjectRoleAction`). |
 
 ## 21. Workspace lifecycle
 <!-- AREA: 21. Workspace lifecycle -->
@@ -769,28 +771,28 @@ The table below summarizes how many feature rows fall into each status, per area
 
 | Area | ✅ Implemented | 🟡 Partial | 🧭 Planned | ⛔ Out of scope | Total |
 | --- | --- | --- | --- | --- | --- |
-| 1. Editor & blocks | 85 | 13 | 0 | 2 | 100 |
-| 2. Text formatting | 19 | 2 | 0 | 1 | 22 |
-| 3. Databases | 42 | 11 | 0 | 0 | 53 |
-| 4. Properties | 25 | 10 | 0 | 1 | 36 |
-| 5. Formulas | 15 | 1 | 0 | 0 | 16 |
-| 6. Templates | 6 | 3 | 0 | 1 | 10 |
+| 1. Editor & blocks | 98 | 1 | 0 | 2 | 101 |
+| 2. Text formatting | 21 | 0 | 0 | 1 | 22 |
+| 3. Databases | 52 | 1 | 0 | 0 | 53 |
+| 4. Properties | 35 | 0 | 0 | 1 | 36 |
+| 5. Formulas | 16 | 0 | 0 | 0 | 16 |
+| 6. Templates | 9 | 0 | 0 | 1 | 10 |
 | 7. Collaboration | 20 | 6 | 0 | 0 | 26 |
-| 8. Sharing & permissions | 18 | 4 | 0 | 0 | 22 |
-| 9. Workspaces & structure | 19 | 4 | 0 | 0 | 23 |
+| 8. Sharing & permissions | 21 | 1 | 0 | 0 | 22 |
+| 9. Workspaces & structure | 23 | 0 | 0 | 0 | 23 |
 | 10. Version history | 9 | 0 | 0 | 0 | 9 |
 | 11. Search | 11 | 0 | 0 | 0 | 11 |
-| 12. Import & export | 19 | 3 | 0 | 0 | 22 |
-| 13. Integrations & API | 15 | 7 | 0 | 0 | 22 |
-| 14. AI | 7 | 9 | 0 | 0 | 16 |
-| 15. Media & embeds | 19 | 2 | 0 | 0 | 21 |
-| 16. Navigation & UX | 44 | 3 | 0 | 2 | 49 |
-| 17. Data model & platform | 23 | 14 | 0 | 0 | 37 |
-| 18. Pricing & plan-gated features | 0 | 14 | 0 | 0 | 14 |
+| 12. Import & export | 22 | 0 | 0 | 0 | 22 |
+| 13. Integrations & API | 18 | 4 | 0 | 0 | 22 |
+| 14. AI | 16 | 0 | 0 | 0 | 16 |
+| 15. Media & embeds | 21 | 0 | 0 | 0 | 21 |
+| 16. Navigation & UX | 48 | 0 | 0 | 2 | 50 |
+| 17. Data model & platform | 26 | 11 | 0 | 0 | 37 |
+| 18. Pricing & plan-gated features | 8 | 6 | 0 | 0 | 14 |
 | 19. Known limitations & quirks | 0 | 0 | 0 | 15 | 15 |
-| 20. Projects, tickets & planning | 29 | 3 | 0 | 0 | 32 |
+| 20. Projects, tickets & planning | 32 | 0 | 0 | 0 | 32 |
 | 21. Workspace lifecycle | 7 | 0 | 0 | 0 | 7 |
-| **Total** | **432** | **109** | **0** | **22** | **563** |
+| **Total** | **513** | **30** | **0** | **22** | **565** |
 
 ## Deliberate divergences
 

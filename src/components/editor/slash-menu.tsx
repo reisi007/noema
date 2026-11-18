@@ -4,11 +4,13 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState
 } from "react";
 import { type Editor } from "@tiptap/react";
 import {
   Bookmark as BookmarkIcon,
+  CalendarDays,
   ChevronRight,
   Columns2,
   Columns3,
@@ -31,6 +33,7 @@ import {
   ListTree,
   Map as MapIcon,
   Minus,
+  MousePointerClick,
   Pilcrow,
   Quote,
   SearchX,
@@ -48,7 +51,10 @@ import { Kbd } from "@/components/ui/kbd";
 import { EmptyState } from "@/components/ui/empty-state";
 import { EQUATION_EVENT } from "@/lib/editor-events";
 import { MERMAID_TEMPLATES } from "@/lib/diagrams/mermaid-policy";
+import { starterUmlDiagram } from "@/lib/diagrams/uml";
+import { PLANTUML_TEMPLATES } from "@/lib/diagrams/plantuml-policy";
 import { t } from "@/lib/i18n";
+import { ASK_AI_SUMMARIZE_PROMPT } from "@/lib/ask-ai-block";
 import { BLOCK_TYPES } from "@/lib/block-conversion";
 import {
   filterCommands,
@@ -151,6 +157,9 @@ const BLOCK_TYPE_ITEMS: Record<SlashBlockType, BlockTypeItem> = {
   h1: { label: "Heading 1", labelKey: "blockHeading1", hint: "Large heading", hintKey: "heading1Hint", icon: <Heading1 className="h-4 w-4" />, keywords: "h1 title", group: "basic", shortcut: "⌘ ⌥ 1", run: (c) => c.toggleHeading({ level: 1 }).run() },
   h2: { label: "Heading 2", labelKey: "blockHeading2", hint: "Medium heading", hintKey: "heading2Hint", icon: <Heading2 className="h-4 w-4" />, keywords: "h2 subtitle", group: "basic", shortcut: "⌘ ⌥ 2", run: (c) => c.toggleHeading({ level: 2 }).run() },
   h3: { label: "Heading 3", labelKey: "blockHeading3", hint: "Small heading", hintKey: "heading3Hint", icon: <Heading3 className="h-4 w-4" />, keywords: "h3", group: "basic", shortcut: "⌘ ⌥ 3", run: (c) => c.toggleHeading({ level: 3 }).run() },
+  h4: { label: "Heading 4", labelKey: "blockHeading4", hint: "Extra small heading", hintKey: "heading4Hint", icon: <Heading4 className="h-4 w-4" />, keywords: "h4 small", group: "basic", run: (c) => c.toggleHeading({ level: 4 }).run() },
+  h5: { label: "Heading 5", labelKey: "blockHeading5", hint: "Tiny heading", hintKey: "heading5Hint", icon: <Heading5 className="h-4 w-4" />, keywords: "h5 tiny", group: "basic", run: (c) => c.toggleHeading({ level: 5 }).run() },
+  h6: { label: "Heading 6", labelKey: "blockHeading6", hint: "Smallest heading", hintKey: "heading6Hint", icon: <Heading6 className="h-4 w-4" />, keywords: "h6 smallest", group: "basic", run: (c) => c.toggleHeading({ level: 6 }).run() },
   bulletedList: { label: "Bulleted list", labelKey: "blockBulletedList", hint: "Unordered list", hintKey: "bulletedListHint", icon: <List className="h-4 w-4" />, keywords: "bullet ul list", group: "basic", shortcut: "⌘ ⇧ 8", run: (c) => c.toggleBulletList().run() },
   numberedList: { label: "Numbered list", labelKey: "blockNumberedList", hint: "Ordered list", hintKey: "numberedListHint", icon: <ListOrdered className="h-4 w-4" />, keywords: "number ol list", group: "basic", shortcut: "⌘ ⇧ 7", run: (c) => c.toggleOrderedList().run() },
   todoList: { label: "To-do list", labelKey: "blockTodoList", hint: "Checklist", hintKey: "todoListHint", icon: <ListTodo className="h-4 w-4" />, keywords: "todo task checkbox", group: "basic", shortcut: "⌘ ⇧ 9", run: (c) => c.toggleTaskList().run() },
@@ -213,6 +222,20 @@ const SLASH_ITEMS: SlashItem[] = [
         })
         .run(),
   })),
+  ...PLANTUML_TEMPLATES.map((template) => ({
+    label: `PlantUML ${template.label}`,
+    hint: "Server-free PlantUML",
+    icon: <Workflow className="h-4 w-4" />,
+    keywords: `plantuml puml uml ${template.id} ${template.label}`,
+    group: "advanced" as const,
+    run: (c: ReturnType<Editor["chain"]>) =>
+      c.insertContent({
+        type: "codeBlock",
+        attrs: { language: "plantuml" },
+        content: [{ type: "text", text: template.source }],
+      }).run(),
+  })),
+  { label: "Visual UML canvas", hint: "Drag-and-drop class, actor and use-case diagrams", icon: <Workflow className="h-4 w-4" />, keywords: "uml visual diagram class actor usecase canvas drag drop figma", group: "advanced", run: (c) => c.insertContent({ type: "umlDiagram", attrs: { data: starterUmlDiagram() } }).run() },
   { label: "Table", labelKey: "blockTable", hint: "3×3 table", hintKey: "tableHint", icon: <TableIcon className="h-4 w-4" />, keywords: "table grid rows", group: "basic", run: (c) => c.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run() },
   { label: "Image", labelKey: "blockImage", hint: "Upload or embed", hintKey: "imageHint", icon: <ImagePlus className="h-4 w-4" />, keywords: "image picture photo upload file", group: "media", action: () => {} },
   { label: "Bookmark", labelKey: "blockBookmark", hint: "Link preview card", hintKey: "bookmarkHint", icon: <BookmarkIcon className="h-4 w-4" />, keywords: "bookmark link card url", group: "media", run: (c) => c.setBookmark().run() },
@@ -220,11 +243,29 @@ const SLASH_ITEMS: SlashItem[] = [
   { label: "PDF preview", hint: "Embed an inline PDF viewer", icon: <FileText className="h-4 w-4" />, keywords: "pdf document file preview embed viewer attachment", group: "media", run: (c) => c.setPdfPreview().run() },
   { label: "Map", hint: "Embed a map for a place", icon: <MapIcon className="h-4 w-4" />, keywords: "map location place geo coordinates address directions", group: "media", run: (c) => c.setMapBlock().run() },
   { label: "Breadcrumb", labelKey: "blockBreadcrumb", hint: "Parent page trail", hintKey: "breadcrumbHint", icon: <Compass className="h-4 w-4" />, keywords: "breadcrumb path trail navigation", group: "advanced", run: (c) => c.setBreadcrumb().run() },
+  { label: "Synced block", labelKey: "blockSyncedBlock", hint: "Mirror the block above", hintKey: "syncedBlockHint", icon: <Layers className="h-4 w-4" />, keywords: "synced block mirror reference transclusion duplicate", group: "advanced", run: (c) => c.insertSyncedBlock().run() },
   { label: "Synced view", labelKey: "blockSyncedView", hint: "Mirror another page", hintKey: "syncedViewHint", icon: <Layers className="h-4 w-4" />, keywords: "synced view transclusion mirror page", group: "database", run: (c) => c.setPageEmbed().run() },
   { label: "Linked database", labelKey: "blockLinkedDatabase", hint: "Embed a database", hintKey: "linkedDatabaseHint", icon: <Layers className="h-4 w-4" />, keywords: "linked database embed view", group: "database", run: (c) => c.setLinkedDatabase().run() },
+  { label: "Calendar", hint: "Month calendar with local events", icon: <CalendarDays className="h-4 w-4" />, keywords: "calendar calender month date event schedule agenda", group: "database", run: (c) => c.setCalendarBlock().run() },
   { label: "Template button", labelKey: "blockTemplateButton", hint: "Insert a template", hintKey: "templateButtonHint", icon: <Copy className="h-4 w-4" />, keywords: "template button snippet meeting tasks", group: "database", run: (c) => c.setTemplateButton({ templateId: "meeting" }).run() },
+  { label: "Button", labelKey: "blockButton", hint: "Run an action on click", hintKey: "buttonHint", icon: <MousePointerClick className="h-4 w-4" />, keywords: "button action click run open link template notify", group: "advanced", run: (c) => c.setButton({}).run() },
   { label: "Ask AI", labelKey: "askAI", hint: "Prompt the assistant", hintKey: "askAiHint", icon: <Sparkles className="h-4 w-4" />, keywords: "ai ask assistant generate", group: "advanced", run: (c) => c.setAskAi({}).run() },
-  { label: "Equation", labelKey: "blockEquation", hint: "Block math", hintKey: "equationHint", icon: <Sigma className="h-4 w-4" />, keywords: "equation math latex katex", group: "advanced", run: () => window.dispatchEvent(new CustomEvent(EQUATION_EVENT, { detail: { kind: "block" } })) },
+  { label: "Summarize page", labelKey: "askSummarizePage", hint: "Let AI summarize this page", hintKey: "askAiHint", icon: <Sparkles className="h-4 w-4" />, keywords: "ai summarize summary recap page", group: "advanced", run: (c) => c.setAskAi({ mode: "summarize", prompt: ASK_AI_SUMMARIZE_PROMPT }).run() },
+  {
+    label: "Equation",
+    labelKey: "blockEquation",
+    hint: "Block math",
+    hintKey: "equationHint",
+    icon: <Sigma className="h-4 w-4" />,
+    keywords: "equation math latex katex",
+    group: "advanced",
+    // Run the shared chain first: it deletes the `/equation` query and focuses
+    // the now-empty paragraph. The equation then replaces that paragraph.
+    run: (chain) => {
+      chain.run();
+      window.dispatchEvent(new CustomEvent(EQUATION_EVENT, { detail: { kind: "block" } }));
+    },
+  },
   { label: "Table of contents", labelKey: "blockTableOfContents", hint: "Outline of headings", hintKey: "tocHint", icon: <ListTree className="h-4 w-4" />, keywords: "toc outline contents", group: "basic", run: (c) => c.setTableOfContents().run() },
   { label: "Divider", labelKey: "blockDivider", hint: "Visual separator", hintKey: "dividerHint", icon: <Minus className="h-4 w-4" />, keywords: "divider hr separator", group: "basic", run: (c) => c.setHorizontalRule().run() },
 ];
@@ -418,6 +459,13 @@ export function SlashMenuSurface<T extends SlashMenuItem>({
     if (item && current) current.items.push({ item, index: row.index });
   }
   const count = sections.reduce((total, section) => total + section.items.length, 0);
+  const activeRef = useRef<HTMLButtonElement | null>(null);
+
+  // Keyboard navigation must keep the active row in view: a long slash menu
+  // used to highlight rows below the visible list while the list stayed put.
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: "nearest" });
+  }, [active]);
 
   return (
     <div
@@ -462,6 +510,7 @@ export function SlashMenuSurface<T extends SlashMenuItem>({
                     role="option"
                     aria-selected={isActive}
                     data-active={isActive ? "true" : undefined}
+                    ref={isActive ? activeRef : undefined}
                     onMouseDown={(event) => event.preventDefault()}
                     onMouseEnter={() => onHover?.(index)}
                     onClick={() => onPick?.(item)}
@@ -587,7 +636,7 @@ export function SlashMenu({
       // contain spaces ("/heading 4" keeps the menu open). A slash typed
       // mid-sentence is literal text, not a command.
       const match = /^\/([^\n]*)$/.exec(textBefore);
-      if (match && $from.parent.type.name === "paragraph") {
+      if (match && $from.parent.isTextblock && !$from.parent.type.spec.code) {
         setQuery(match[1] ?? "");
         try {
           const coords = editor.view.coordsAtPos(editor.state.selection.from);
