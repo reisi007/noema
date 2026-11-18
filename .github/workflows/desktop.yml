@@ -1,9 +1,9 @@
-# Desktop app: builds the installable app for Windows, macOS (Intel + Apple
-# Silicon) and Linux.
+# Desktop app: builds the installable app for Windows, macOS (Apple Silicon)
+# and Linux.
 #
 # Two things are unusual here on purpose:
 #  · the Rust shell is built on native runners (cross-compiling a webview app is
-#    not supported), and macOS is built twice for both architectures;
+#    not supported), so macOS is built on an Apple Silicon runner;
 #  · the payload is assembled *before* Tauri packs it — the Next standalone
 #    server, its static assets, the Prisma CLI and a Node runtime — because the
 #    installed app must not require Node, npm or a terminal.
@@ -69,10 +69,6 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             rust-target: aarch64-apple-darwin
-            bundles: dmg,app
-          - os: macos-15-intel
-            name: macos-x64
-            rust-target: x86_64-apple-darwin
             bundles: dmg,app
 
     steps:
@@ -216,10 +212,6 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             rust-target: aarch64-apple-darwin
-            bundles: dmg,app
-          - os: macos-15-intel
-            name: macos-x64
-            rust-target: x86_64-apple-darwin
             bundles: dmg,app
 
     steps:
