@@ -36,6 +36,11 @@ const DSI_ALLOW = [
   "src/lib/html-export.ts",
   "src/lib/html-sanitize.ts",
   "src/lib/import-confluence.ts",
+  // The Mermaid renderer runs the engine's SVG through a DOMParser-based
+  // sanitiser (script/iframe/on* attributes and external references are
+  // dropped) before injecting it — the one audited place where diagram output
+  // reaches the DOM.
+  "src/components/diagrams/mermaid-diagram.tsx",
 ];
 
 execFileSync(process.execPath, ["scripts/audit-inventory.mjs"], { cwd: root, stdio: "ignore" });
