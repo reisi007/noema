@@ -65,8 +65,8 @@ const CHAPTERS = [
       "A TipTap editor with Notion's block vocabulary, built for the keyboard: slash menu, drag handles, selection toolbar.",
     areas: [
       "Editor",
-      "Editor blocks",
       "Diagrams",
+      "Editor blocks",
       "Block menu",
       "Undo / redo",
       "Backlinks",

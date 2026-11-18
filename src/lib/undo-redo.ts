@@ -80,6 +80,10 @@ export type Command<S> = {
   coalesceKey?: string;
   /** Caller-supplied instant used for coalescing; defaults to `0`. */
   at?: number;
+  /** Optional server effect run once after this command is undone. */
+  onUndo?: () => void | Promise<void>;
+  /** Optional server effect run once after this command is redone. */
+  onRedo?: () => void | Promise<void>;
 };
 
 /** One recorded command plus the flags that make it undoable or not. */
@@ -151,6 +155,21 @@ export type HistoryEntry = {
   at?: number;
 };
 
+/**
+ * The result of walking the history to a chosen entry: the resulting stack and
+ * the commands that were actually undone/redone, in the order the effects must
+ * run. Remote entries are never included — they are outside the local scope.
+ */
+export type HistoryTransition<S> = {
+  /** The stack after every step. */
+  stack: UndoStack<S>;
+  /**
+   * Commands crossed by the transition. For `undoTo` this is newest-first; for
+   * `redoTo` it is oldest-first, so a caller can await their effects in order.
+   */
+  commands: Command<S>[];
+};
+
 /** A usable history depth: a finite number floored to an integer ≥ 1. */
 function normalizeLimit(limit: number | undefined): number {
   if (typeof limit !== "number" || !Number.isFinite(limit)) return DEFAULT_UNDO_LIMIT;
@@ -191,6 +210,8 @@ function composeCommand<S>(
   children: readonly Command<S>[],
   meta: { groupKey?: string; coalesceKey?: string; at?: number },
 ): Command<S> {
+  const hasUndo = children.some((child) => child.onUndo !== undefined);
+  const hasRedo = children.some((child) => child.onRedo !== undefined);
   return {
     id,
     label,
@@ -200,6 +221,20 @@ function composeCommand<S>(
     groupKey: meta.groupKey,
     coalesceKey: meta.coalesceKey,
     at: meta.at,
+    ...(hasUndo
+      ? {
+          onUndo: async () => {
+            for (const child of [...children].reverse()) await child.onUndo?.();
+          },
+        }
+      : {}),
+    ...(hasRedo
+      ? {
+          onRedo: async () => {
+            for (const child of children) await child.onRedo?.();
+          },
+        }
+      : {}),
   };
 }
 
@@ -339,6 +374,66 @@ export function redo<S>(stack: UndoStack<S>): UndoStack<S> {
 }
 
 /**
+ * Undo every local step down to (and including) the entry at `index`.
+ *
+ * The history view renders one row per entry; selecting a row asks the stack to
+ * walk back to it. Remote entries are skipped exactly as {@link undo} skips
+ * them, so a collaborator's step is never reverted by someone else's click.
+ * Returns the transitioned stack plus the commands whose effects must run, in
+ * newest-first order. A no-op (no commands, same state) when `index` is out of
+ * range, already undone, remote, or when no local step remains.
+ */
+export function undoTo<S>(stack: UndoStack<S>, index: number): HistoryTransition<S> {
+  const target = stack.entries[index];
+  if (!target || target.remote || target.undone) {
+    return { stack: snapshot(stack), commands: [] };
+  }
+
+  let current = stack;
+  const commands: Command<S>[] = [];
+  while (true) {
+    const command = nextUndoCommand(current);
+    if (!command) break;
+    const commandIndex = current.entries.findIndex(
+      (entry) => !entry.remote && !entry.undone && entry.command === command,
+    );
+    current = undo(current);
+    commands.push(command);
+    if (commandIndex === index) break;
+  }
+  return { stack: current, commands };
+}
+
+/**
+ * Redo every local step up to (and including) the entry at `index`.
+ *
+ * The mirror of {@link undoTo}: a row on the redo side asks the stack to walk
+ * forward to it. Remote entries are left untouched. Returns the transitioned
+ * stack plus the commands to re-run, oldest-first. A no-op when the entry is
+ * applied, remote, out of range, or when the redo branch does not reach it.
+ */
+export function redoTo<S>(stack: UndoStack<S>, index: number): HistoryTransition<S> {
+  const target = stack.entries[index];
+  if (!target || target.remote || !target.undone) {
+    return { stack: snapshot(stack), commands: [] };
+  }
+
+  let current = stack;
+  const commands: Command<S>[] = [];
+  while (true) {
+    const command = nextRedoCommand(current);
+    if (!command) break;
+    const commandIndex = current.entries.findIndex(
+      (entry) => !entry.remote && entry.undone && entry.command === command,
+    );
+    current = redo(current);
+    commands.push(command);
+    if (commandIndex === index) break;
+  }
+  return { stack: current, commands };
+}
+
+/**
  * Fold `command` into history as a collaborator's edit. It is applied to the
  * shared state and recorded as `remote`, so a later local `undo` skips and
  * marks it instead of reverting someone else's work. Truncates the redo branch
@@ -370,6 +465,23 @@ export function group<S>(label: string, commands: readonly Command<S>[]): Comman
     children,
     { groupKey: label },
   );
+}
+
+/** The command the next local `undo` would invert, or `null`. */
+export function nextUndoCommand<S>(stack: UndoStack<S>): Command<S> | null {
+  for (let index = stack.entries.length - 1; index >= 0; index -= 1) {
+    const entry = stack.entries[index];
+    if (!entry.remote && !entry.undone) return entry.command;
+  }
+  return null;
+}
+
+/** The command the next local `redo` would re-apply, or `null`. */
+export function nextRedoCommand<S>(stack: UndoStack<S>): Command<S> | null {
+  for (const entry of stack.entries) {
+    if (!entry.remote && entry.undone) return entry.command;
+  }
+  return null;
 }
 
 /** Whether a local command can be undone. */

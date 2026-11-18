@@ -9,6 +9,7 @@
 import type { Node as PMNode } from "@tiptap/pm/model";
 
 import { safeHref } from "./markdown";
+import { diagramSearchText, diagramToMermaid } from "./diagrams/uml";
 
 export type Mark = { type: string; attrs?: Record<string, unknown> };
 
@@ -46,6 +47,13 @@ export function prosemirrorToText(doc: unknown): string {
   const out: string[] = [];
   const walk = (node: RichNode) => {
     if (node.text) out.push(node.text);
+    if (node.type === "umlDiagram") out.push(diagramSearchText(node.attrs?.data));
+    // Action atoms have no child text, so their visible label is what a search
+    // index and a screen-reader summary can use.
+    if (node.type === "templateButton" || node.type === "button") {
+      const label = node.attrs?.label;
+      if (typeof label === "string" && label !== "") out.push(label);
+    }
     node.content?.forEach(walk);
     if (node.type === "paragraph" || /^heading/.test(node.type ?? "")) {
       out.push("\n");
@@ -64,6 +72,33 @@ export function wordCount(doc: unknown): number {
 
 export function charCount(doc: unknown): number {
   return prosemirrorToText(doc).length;
+}
+
+/** One-line action summary for Markdown export of a Button block. */
+function buttonActionSummary(attrs: Record<string, unknown> | undefined): string {
+  const action = attrs?.action;
+  if (!action || typeof action !== "object" || Array.isArray(action)) return "no action";
+  const kind = (action as { kind?: unknown }).kind;
+  switch (kind) {
+    case "open_url": {
+      const url = (action as { url?: unknown }).url;
+      return `open ${typeof url === "string" ? url : "link"}`;
+    }
+    case "insert_template": {
+      const templateId = (action as { templateId?: unknown }).templateId;
+      return `insert template ${typeof templateId === "string" ? templateId : ""}`.trim();
+    }
+    case "set_property": {
+      const propertyId = (action as { propertyId?: unknown }).propertyId;
+      return `set property ${typeof propertyId === "string" ? propertyId : ""}`.trim();
+    }
+    case "notify": {
+      const message = (action as { message?: unknown }).message;
+      return `notify ${typeof message === "string" ? message : ""}`.trim();
+    }
+    default:
+      return "no action";
+  }
 }
 
 /**
@@ -135,8 +170,19 @@ export function docToMarkdown(doc: unknown): string {
       else if (title) lines.push(title);
     } else if (type === "pageEmbed") {
       lines.push(`/w/…/${String(node.attrs?.pageId ?? "")} — ${String(node.attrs?.title ?? "")}`);
+    } else if (type === "umlDiagram") {
+      lines.push(`\`\`\`mermaid\n${diagramToMermaid(node.attrs?.data)}\n\`\`\``);
     } else if (type === "blockMath") {
       lines.push(`$$\n${String(node.attrs?.latex ?? "")}\n$$`);
+    } else if (type === "templateButton") {
+      // Atoms have no children; the label + selected template is the meaningful
+      // content an exported document can carry.
+      const label = String(node.attrs?.label ?? "").trim() || "Template";
+      const templateId = String(node.attrs?.templateId ?? "").trim();
+      lines.push(templateId ? `[${label}] (template: ${templateId})` : `[${label}]`);
+    } else if (type === "button") {
+      const label = String(node.attrs?.label ?? "").trim() || "Button";
+      lines.push(`[${label}] (${buttonActionSummary(node.attrs)})`);
     } else if (type === "table") {
       const rows = node.content ?? [];
       rows.forEach((row, index) => {

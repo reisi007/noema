@@ -10,6 +10,11 @@ import {
 } from "@/lib/permissions";
 import { getWorkspaceBySlug, getWorkspaceMembers, getRecentActivity, getRecentWebhookDeliveries } from "@/server/queries";
 import { prisma } from "@/lib/db";
+import {
+  SsoSettings,
+  type SsoConnectionRow,
+  type VerifiedDomainRow,
+} from "@/components/sso-settings";
 import { TeamspaceManager, type TeamspaceRow } from "@/components/teamspace-manager";
 import { AiSettings } from "@/components/ai-settings";
 import { EmailSettings } from "@/components/email-settings";
@@ -20,7 +25,7 @@ import {
   listEmailDeliveries,
   listWorkspaceInvites,
 } from "@/server/actions/email";
-import { getAiProviderSummary } from "@/server/actions/ai-settings";
+import { getAiBudgetSummary, getAiProviderSummary } from "@/server/actions/ai-settings";
 import {
   ApiTokenManager,
   type ApiTokenRow,
@@ -217,6 +222,67 @@ export default async function SettingsPage({
       invites: { where: { acceptedAt: null }, select: { id: true, email: true, role: true } },
     },
   });
+  const [ssoConnectionRows, verifiedDomainRows] = manage
+    ? await Promise.all([
+        prisma.ssoConnection.findMany({
+          where: { workspaceId: workspace.id },
+          orderBy: { createdAt: "asc" },
+          select: {
+            id: true,
+            name: true,
+            idpEntityId: true,
+            ssoUrl: true,
+            certificate: true,
+            metadataUrl: true,
+            metadataFetchedAt: true,
+            spEntityId: true,
+            callbackUrl: true,
+            emailAttribute: true,
+            nameAttribute: true,
+            groupsAttribute: true,
+            roleRules: true,
+            enabled: true,
+            scimEnabled: true,
+          },
+        }),
+        prisma.verifiedDomain.findMany({
+          where: { workspaceId: workspace.id },
+          orderBy: { domain: "asc" },
+          select: {
+            id: true,
+            domain: true,
+            verifyToken: true,
+            verifiedAt: true,
+            connectionId: true,
+          },
+        }),
+      ])
+    : [[], []];
+  const ssoConnections: SsoConnectionRow[] = ssoConnectionRows.map((row) => ({
+    ...row,
+    metadataFetchedAt: row.metadataFetchedAt?.toISOString() ?? null,
+    roleRules:
+      row.roleRules === null || row.roleRules === undefined
+        ? ""
+        : JSON.stringify(row.roleRules),
+  }));
+  const ssoActivity = manage
+    ? await prisma.activity.findMany({
+        where: { workspaceId: workspace.id, action: { startsWith: "sso." } },
+        orderBy: { createdAt: "desc" },
+        take: 20,
+        select: { id: true, action: true, createdAt: true },
+      })
+    : [];
+  const verifiedDomains: VerifiedDomainRow[] = verifiedDomainRows.map((row) => ({
+    id: row.id,
+    domain: row.domain,
+    recordName: `_noema-verification.${row.domain}`,
+    verifyToken: row.verifyToken,
+    verifiedAt: row.verifiedAt?.toISOString() ?? null,
+    connectionId: row.connectionId,
+  }));
+
   const teamspaceRows: TeamspaceRow[] = teamspaces.map((teamspace) => ({
     id: teamspace.id,
     name: teamspace.name,
@@ -247,7 +313,8 @@ export default async function SettingsPage({
   const firstActivityDay = dailyActivity.at(0)?.date ?? "";
   const lastActivityDay = dailyActivity.at(-1)?.date ?? "";
 
-  const [aiProvider, emailSummary, workspaceInvites, emailDeliveries, labels] = await Promise.all([    getAiProviderSummary(workspace.id),
+  const [aiProvider, aiBudget, emailSummary, workspaceInvites, emailDeliveries, labels] = await Promise.all([    getAiProviderSummary(workspace.id),
+    getAiBudgetSummary(workspace.id),
     getEmailSummary(workspace.id),
     listWorkspaceInvites(workspace.id),
     listEmailDeliveries(workspace.id),
@@ -517,7 +584,12 @@ export default async function SettingsPage({
       )}
 
       {manage && aiProvider && (
-        <AiSettings workspaceId={workspace.id} summary={aiProvider} locale={locale} />
+        <AiSettings
+          workspaceId={workspace.id}
+          summary={aiProvider}
+          budget={aiBudget}
+          locale={locale}
+        />
       )}
 
       {manage && (
@@ -550,6 +622,21 @@ export default async function SettingsPage({
           }))}
           locale={locale}
           currentUserRole={access.role}
+        />
+      )}
+
+      {manage && (
+        <SsoSettings
+          workspaceId={workspace.id}
+          slug={workspace.slug}
+          locale={locale}
+          connections={ssoConnections}
+          domains={verifiedDomains}
+          activity={ssoActivity.map((entry) => ({
+            id: entry.id,
+            action: entry.action,
+            createdAt: entry.createdAt.toISOString(),
+          }))}
         />
       )}
 

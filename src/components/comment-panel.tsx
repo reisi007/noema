@@ -14,6 +14,7 @@ import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   Check,
+  CornerDownRight,
   MessageSquare,
   MoreHorizontal,
   Pencil,
@@ -31,6 +32,7 @@ import {
 } from "@/server/actions/comments";
 import { Avatar } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { CommentComposerTools } from "@/components/comment-composer-tools";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -49,9 +51,23 @@ import {
 import { actionError, safeAction } from "@/lib/actions-client";
 import { resolveAvatar, type Avatar as ResolvedAvatar } from "@/lib/avatars";
 import { cn } from "@/lib/utils";
-import { parseCommentBody, toPlainText, type CommentSegment } from "@/lib/comment-body";
+import { contentDirProps } from "@/lib/bidi";
+import {
+  commentMentionHref,
+  parseCommentBody,
+  toPlainText,
+  type CommentSegment,
+} from "@/lib/comment-body";
 import { extractMentions } from "@/lib/comments";
-import { COMMENT_EVENT } from "@/lib/editor-events";
+import { type CommentAnchorState } from "@/lib/comment-anchors";
+import {
+  COMMENT_ANCHOR_STATE_EVENT,
+  COMMENT_EVENT,
+  COMMENT_JUMP_EVENT,
+  type CommentAnchorStateRequest,
+  type CommentJumpRequest,
+  type CommentRequest,
+} from "@/lib/editor-events";
 import { t } from "@/lib/i18n";
 import { formatRelativeTime } from "@/lib/i18n-format";
 import { stableTime } from "@/lib/time";
@@ -91,6 +107,14 @@ export type CommentNode = {
   id: string;
   body: string;
   quote: string | null;
+  /** Stable top-level block id the selection was anchored to, when known. */
+  blockId: string | null;
+  /** Exact range start inside `blockId`'s plain text (root comments). */
+  anchorFrom?: number | null;
+  /** Exact range end inside `blockId`'s plain text (root comments). */
+  anchorTo?: number | null;
+  /** Whether the stored range still matches the current block text. */
+  anchorState?: CommentAnchorState;
   resolved: boolean;
   reactions: ReactionRow[];
   createdAt: string;
@@ -106,6 +130,55 @@ export type CommentNode = {
 
 /** Custom event the editor fires when "Comment" is pressed. */
 export { COMMENT_EVENT } from "@/lib/editor-events";
+
+/** Pure: validate the editor's hand-off before it reaches composer state. */
+export function commentComposerAnchor(
+  detail: CommentRequest | undefined,
+): {
+  quote: string;
+  blockId: string | null;
+  from: number | null;
+  to: number | null;
+} {
+  const quote = (detail?.quote ?? "").slice(0, 500);
+  const blockId =
+    typeof detail?.blockId === "string" && detail.blockId.trim() !== ""
+      ? detail.blockId
+      : null;
+  const from = detail?.from;
+  const to = detail?.to;
+  const hasRange =
+    typeof from === "number" &&
+    Number.isInteger(from) &&
+    from >= 0 &&
+    typeof to === "number" &&
+    Number.isInteger(to) &&
+    to > from;
+  return {
+    quote,
+    blockId,
+    from: hasRange ? (from as number) : null,
+    to: hasRange ? (to as number) : null,
+  };
+}
+
+/** Pure: the panel's jump request for a stored root-comment anchor, or null. */
+export function commentJumpTarget(comment: {
+  id: string;
+  blockId: string | null;
+  quote?: string | null;
+  anchorFrom?: number | null;
+  anchorTo?: number | null;
+}): CommentJumpRequest | null {
+  if (!comment.blockId || comment.blockId.trim() === "") return null;
+  return {
+    commentId: comment.id,
+    blockId: comment.blockId,
+    quote: comment.quote ?? null,
+    from: comment.anchorFrom ?? null,
+    to: comment.anchorTo ?? null,
+  };
+}
 
 /**
  * How long the composer keeps its accent flash after the editor hands it a
@@ -263,6 +336,27 @@ function useAutoGrowTextarea(maxHeightPx: number): {
   return { ref, resize };
 }
 
+/**
+ * Scroll the editor to a persisted block anchor. The editor stamps
+ * `data-block-id` on every top-level block, so this works from the comment
+ * panel below the editor without threading an editor instance through the
+ * panel. Returns `false` when the block is gone (deleted, or a different page),
+ * letting the caller explain why nothing moved.
+ */
+function scrollToBlock(blockId: string): boolean {
+  if (typeof document === "undefined" || blockId.trim() === "") return false;
+  const blocks = document.querySelectorAll<HTMLElement>("[data-block-id]");
+  for (const block of blocks) {
+    if (block.getAttribute("data-block-id") !== blockId) continue;
+    block.scrollIntoView({
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+      block: "center",
+    });
+    return true;
+  }
+  return false;
+}
+
 /** Honour the user's motion preference for the panel-triggered scroll. */
 function prefersReducedMotion(): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
@@ -348,14 +442,21 @@ function CommentListSkeleton() {
 export function CommentPanel({
   locale,
   pageId,
+  workspaceId,
+  workspaceSlug = "",
   comments,
   currentUserId,
   canComment,
   loading = false,
   loadError = null,
   onRetry,
+  focusCommentId,
 }: {
   pageId: string;
+  /** Workspace that owns the page; enables attach + mention tools. */
+  workspaceId?: string;
+  /** Slug used to build navigable mention links in rendered comments. */
+  workspaceSlug?: string;
   comments: CommentNode[];
   currentUserId: string;
   canComment: boolean;
@@ -366,10 +467,15 @@ export function CommentPanel({
   loadError?: string | null;
   /** Retry hook for the error state; defaults to `router.refresh()`. */
   onRetry?: () => void;
+  /** A deep link target: scroll to and briefly highlight this comment. */
+  focusCommentId?: string;
 }) {
   const router = useRouter();
   const [body, setBody] = useState("");
   const [quote, setQuote] = useState("");
+  const [anchorBlockId, setAnchorBlockId] = useState<string | null>(null);
+  const [anchorFrom, setAnchorFrom] = useState<number | null>(null);
+  const [anchorTo, setAnchorTo] = useState<number | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editBody, setEditBody] = useState("");
   const [replyTo, setReplyTo] = useState<string | null>(null);
@@ -377,8 +483,22 @@ export function CommentPanel({
   const [pending, startTransition] = useTransition();
   const [flash, setFlash] = useState(false);
   const [composerError, setComposerError] = useState<string | null>(null);
+  /**
+   * Ranges the live editor has reported as no longer matching their quote.
+   * Server state starts the badge; this keeps it accurate while the user types.
+   */
+  const [liveStale, setLiveStale] = useState<ReadonlySet<string>>(new Set());
   // Resolved/open filter; `all` keeps every thread visible by default.
   const [resolvedFilter, setResolvedFilter] = useState<ResolvedFilter>("all");
+  /**
+   * Resolve/reopen writes are optimistic. The server action + `router.refresh`
+   * round trip can land a beat after the click, and the row used to keep its
+   * old badge (and the counts stayed put) in the meantime. Hold the intended
+   * state per thread until the refreshed props echo it back.
+   */
+  const [resolvedOverrides, setResolvedOverrides] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
   const composerRef = useRef<HTMLDivElement | null>(null);
   const composerErrorId = useId();
 
@@ -386,11 +506,49 @@ export function CommentPanel({
   const replyArea = useAutoGrowTextarea(COMPOSER_MAX_HEIGHT_PX);
   const inputRef = mainArea.ref;
 
+  /**
+   * Insert attachment/mention text at the caret instead of appending it. Both
+   * composers own a textarea ref, so a single helper keeps the caret, focus and
+   * auto-grow correct after the controlled value changes.
+   */
+  const insertInto = (
+    value: string,
+    setValue: (next: string) => void,
+    ref: RefObject<HTMLTextAreaElement | null>,
+    text: string,
+  ) => {
+    const element = ref.current;
+    const start = Math.min(element?.selectionStart ?? value.length, value.length);
+    const end = Math.min(element?.selectionEnd ?? start, value.length);
+    const next = `${value.slice(0, start)}${text}${value.slice(end)}`;
+    setValue(next);
+    window.requestAnimationFrame(() => {
+      element?.focus();
+      const caret = start + text.length;
+      element?.setSelectionRange(caret, caret);
+    });
+  };
+
   // Purely derived from the props: flatten the roots/replies into the pure
   // thread model once, then group via `buildThreads` and tally resolved vs open
   // threads via `threadCounts`. Read-only presentation - no action or wire
-  // shape changes.
-  const threadComments = useMemo(() => toThreadComments(comments), [comments]);
+  // shape changes. `resolvedOverrides` is the in-flight optimistic layer; once
+  // the server echo matches it the effect below drops it again.
+  const effectiveComments = useMemo(() => {
+    const ids = Object.keys(resolvedOverrides);
+    if (ids.length === 0) return comments;
+    return comments.map((comment) => {
+      const override = resolvedOverrides[comment.id];
+      return override === undefined || override === comment.resolved
+        ? comment
+        : { ...comment, resolved: override };
+    });
+  }, [comments, resolvedOverrides]);
+
+  const threadComments = useMemo(
+    () => toThreadComments(effectiveComments),
+    [effectiveComments],
+  );
 
   const threads = useMemo(() => buildThreads(threadComments), [threadComments]);
 
@@ -415,9 +573,45 @@ export function CommentPanel({
   }, [threads, resolvedFilter]);
 
   const visibleComments = useMemo(
-    () => comments.filter((comment) => visibleThreadIds.has(comment.id)),
-    [comments, visibleThreadIds],
+    () => effectiveComments.filter((comment) => visibleThreadIds.has(comment.id)),
+    [effectiveComments, visibleThreadIds],
   );
+
+  // The server has echoed an optimistic resolve/reopen: stop overriding it.
+  useEffect(() => {
+    setResolvedOverrides((previous) => {
+      const ids = Object.keys(previous);
+      if (ids.length === 0) return previous;
+      const next = { ...previous };
+      let changed = false;
+      for (const id of ids) {
+        const server = comments.find((comment) => comment.id === id);
+        if (!server || server.resolved === previous[id]) {
+          delete next[id];
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [comments]);
+
+  const [focusedComment, setFocusedComment] = useState<string | null>(null);
+
+  // Deep link from the inbox (`?comment=<id>`): scroll the exact thread into
+  // view and flash it briefly. The block anchor in `#<blockId>` is handled by
+  // the browser when the editor renders the block.
+  useEffect(() => {
+    if (!focusCommentId) return;
+    const element = document.getElementById(`comment-${focusCommentId}`);
+    if (!element) return;
+    element.scrollIntoView({
+      block: "center",
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+    });
+    setFocusedComment(focusCommentId);
+    const timer = window.setTimeout(() => setFocusedComment(null), 2200);
+    return () => window.clearTimeout(timer);
+  }, [focusCommentId]);
 
   const filterCounts: Record<ResolvedFilter, number> = {
     all: counts.threads,
@@ -441,8 +635,14 @@ export function CommentPanel({
   // The editor's "Comment" action hands the selection to us here.
   useEffect(() => {
     const onComment = (event: Event) => {
-      const detail = (event as CustomEvent<{ quote?: string }>).detail;
-      setQuote((detail?.quote ?? "").slice(0, 500));
+      const detail = (event as CustomEvent<CommentRequest>).detail;
+      const anchor = commentComposerAnchor(detail);
+      setQuote(anchor.quote);
+      setAnchorBlockId(anchor.blockId);
+      // The editor's real selection, when it captured one. Both offsets must be
+      // present; a half range is dropped rather than guessed.
+      setAnchorFrom(anchor.from);
+      setAnchorTo(anchor.to);
       setReplyTo(null);
       composerRef.current?.scrollIntoView({
         block: "center",
@@ -456,6 +656,19 @@ export function CommentPanel({
     return () => window.removeEventListener(COMMENT_EVENT, onComment);
   }, [inputRef]);
 
+  // The live editor reports ranges whose text changed. Only the exact-range
+  // claim is withdrawn; the quote stays visible.
+  useEffect(() => {
+    const onAnchorState = (event: Event) => {
+      const detail = (event as CustomEvent<CommentAnchorStateRequest>).detail;
+      const ids = Array.isArray(detail?.staleIds) ? detail.staleIds : [];
+      setLiveStale(new Set(ids.filter((id) => typeof id === "string")));
+    };
+    window.addEventListener(COMMENT_ANCHOR_STATE_EVENT, onAnchorState);
+    return () =>
+      window.removeEventListener(COMMENT_ANCHOR_STATE_EVENT, onAnchorState);
+  }, []);
+
   const submit = (text: string, parentId: string | null) => {
     if (!text.trim()) return;
     setComposerError(null);
@@ -466,6 +679,9 @@ export function CommentPanel({
           body: text,
           parentId,
           quote: parentId ? undefined : quote.trim() || undefined,
+          blockId: parentId ? undefined : anchorBlockId ?? undefined,
+          anchorFrom: parentId ? undefined : anchorFrom ?? undefined,
+          anchorTo: parentId ? undefined : anchorTo ?? undefined,
         }),
       );
       if (!outcome.ok) {
@@ -483,17 +699,29 @@ export function CommentPanel({
       setReplyBody("");
       setReplyTo(null);
       setQuote("");
+      setAnchorBlockId(null);
+      setAnchorFrom(null);
+      setAnchorTo(null);
       toast.success(parentId ? "Reply added" : "Comment added");
       router.refresh();
     });
   };
 
-  const toggleResolved = (id: string, resolved: boolean) =>
+  const toggleResolved = (id: string, resolved: boolean) => {
+    setResolvedOverrides((previous) => ({ ...previous, [id]: resolved }));
     startTransition(async () => {
       const outcome = await safeAction(() => resolveCommentAction(id, resolved));
-      if (!outcome.ok) toast.error(outcome.error);
+      if (!outcome.ok) {
+        setResolvedOverrides((previous) => {
+          const next = { ...previous };
+          delete next[id];
+          return next;
+        });
+        toast.error(outcome.error);
+      }
       router.refresh();
     });
+  };
 
   const remove = (id: string) =>
     startTransition(async () => {
@@ -590,16 +818,31 @@ export function CommentPanel({
                 const isAuthor = comment.author.id === currentUserId;
                 const resolved = resolveState(comment.resolved) === "resolved";
                 const canReplyToThis = replyableIds.has(comment.id);
+                const commentBlockId = comment.blockId;
+                const jumpTarget = commentJumpTarget(comment);
+                const anchorStale =
+                  comment.anchorState === "stale" ||
+                  liveStale.has(comment.id);
+                const anchorValid =
+                  comment.anchorState === "valid" && !liveStale.has(comment.id);
+                const jumpLabel = anchorValid ? "Jump to text" : t(locale, "jumpToBlock");
+                // Quoted page text is user-authored too: isolate it so a mixed
+                // quote never reorders the comment header around it.
+                const quoteDirection = contentDirProps(comment.quote ?? "");
                 return (
                   <li
                     key={comment.id}
+                    id={`comment-${comment.id}`}
                     data-testid={`comment-${comment.id}`}
+                    data-focused={focusedComment === comment.id ? "true" : undefined}
                     data-resolved={resolved ? "true" : undefined}
                     className={cn(
                       "group u-surface flex gap-3 rounded-card border p-3",
                       resolved
                         ? "border-border bg-surface-2/50"
                         : "border-border bg-bg",
+                      focusedComment === comment.id &&
+                        "ring-2 ring-focus ring-offset-2 ring-offset-bg",
                     )}
                   >
                     <Avatar
@@ -613,7 +856,7 @@ export function CommentPanel({
                     <div className={cn("min-w-0 flex-1", resolved && "text-muted")}>
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="truncate text-sm font-medium">
-                          {comment.author.name}
+                          <bdi>{comment.author.name}</bdi>
                         </span>
                         <RelativeTime
                           value={comment.createdAt}
@@ -628,12 +871,58 @@ export function CommentPanel({
                       </div>
 
                       {comment.quote && (
-                        <blockquote
-                          data-testid="comment-quote"
-                          className="mt-2 rounded-md border-s-2 border-s-accent bg-surface-2 px-2.5 py-1.5 text-xs italic text-muted"
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <blockquote
+                            data-testid="comment-quote"
+                            dir={quoteDirection.dir}
+                            className={cn(
+                              "rounded-md border-s-2 border-s-accent bg-surface-2 px-2.5 py-1.5 text-xs italic text-muted",
+                              quoteDirection.className,
+                            )}
+                          >
+                            {comment.quote}
+                          </blockquote>
+                          {anchorStale && (
+                            // The quote is kept, but the persisted range no
+                            // longer matches the block: say so instead of
+                            // highlighting the wrong words.
+                            <Tag
+                              hue="orange"
+                              size="sm"
+                              data-testid="comment-anchor-stale"
+                              title="The text this comment quoted has changed."
+                            >
+                              Text changed
+                            </Tag>
+                          )}
+                        </div>
+                      )}
+
+                      {commentBlockId && jumpTarget && (
+                        <button
+                          type="button"
+                          data-testid={`comment-jump-${comment.id}`}
+                          data-comment-block-id={commentBlockId}
+                          data-comment-anchor-state={comment.anchorState ?? "block"}
+                          aria-label={`${jumpLabel}: ${commentBlockId}`}
+                          onClick={() => {
+                            // The editor listens for the exact range and paints
+                            // it; the DOM scroll is the fallback for a block the
+                            // editor no longer renders (deleted/other page).
+                            window.dispatchEvent(
+                              new CustomEvent(COMMENT_JUMP_EVENT, {
+                                detail: jumpTarget,
+                              }),
+                            );
+                            if (!scrollToBlock(commentBlockId)) {
+                              toast.error(t(locale, "nothingToWorkWith"));
+                            }
+                          }}
+                          className="focus-ring u-colors mt-2 flex items-center gap-1 rounded-xs text-xs text-accent hover:underline"
                         >
-                          {comment.quote}
-                        </blockquote>
+                          <CornerDownRight className="h-3 w-3" />
+                          {jumpLabel}
+                        </button>
                       )}
 
                       {editingId === comment.id ? (
@@ -662,6 +951,7 @@ export function CommentPanel({
                         >
                           <Textarea
                             defaultValue={comment.body}
+                            dir={contentDirProps(comment.body).dir}
                             aria-label={t(locale, "editComment")}
                             onChange={(event) => setEditBody(event.target.value)}
                             size="sm"
@@ -681,7 +971,11 @@ export function CommentPanel({
                           </div>
                         </form>
                       ) : (
-                        <CommentBody body={comment.body} className="mt-1 text-sm" />
+                        <CommentBody
+                          body={comment.body}
+                          slug={workspaceSlug}
+                          className="mt-1 text-sm"
+                        />
                       )}
 
                       <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -786,7 +1080,7 @@ export function CommentPanel({
                               <div className="min-w-0">
                                 <div className="flex flex-wrap items-center gap-2">
                                   <span className="truncate text-sm font-medium">
-                                    {reply.author.name}
+                                    <bdi>{reply.author.name}</bdi>
                                   </span>
                                   <RelativeTime
                                     value={reply.createdAt}
@@ -796,6 +1090,7 @@ export function CommentPanel({
                                 </div>
                                 <CommentBody
                                   body={reply.body}
+                                  slug={workspaceSlug}
                                   className="mt-0.5 text-sm"
                                 />
                                 {reply.reactions && reply.reactions.length > 0 && (
@@ -833,6 +1128,7 @@ export function CommentPanel({
                           <Textarea
                             ref={replyArea.ref}
                             value={replyBody}
+                            dir={contentDirProps(replyBody).dir}
                             aria-label={t(locale, "writeReply")}
                             onChange={(event) => {
                               setReplyBody(event.target.value);
@@ -842,8 +1138,17 @@ export function CommentPanel({
                             placeholder={t(locale, "writeReply")}
                             className="resize-none"
                           />
-                          <div className="flex items-center justify-between gap-2">
-                            <MentionHints body={replyBody} />
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="flex items-center gap-1">
+                              <MentionHints body={replyBody} />
+                              <CommentComposerTools
+                                compact
+                                workspaceId={workspaceId}
+                                onInsert={(text) =>
+                                  insertInto(replyBody, setReplyBody, replyArea.ref, text)
+                                }
+                              />
+                            </span>
                             <Button
                               size="sm"
                               aria-label={t(locale, "postReply")}
@@ -876,13 +1181,24 @@ export function CommentPanel({
           )}
         >
           {quote && (
-            <div className="flex items-start gap-2 rounded-control bg-surface px-2 py-1.5 text-xs text-muted">
+            <div
+              data-testid="comment-composer-quote"
+              data-anchor-block-id={anchorBlockId ?? undefined}
+              data-anchor-from={anchorFrom ?? undefined}
+              data-anchor-to={anchorTo ?? undefined}
+              className="flex items-start gap-2 rounded-control bg-surface px-2 py-1.5 text-xs text-muted"
+            >
               <Quote className="mt-0.5 h-3 w-3 shrink-0" />
-              <span className="min-w-0 flex-1 truncate">{quote}</span>
+              <bdi className="min-w-0 flex-1 truncate">{quote}</bdi>
               <button
                 type="button"
                 aria-label={t(locale, "removeQuote")}
-                onClick={() => setQuote("")}
+                onClick={() => {
+                  setQuote("");
+                  setAnchorBlockId(null);
+                  setAnchorFrom(null);
+                  setAnchorTo(null);
+                }}
                 className="focus-ring shrink-0 rounded-xs u-colors hover:text-fg"
               >
                 ×
@@ -892,6 +1208,7 @@ export function CommentPanel({
           <Textarea
             ref={inputRef}
             value={body}
+            dir={contentDirProps(body).dir}
             aria-label={t(locale, "addComment")}
             data-comment-input
             invalid={Boolean(composerError)}
@@ -910,7 +1227,13 @@ export function CommentPanel({
             placeholder={quote ? t(locale, "commentOnSelection") : t(locale, "addAComment")}
             className="resize-none"
           />
-          <MentionHints body={body} />
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <MentionHints body={body} />
+            <CommentComposerTools
+              workspaceId={workspaceId}
+              onInsert={(text) => insertInto(body, setBody, inputRef, text)}
+            />
+          </div>
           {composerError && (
             <p
               id={composerErrorId}
@@ -941,6 +1264,9 @@ export function CommentPanel({
                 onClick={() => {
                   setBody("");
                   setQuote("");
+                  setAnchorBlockId(null);
+                  setAnchorFrom(null);
+                  setAnchorTo(null);
                   setComposerError(null);
                 }}
               >
@@ -970,14 +1296,29 @@ export function CommentPanel({
  * text. Bodies with no rich segments take the canonical {@link toPlainText}
  * path. Presentation only — the wire body is never rewritten.
  */
-function CommentBody({ body, className }: { body: string; className?: string }) {
+function CommentBody({
+  body,
+  slug = "",
+  className,
+}: {
+  body: string;
+  slug?: string;
+  className?: string;
+}) {
   const segments = parseCommentBody(body);
   const rich = segments.some((segment) => segment.type !== "text");
+  // A comment can be written in any script (or mix two). Give the paragraph
+  // its own base direction so an Arabic body inside the English UI — and an
+  // English body inside `ar` — keeps its punctuation on the authored side.
+  const direction = contentDirProps(body);
   return (
-    <p className={cn("whitespace-pre-wrap", className)}>
+    <p
+      dir={direction.dir}
+      className={cn("whitespace-pre-wrap", direction.className, className)}
+    >
       {rich
         ? segments.map((segment, index) => (
-            <CommentSegmentView key={index} segment={segment} />
+            <CommentSegmentView key={index} segment={segment} slug={slug} />
           ))
         : toPlainText(segments)}
     </p>
@@ -985,14 +1326,27 @@ function CommentBody({ body, className }: { body: string; className?: string }) 
 }
 
 /** One parsed segment: a mention chip, an external link, an emoji or raw text. */
-function CommentSegmentView({ segment }: { segment: CommentSegment }) {
+function CommentSegmentView({ segment, slug }: { segment: CommentSegment; slug: string }) {
   switch (segment.type) {
-    case "mention":
-      return (
+    case "mention": {
+      const href = commentMentionHref(segment.id, slug);
+      const chip = (
         <span className="rounded-chip bg-surface-2 px-1 font-medium text-fg">
-          @{segment.value}
+          <bdi>@{segment.value}</bdi>
         </span>
       );
+      return href ? (
+        <a
+          href={href}
+          className="focus-ring rounded-chip underline-offset-2 hover:underline"
+          title={`Open ${segment.value}`}
+        >
+          {chip}
+        </a>
+      ) : (
+        chip
+      );
+    }
     case "link": {
       // `parseCommentBody` only yields http(s)/www links; `sanitizeHref` is the
       // same scheme gate the renderer/markdown use, and `www.` needs a scheme.
@@ -1006,7 +1360,7 @@ function CommentSegmentView({ segment }: { segment: CommentSegment }) {
           rel="noreferrer noopener"
           className="text-accent underline underline-offset-2"
         >
-          {segment.value}
+          <bdi>{segment.value}</bdi>
         </a>
       ) : (
         <span>{segment.value}</span>

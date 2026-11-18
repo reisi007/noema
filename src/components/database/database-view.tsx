@@ -11,6 +11,9 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { PromptDialog } from "@/components/prompt-dialog";
+import { useAction } from "@/lib/actions-client";
+import { useUndoRedo } from "@/components/providers/undo-redo-provider";
+import { bulkEffectCommand } from "@/lib/undo-bulk";
 import { useRouter } from "next/navigation";
 import {
   Ban,
@@ -28,25 +31,70 @@ import {
   Upload,
   X } from "lucide-react";
 import {
-  createPropertyAction,
-  createRowAction,
-  createViewAction,
-  deletePropertyAction,
-  deleteRowAction,
-  duplicateDatabaseAction,
-  duplicateViewAction,
-  importCsvAction,
-  createRowFromTemplateAction,
-  listDeletedRowsAction,
-  reorderPropertiesAction,
-  saveRowAsTemplateAction,
-  setPropertyValueAction,
-  updatePropertyAction,
-  updateViewAction } from "@/server/actions/database";
+  createPropertyAction as rawCreatePropertyAction,
+  createRowAction as rawCreateRowAction,
+  createViewAction as rawCreateViewAction,
+  deletePropertyAction as rawDeletePropertyAction,
+  deleteRowAction as rawDeleteRowAction,
+  duplicateDatabaseAction as rawDuplicateDatabaseAction,
+  duplicateViewAction as rawDuplicateViewAction,
+  importCsvAction as rawImportCsvAction,
+  createRowFromTemplateAction as rawCreateRowFromTemplateAction,
+  listDeletedRowsAction as rawListDeletedRowsAction,
+  loadMoreDatabaseRowsAction as rawLoadMoreDatabaseRowsAction,
+  reorderPropertiesAction as rawReorderPropertiesAction,
+  saveRowAsTemplateAction as rawSaveRowAsTemplateAction,
+  setPropertyValueAction as rawSetPropertyValueAction,
+  setRelationTwoWayAction as rawSetRelationTwoWayAction,
+  setSubItemParentAction as rawSetSubItemParentAction,
+  submitFormAction as rawSubmitFormAction,
+  updatePropertyAction as rawUpdatePropertyAction,
+  updateViewAction as rawUpdateViewAction } from "@/server/actions/database";
 import {
-  restorePageAction,
-  toggleSchemaLockAction,
-  updatePageAction } from "@/server/actions/pages";
+  restorePageAction as rawRestorePageAction,
+  toggleSchemaLockAction as rawToggleSchemaLockAction,
+  updatePageAction as rawUpdatePageAction } from "@/server/actions/pages";
+import { guarded } from "@/lib/actions-client";
+
+// Every action call in this screen goes through the transport guard, so a
+// dropped connection becomes a `{ error }` result instead of an unhandled
+// rejection. `useAction` (inside the component) adds the toast/refresh wrapper
+// for the relation controls; these aliases keep the other call sites safe.
+const createPropertyAction = guarded(rawCreatePropertyAction) as typeof rawCreatePropertyAction;
+const createRowAction = guarded(rawCreateRowAction) as typeof rawCreateRowAction;
+const createViewAction = guarded(rawCreateViewAction) as typeof rawCreateViewAction;
+const deletePropertyAction =
+  guarded(rawDeletePropertyAction) as typeof rawDeletePropertyAction;
+const deleteRowAction = guarded(rawDeleteRowAction) as typeof rawDeleteRowAction;
+const duplicateDatabaseAction =
+  guarded(rawDuplicateDatabaseAction) as typeof rawDuplicateDatabaseAction;
+const duplicateViewAction =
+  guarded(rawDuplicateViewAction) as typeof rawDuplicateViewAction;
+const importCsvAction = guarded(rawImportCsvAction) as typeof rawImportCsvAction;
+const createRowFromTemplateAction =
+  guarded(rawCreateRowFromTemplateAction) as typeof rawCreateRowFromTemplateAction;
+const listDeletedRowsAction =
+  guarded(rawListDeletedRowsAction) as typeof rawListDeletedRowsAction;
+const loadMoreDatabaseRowsAction =
+  guarded(rawLoadMoreDatabaseRowsAction) as typeof rawLoadMoreDatabaseRowsAction;
+const reorderPropertiesAction =
+  guarded(rawReorderPropertiesAction) as typeof rawReorderPropertiesAction;
+const saveRowAsTemplateAction =
+  guarded(rawSaveRowAsTemplateAction) as typeof rawSaveRowAsTemplateAction;
+const setPropertyValueAction =
+  guarded(rawSetPropertyValueAction) as typeof rawSetPropertyValueAction;
+const setRelationTwoWayAction =
+  guarded(rawSetRelationTwoWayAction) as typeof rawSetRelationTwoWayAction;
+const setSubItemParentAction =
+  guarded(rawSetSubItemParentAction) as typeof rawSetSubItemParentAction;
+const submitFormAction = guarded(rawSubmitFormAction) as typeof rawSubmitFormAction;
+const updatePropertyAction =
+  guarded(rawUpdatePropertyAction) as typeof rawUpdatePropertyAction;
+const updateViewAction = guarded(rawUpdateViewAction) as typeof rawUpdateViewAction;
+const restorePageAction = guarded(rawRestorePageAction) as typeof rawRestorePageAction;
+const toggleSchemaLockAction =
+  guarded(rawToggleSchemaLockAction) as typeof rawToggleSchemaLockAction;
+const updatePageAction = guarded(rawUpdatePageAction) as typeof rawUpdatePageAction;
 import { DUR } from "@/lib/design-tokens";
 import { toast } from "sonner";
 import {
@@ -63,6 +111,7 @@ import { AGGREGATION_FUNCTIONS, type AggregationFn } from "@/lib/aggregations";
 import type { ChartType } from "@/lib/charts";
 import type { RowColorRule } from "@/lib/row-color-rules";
 import { mergeLayout, type ColumnLayout } from "@/lib/column-layout";
+import type { PropertyLayout } from "@/lib/property-layout-engine";
 import type { DependencyEdge } from "@/lib/dependencies";
 import {
   buildSubIssueTree,
@@ -79,15 +128,13 @@ import {
   computeRollup as computeRelationRollup,
   createRelationPair,
   createRelationState,
-  linkRows,
   setRollupConfig,
   symmetricPairs,
-  unlinkRows,
-  type InverseLink,
   type RelationState,
   type RollupFn as RelationRollupFn,
 } from "@/lib/relation-pairs";
 import { normalizeRollupConfig } from "@/lib/rollup-config";
+import { normalizeRelationConfig } from "@/lib/relation-config";
 import {
   canEditSchema,
   describeLock,
@@ -127,6 +174,7 @@ import {
 import { DatabaseViewToolbar } from "@/components/database/view-toolbar";
 import { DatabasePeek } from "@/components/database/database-peek";
 import { DatabaseActions } from "@/components/database/database-actions";
+import { FormBuilder } from "@/components/database/form-builder";
 import { Dialog } from "@/components/ui/dialog";
 import { t } from "@/lib/i18n";
 import {
@@ -180,6 +228,17 @@ const LazyChartView = dynamic(
     })),
   { ssr: false, loading: () => <ViewFallback /> },
 );
+/**
+ * The dependency editor is only needed while a row peek is open; keeping it in
+ * its own chunk protects the database route's first-load budget.
+ */
+const LazyRowDependencies = dynamic(
+  () =>
+    import("@/components/database/row-dependencies").then((mod) => ({
+      default: mod.RowDependencies,
+    })),
+  { ssr: false },
+);
 const LazyFormView = dynamic(
   () =>
     import("@/components/database/form-view").then((mod) => ({
@@ -213,6 +272,12 @@ type ViewTemplate = {
   name: string;
   icon: string | null;
   recurrence?: string | null;
+  /** `Template.nextRunAt` — the scheduler's next due instant (R89.17). */
+  nextRunAt?: string | Date | null;
+  /** `Template.lastRunAt` — when the scheduler last materialized a row. */
+  lastRunAt?: string | Date | null;
+  /** `Template.paused` — keeps the cadence but stops the cron (R31.22). */
+  paused?: boolean;
   /** `Template.config`, the saved `{ values }` property defaults. */
   config?: { values?: { propertyId: string; value: unknown }[] } | null;
   /** `Template.content` (a ProseMirror doc once the query exposes it). */
@@ -480,12 +545,11 @@ const DEPENDENCY_COLUMN_ID = "__dependencies__";
 
 /**
  * The additive fields the sub-items engine (`@/lib/sub-items`) reads off a
- * row. `DBRow` does not carry them yet, so they are read defensively: an
- * absent `parentId` keeps a row at the top level and the tree renders exactly
- * like today's flat list.
+ * row. `subOfId` is persisted on `Page`, `position` is the sibling order; the
+ * engine's own vocabulary stays `parentId`/`order`.
  */
-type SubItemFields = { parentId?: string | null; order?: number };
-type SubItemDisplayRow = QueryRow & SubItemFields;
+type SubItemFields = { subOfId?: string | null; position?: number };
+type SubItemDisplayRow = QueryRow & { parentId: string | null; order?: number };
 
 /**
  * fix04 — additive bridges onto the newer sub-issue / relation / rollup engines
@@ -494,12 +558,27 @@ type SubItemDisplayRow = QueryRow & SubItemFields;
  * shapes is node-testable without a DOM; `DatabaseView` is the only caller.
  */
 
-/** Nested sub-issue depth cap. Deeper rows surface as flat orphans, never lost. */
-export const SUB_ISSUE_MAX_DEPTH = 4;
+/** Persisted sub-items are one level deep; deeper rows surface as orphans. */
+export const SUB_ISSUE_MAX_DEPTH = 1;
 
 /** `@/lib/dependencies` edges (`from` blocks `to`) → sub-issues blocking edges. */
 export function toSubIssueEdges(edges: readonly DependencyEdge[]): SubIssueDependencyEdge[] {
   return edges.map((edge) => ({ blockerId: edge.from, blockedId: edge.to }));
+}
+
+/**
+ * Give each blocking edge the stable id the timeline arrow router needs. The
+ * pair is unique (`RowDependency` has a compound unique index), so the id is
+ * deterministic across renders and server refreshes.
+ */
+export function toTimelineEdges(
+  edges: readonly DependencyEdge[],
+): { id: string; from: string; to: string }[] {
+  return edges.map((edge) => ({
+    id: `${edge.from}:${edge.to}`,
+    from: edge.from,
+    to: edge.to,
+  }));
 }
 
 export type SubIssueLayout = {
@@ -550,11 +629,6 @@ const pageIdsOf = (value: unknown): string[] => {
   return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
 };
 
-const relationIdsIn = (state: RelationState, propertyId: string, rowId: string): string[] => {
-  const ids = state.links[propertyId]?.[rowId];
-  return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
-};
-
 /** Project a stored property value onto the primitive the rollup aggregates. */
 function projectRelationValue(raw: unknown, type: string): unknown {
   const value = (raw ?? {}) as Record<string, unknown>;
@@ -575,10 +649,11 @@ function projectRelationValue(raw: unknown, type: string): unknown {
 /**
  * Build a `@/lib/relation-pairs` state from the view's own rows and the related
  * rows the query already resolved (`relationData`). RELATION properties become
- * cross-referencing pairs (the inverse property is picked out of the target
- * database's schema when it is a relation, otherwise a synthetic id keeps the
- * pair well-formed without ever being persisted); both stored sides are
- * projected so `symmetricPairs` sees real reciprocal edges.
+ * cross-referencing pairs. The pair's inverse is the configured
+ * `config.inversePropertyId` when that property still exists on the target;
+ * otherwise a synthetic id keeps the pair well-formed without ever being
+ * persisted. Both stored sides are projected so `symmetricPairs` sees real
+ * reciprocal edges.
  */
 export function buildRelationState(input: {
   databaseId: string;
@@ -588,8 +663,7 @@ export function buildRelationState(input: {
 }): BuiltRelationState {
   const relationProperties = input.properties.filter((property) => {
     if (property.type !== "RELATION") return false;
-    const config = property.config as { targetDatabaseId?: unknown } | null;
-    return typeof config?.targetDatabaseId === "string" && config.targetDatabaseId !== "";
+    return normalizeRelationConfig(property.config).targetDatabaseId !== null;
   });
 
   const valueOf = (row: DBRow, propertyId: string): unknown =>
@@ -610,35 +684,44 @@ export function buildRelationState(input: {
   const seenTargets = new Set<string>();
 
   for (const property of relationProperties) {
-    const config = property.config as { targetDatabaseId: string; multi?: boolean };
+    const config = normalizeRelationConfig(property.config);
+    const targetDatabaseId = config.targetDatabaseId;
+    if (!targetDatabaseId) continue;
     const target = input.relationData[property.id];
+    const configuredInverse = config.inversePropertyId;
     const inversePropertyId =
-      target?.properties.find((candidate) => candidate.type === "RELATION")?.id ?? null;
+      configuredInverse &&
+      target?.properties.some(
+        (candidate) =>
+          candidate.id === configuredInverse && candidate.type === "RELATION",
+      )
+        ? configuredInverse
+        : null;
     const definition = createRelationPair({
       a: { databaseId: input.databaseId, propertyId: property.id },
       b: {
-        databaseId: config.targetDatabaseId,
+        databaseId: targetDatabaseId,
         propertyId: inversePropertyId ?? `${property.id}::inverse`,
       },
-      cardinality: config.multi === false ? "one" : "many",
+      cardinality: config.multi ? "many" : "one",
     });
     definitions.push(definition);
     pairs[property.id] = {
       pairId: definition.id,
       inversePropertyId,
-      targetDatabaseId: config.targetDatabaseId,
+      targetDatabaseId,
     };
 
     if (target) {
       const types = new Map(target.properties.map((entry) => [entry.id, entry.type]));
       for (const [targetRowId, rawById] of Object.entries(target.valuesByRow)) {
-        if (!seenTargets.has(`${config.targetDatabaseId}\u0000${targetRowId}`)) {
-          seenTargets.add(`${config.targetDatabaseId}\u0000${targetRowId}`);
+        if (!seenTargets.has(`${targetDatabaseId}\u0000${targetRowId}`)) {
+          seenTargets.add(`${targetDatabaseId}\u0000${targetRowId}`);
           const values: Record<string, unknown> = {};
           for (const [propertyId, raw] of Object.entries(rawById)) {
             values[propertyId] = projectRelationValue(raw, types.get(propertyId) ?? "TEXT");
           }
-          rows.push({ id: targetRowId, databaseId: config.targetDatabaseId, values });
+          rows.push({ id: targetRowId, databaseId: targetDatabaseId, values });
         }
         if (inversePropertyId) {
           const stored = pageIdsOf(rawById[inversePropertyId]);
@@ -708,7 +791,10 @@ export function rollupCellFromPairs(
       relationPropertyId: normalized.relationPropertyId,
       targetPropertyId: normalized.targetPropertyId,
       fn,
-      separator: ", ",
+      separator:
+        typeof (storedConfig as { separator?: unknown } | null)?.separator === "string"
+          ? (storedConfig as { separator: string }).separator
+          : ", ",
     }),
   );
   if (result.value === null) return "—";
@@ -723,64 +809,6 @@ export function mutualRelationCount(state: RelationState, pairId: string, rowId:
   return symmetricPairs(state, pairId).filter((edge) => edge.aRowId === rowId).length;
 }
 
-/** One property write the relation planner wants persisted. */
-export type RelationWrite = {
-  rowId: string;
-  propertyId: string;
-  value: { pageIds: string[] };
-};
-
-/**
- * Plan a relation edit as a two-way write: reconcile `rowId` to `value`'s
- * `pageIds` through `linkRows`/`unlinkRows` (single-cardinality replacement and
- * dedupe are the engine's job), then emit the source write plus every far-side
- * write the engine reports for a *real* inverse property. Returns `null` when
- * the property is not a paired relation, so the caller keeps the plain write.
- */
-export function planRelationWrite(
-  state: RelationState,
-  pairs: RelationPairIndex,
-  property: DBProperty,
-  rowId: string,
-  value: unknown,
-): { writes: RelationWrite[] } | null {
-  const entry = pairs[property.id];
-  if (!entry) return null;
-
-  const next = pageIdsOf(value);
-  const current = relationIdsIn(state, property.id, rowId);
-  const added = next.filter((id) => !current.includes(id));
-  const removed = current.filter((id) => !next.includes(id));
-
-  const linked = added.length
-    ? linkRows(state, { fromId: rowId, toIds: added, pairId: entry.pairId })
-    : { state, inverseLinks: [] as InverseLink[] };
-  const unlinked = removed.length
-    ? unlinkRows(linked.state, { fromId: rowId, toIds: removed, pairId: entry.pairId })
-    : { state: linked.state, inverseLinks: [] as InverseLink[] };
-
-  const writes: RelationWrite[] = [
-    {
-      rowId,
-      propertyId: property.id,
-      value: { pageIds: relationIdsIn(unlinked.state, property.id, rowId) },
-    },
-  ];
-
-  if (entry.inversePropertyId) {
-    for (const inverse of [...linked.inverseLinks, ...unlinked.inverseLinks]) {
-      if (inverse.propertyId !== entry.inversePropertyId) continue;
-      writes.push({
-        rowId: inverse.rowId,
-        propertyId: inverse.propertyId,
-        value: { pageIds: inverse.targetIds },
-      });
-    }
-  }
-
-  return { writes };
-}
-
 export function DatabaseView({
   locale,
   databasePageId,
@@ -791,13 +819,14 @@ export function DatabaseView({
   databases,
   properties,
   views,
-  rows,
+  rows: initialRows,
   members,
   editable,
   dependencyEdges = [],
   schemaLocked = false,
   lockedPropertyIds,
   loading = false,
+  nextRowCursor = null,
 }: {
   databasePageId: string;
   workspaceId: string;
@@ -808,6 +837,8 @@ export function DatabaseView({
   properties: DBProperty[];
   views: DBView[];
   rows: DBRow[];
+  /** Opaque keyset token for the next row window (`null` at the end). */
+  nextRowCursor?: string | null;
   /** Workspace members offered by PEOPLE cells (multi-user assignment). */
   members?: { id: string; name: string }[];
   editable: boolean;
@@ -829,6 +860,39 @@ export function DatabaseView({
 }) {
   const router = useRouter();
   const [, startTransition] = useTransition();
+  const { run: runAction } = useAction(locale);
+  const { push: pushGlobal } = useUndoRedo();
+  const [extraRows, setExtraRows] = useState<DBRow[]>([]);
+  const [extraDependencyEdges, setExtraDependencyEdges] = useState<DependencyEdge[]>([]);
+  const [rowCursor, setRowCursor] = useState<string | null>(nextRowCursor);
+  const [loadingMoreRows, setLoadingMoreRows] = useState(false);
+  useEffect(() => {
+    setRowCursor(nextRowCursor);
+  }, [nextRowCursor]);
+  const rows = useMemo(() => {
+    const seen = new Set(initialRows.map((row) => row.id));
+    return [...initialRows, ...extraRows.filter((row) => !seen.has(row.id))];
+  }, [initialRows, extraRows]);
+  const allDependencyEdges = useMemo(() => {
+    const seen = new Set(
+      dependencyEdges.map((edge) => `${edge.from}\u0000${edge.to}`),
+    );
+    return [
+      ...dependencyEdges,
+      ...extraDependencyEdges.filter(
+        (edge) => !seen.has(`${edge.from}\u0000${edge.to}`),
+      ),
+    ];
+  }, [dependencyEdges, extraDependencyEdges]);
+  // A refresh that removes selected rows (another client trashed one, a filter
+  // changed) must not leave invisible ids in the bulk selection.
+  useEffect(() => {
+    setSelectedRowIds((current) => {
+      const live = new Set(rows.map((row) => row.id));
+      const next = current.filter((id) => live.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [rows]);
   /**
    * R89.24 — the schema lock is optimistic while the server write is in
    * flight: the toolbar flips immediately, and a refused write (e.g. a member
@@ -862,6 +926,9 @@ export function DatabaseView({
    */
   const [propertyToDelete, setPropertyToDelete] = useState<DBProperty | null>(null);
   const [rowToDelete, setRowToDelete] = useState<string | null>(null);
+  /** Table multi-selection for bulk row actions (trash → one undo step). */
+  const [selectedRowIds, setSelectedRowIds] = useState<string[]>([]);
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
   const [lockPending, setLockPending] = useState(false);
   const [deletedRows, setDeletedRows] = useState<
     { id: string; title: string; icon: string | null; deletedAt: string }[] | null
@@ -931,13 +998,39 @@ export function DatabaseView({
     properties.find((p) => p.config?.primary) ?? properties[0] ?? null;
 
   // Parsed + normalised on read: malformed or unknown stored keys are ignored.
-  const viewConfig = parseViewConfig(activeView?.config);
+  const serverViewConfig = parseViewConfig(activeView?.config);
+  /**
+   * Optimistic view config. `setViewConfig` runs a server action and then
+   * `router.refresh()`; until that round trip lands the toolbar must already
+   * show the value the user picked, otherwise a fast follow-up action is built
+   * from a stale control (and the popover visibly snaps back). The local copy
+   * is only trusted while its server echo is still in flight; as soon as the
+   * refreshed props match it, the props are authoritative again.
+   */
+  const [optimisticViewConfig, setOptimisticViewConfig] = useState<{
+    viewId: string;
+    config: EditableViewConfig;
+  } | null>(null);
+  const viewConfig =
+    optimisticViewConfig && activeView && optimisticViewConfig.viewId === activeView.id
+      ? optimisticViewConfig.config
+      : serverViewConfig;
+  const serverViewConfigJson = JSON.stringify(serverViewConfig);
+  useEffect(() => {
+    if (!optimisticViewConfig) return;
+    if (optimisticViewConfig.viewId !== activeView?.id) {
+      setOptimisticViewConfig(null);
+      return;
+    }
+    const echoed =
+      JSON.stringify(optimisticViewConfig.config) === serverViewConfigJson;
+    if (echoed) setOptimisticViewConfig(null);
+  }, [activeView?.id, serverViewConfigJson, optimisticViewConfig]);
   // Once the server echoes a config back, the props are authoritative again
   // and the optimistic buffer below can be dropped.
-  const viewConfigJson = JSON.stringify(viewConfig);
   useEffect(() => {
     pendingConfig.current = undefined;
-  }, [viewConfigJson]);
+  }, [serverViewConfigJson]);
   const { rows: viewRows } = applyView(
     rows as unknown as QueryRow[],
     properties as unknown as QueryProperty[],
@@ -1031,7 +1124,11 @@ export function DatabaseView({
     () =>
       viewRows.map((row) => {
         const fields = row as QueryRow & SubItemFields;
-        return { ...row, parentId: fields.parentId ?? null, order: fields.order };
+        return {
+          ...row,
+          parentId: fields.subOfId ?? null,
+          order: fields.position,
+        };
       }),
     [viewRows],
   );
@@ -1058,12 +1155,46 @@ export function DatabaseView({
       return { ...previous, [activeView.id]: next };
     });
   };
-  /** Promote a nested row to the top level through `@/lib/sub-issues`. */
-  const promoteSubIssue = (id: string) => {
+  /**
+   * Move a row through the pure sub-issue engine for immediate feedback, then
+   * persist the same edge. A rejected move (self/cycle/depth) never reaches the
+   * server; a server refusal rolls the optimistic tree back.
+   */
+  const moveSubIssueRow = async (id: string, parentId: string | null) => {
     if (!activeView) return;
-    if (!canMoveSubIssue(effectiveSubItemRows, id, { toParentId: null }).ok) return;
-    const moved = moveSubIssue(effectiveSubItemRows, id, { toParentId: null });
+    const options = { toParentId: parentId, maxDepth: SUB_ISSUE_MAX_DEPTH };
+    if (!canMoveSubIssue(effectiveSubItemRows, id, options).ok) return;
+    const previousRows = effectiveSubItemRows;
+    const moved = moveSubIssue(effectiveSubItemRows, id, options);
     setSubIssueRowsByView((previous) => ({ ...previous, [activeView.id]: moved }));
+    const result = await setSubItemParentAction(id, parentId);
+    if ("error" in result) {
+      setSubIssueRowsByView((previous) => ({
+        ...previous,
+        [activeView.id]: previousRows,
+      }));
+      toast.error(result.error);
+      return;
+    }
+    router.refresh();
+  };
+  /** Promote a nested row to the top level. */
+  const promoteSubIssue = (id: string) => {
+    void moveSubIssueRow(id, null);
+  };
+  /**
+   * The row a visible row would nest under: the preceding top-level row in the
+   * current view order. A row that is already nested, or the first row, has no
+   * target.
+   */
+  const nestTargetFor = (id: string): DBRow | null => {
+    const current = effectiveSubItemRows.find((row) => row.id === id);
+    if (!current || current.parentId !== null) return null;
+    const index = viewRows.findIndex((row) => row.id === id);
+    if (index <= 0) return null;
+    const previous = viewRows[index - 1] as DBRow;
+    if (previous.subOfId) return null;
+    return previous;
   };
   /** The roll-up summary for a sub-issue parent, or `null` for a leaf. */
   const subIssueRollupText = (id: string): string | null => {
@@ -1077,8 +1208,8 @@ export function DatabaseView({
   // the graph is empty, every indicator is blank and no column is added, so an
   // ordinary database renders exactly as before.
   const dependencyGraph = useMemo(
-    () => buildSubIssueDependencyTree(toSubIssueEdges(dependencyEdges)),
-    [dependencyEdges],
+    () => buildSubIssueDependencyTree(toSubIssueEdges(allDependencyEdges)),
+    [allDependencyEdges],
   );
   const dependencySummary = (rowId: string): string => {
     const node = dependencyGraph.nodes.get(rowId);
@@ -1110,7 +1241,7 @@ export function DatabaseView({
   // The virtual dependency column, plus the table schema/config that show it.
   // Both are the plain values when there are no edges, so the table is
   // untouched until a caller supplies dependencies.
-  const hasDependencyEdges = dependencyEdges.length > 0;
+  const hasDependencyEdges = allDependencyEdges.length > 0;
   const dependencyColumn: DBProperty = {
     id: DEPENDENCY_COLUMN_ID,
     name: `${t(locale, "relationBlocks")} / ${t(locale, "relationBlockedBy")}`,
@@ -1267,9 +1398,13 @@ export function DatabaseView({
       ...patch,
     };
     pendingConfig.current = next;
+    setOptimisticViewConfig({ viewId: activeView.id, config: next });
     startTransition(async () => {
       const result = await updateViewAction(activeView.id, { config: next });
-      if ("error" in result) toast.error(result.error);
+      if ("error" in result) {
+        toast.error(result.error);
+        setOptimisticViewConfig(null);
+      }
       router.refresh();
     });
   };
@@ -1360,14 +1495,48 @@ export function DatabaseView({
     }));
   };
 
-  const onLinkDatabase = (property: DBProperty, targetDatabaseId: string) =>
-    startTransition(async () => {
-      await updatePropertyAction(property.id, {
-        config: { ...(property.config ?? {}), targetDatabaseId },
-      });
-      toast.success(t(locale, "relationLinked"));
-      router.refresh();
+  const onLinkDatabase = (property: DBProperty, targetDatabaseId: string) => {
+    const previous = normalizeRelationConfig(property.config);
+    runAction(
+      async () => {
+        if (previous.inversePropertyId && previous.targetDatabaseId !== targetDatabaseId) {
+          // Changing the target invalidates the old reciprocal column. Clear
+          // the pair first so the old target property keeps no stale backlink.
+          const cleared = await setRelationTwoWayAction(property.id, false);
+          if ("error" in cleared) return cleared;
+        }
+        return updatePropertyAction(property.id, {
+          config: {
+            ...(property.config ?? {}),
+            targetDatabaseId,
+            inversePropertyId:
+              previous.targetDatabaseId === targetDatabaseId
+                ? previous.inversePropertyId
+                : null,
+          },
+        });
+      },
+      {
+        success: t(locale, "relationLinked"),
+        onSuccess: () => router.refresh(),
+      },
+    );
+  };
+
+  const onSetRelationMulti = (property: DBProperty, multi: boolean) => {
+    const config = normalizeRelationConfig(property.config);
+    runAction(
+      () => updatePropertyAction(property.id, { config: { ...config, multi } }),
+      { onSuccess: () => router.refresh() },
+    );
+  };
+
+  const onToggleTwoWay = (property: DBProperty, enabled: boolean) => {
+    runAction(() => setRelationTwoWayAction(property.id, enabled), {
+      success: t(locale, enabled ? "twoWayEnabled" : "twoWayDisabled"),
+      onSuccess: () => router.refresh(),
     });
+  };
 
   const onConfigureRollup = (
     property: DBProperty,
@@ -1486,6 +1655,8 @@ export function DatabaseView({
     relationData,
     onLinkDatabase,
     onConfigureRollup,
+    onSetRelationMulti,
+    onToggleTwoWay,
   };
 
   const valueFor = (row: DBRow, propertyId: string): unknown =>
@@ -1548,6 +1719,7 @@ export function DatabaseView({
       relationPropertyId?: string;
       targetPropertyId?: string;
       function?: RollupFunction;
+      separator?: string;
     };
     const relationPropertyId = config.relationPropertyId ?? "";
     const targetPropertyId = config.targetPropertyId ?? "";
@@ -1580,7 +1752,9 @@ export function DatabaseView({
       }
       return formatCell(raw, targetProperty) || null;
     });
-    return aggregate(values, fn);
+    return aggregate(values, fn, {
+      separator: typeof config.separator === "string" ? config.separator : ", ",
+    });
   };
 
   /** Computed value for FORMULA, ROLLUP and system properties. */
@@ -1610,32 +1784,79 @@ export function DatabaseView({
   };
 
   const setValue = (rowId: string, propertyId: string, value: unknown) => {
-    // RELATION edits are maintained on both sides through the relation-pairs
-    // engine: reconcile the source row, then persist every far-side write the
-    // engine reports for a real inverse property. Other properties keep the
-    // plain single-value write.
-    const property = properties.find((candidate) => candidate.id === propertyId);
-    if (property?.type === "RELATION") {
-      const plan = planRelationWrite(
-        relationState.state,
-        relationState.pairs,
-        property,
-        rowId,
-        value,
-      );
-      if (plan) {
-        startTransition(async () => {
-          for (const write of plan.writes) {
-            await setPropertyValueAction(write.rowId, write.propertyId, write.value);
-          }
-          router.refresh();
-        });
+    // The server owns relation propagation now: a RELATION write validates the
+    // target ids and updates the configured reciprocal cell in the same
+    // transaction. Sending the source write once avoids a double reciprocal
+    // write from the old client-side planner.
+    const previous = rows
+      .find((row) => row.id === rowId)
+      ?.propertyValues.find((entry) => entry.propertyId === propertyId)?.value;
+    runAction(() => setPropertyValueAction(rowId, propertyId, value), {
+      onSuccess: () => {
+        if (JSON.stringify(previous) !== JSON.stringify(value)) {
+          pushGlobal({
+            id: crypto.randomUUID(),
+            label: `Edit ${properties.find((property) => property.id === propertyId)?.name ?? "property"}`,
+            apply: (state) => state,
+            invert: (state) => state,
+            coalesceKey: `${rowId}:${propertyId}`,
+            at: Date.now(),
+            onUndo: async () => {
+              await setPropertyValueAction(rowId, propertyId, previous ?? null);
+              router.refresh();
+            },
+            onRedo: async () => {
+              await setPropertyValueAction(rowId, propertyId, value);
+              router.refresh();
+            },
+          });
+        }
+        router.refresh();
+      },
+    });
+  };
+
+  /** Append the next keyset window of rows without discarding loaded rows. */
+  const loadMoreRows = () => {
+    if (!rowCursor || loadingMoreRows) return;
+    setLoadingMoreRows(true);
+    startTransition(async () => {
+      const page = await loadMoreDatabaseRowsAction(databasePageId, rowCursor);
+      setLoadingMoreRows(false);
+      if ("error" in page) {
+        toast.error(page.error);
         return;
       }
-    }
-    startTransition(async () => {
-      await setPropertyValueAction(rowId, propertyId, value);
-      router.refresh();
+      const nextRows: DBRow[] = page.rows.map((row) => ({
+        id: row.id,
+        title: row.title,
+        icon: row.icon,
+        createdAt: row.createdAt.toISOString(),
+        updatedAt: row.updatedAt.toISOString(),
+        createdByName: row.createdBy?.name ?? null,
+        lastEditedByName:
+          page.lastEditedBy[row.id] ?? row.createdBy?.name ?? null,
+        subOfId: row.subOfId,
+        position: row.position,
+        propertyValues: row.propertyValues.map((entry) => ({
+          propertyId: entry.propertyId,
+          value: entry.value,
+        })),
+      }));
+      setExtraRows((previous) => {
+        const seen = new Set(previous.map((row) => row.id));
+        return [...previous, ...nextRows.filter((row) => !seen.has(row.id))];
+      });
+      setExtraDependencyEdges((previous) => {
+        const seen = new Set(previous.map((edge) => `${edge.from}\u0000${edge.to}`));
+        return [
+          ...previous,
+          ...page.dependencies
+            .map((edge) => ({ from: edge.blockerId, to: edge.blockedId }))
+            .filter((edge) => !seen.has(`${edge.from}\u0000${edge.to}`)),
+        ];
+      });
+      setRowCursor(page.nextRowCursor);
     });
   };
 
@@ -1698,35 +1919,26 @@ export function DatabaseView({
     });
 
   /**
-   * Submit a FORM view. The row is created through the same `createRowAction`
-   * path the table's "New row" uses — the submitted title (the primary column,
-   * when it is a question) seeds the row so its cell is not written twice —
-   * then every other accepted answer is written with `setPropertyValueAction`,
-   * exactly as a cell edit would. `FormView` owns validation, so only accepted
-   * answers reach here.
+   * Submit a FORM view through the atomic server action.
+   *
+   * `FormView` has already run the same validation for immediate feedback; the
+   * action re-reads the stored schema and re-validates against the live
+   * database before creating the row and every cell in one transaction. The
+   * returned result lets the form keep its success state off until the write
+   * really committed.
    */
-  const submitForm = (values: { propertyId: string; value: unknown }[]) => {
-    startTransition(async () => {
-      const primaryAnswer = primary
-        ? values.find((cell) => cell.propertyId === primary.id)
-        : undefined;
-      const submittedTitle = (primaryAnswer?.value as { text?: unknown } | undefined)?.text;
-      const created = await createRowAction(
-        databasePageId,
-        typeof submittedTitle === "string" ? submittedTitle : "",
-      );
-      if (!("ok" in created)) {
-        toast.error(created.error);
-        return;
-      }
-      for (const cell of values) {
-        // `createRowAction` already seeded the primary cell from the title.
-        if (cell.propertyId === primary?.id) continue;
-        await setPropertyValueAction(created.id, cell.propertyId, cell.value);
-      }
-      toast.success(t(locale, "done"));
-      router.refresh();
-    });
+  const submitForm = async (values: { propertyId: string; value: unknown }[]) => {
+    const answers = Object.fromEntries(
+      values.map((cell) => [cell.propertyId, cell.value]),
+    );
+    const result = await submitFormAction(activeView.id, answers);
+    if ("error" in result) {
+      toast.error(result.error);
+      return { error: result.error };
+    }
+    toast.success(t(locale, "done"));
+    router.refresh();
+    return { ok: true as const };
   };
 
   const onSaveTemplate = (row: DBRow) =>
@@ -1799,6 +2011,32 @@ export function DatabaseView({
    */
   const removeRow = (rowId: string) => setRowToDelete(rowId);
 
+  /**
+   * Record a trashed row (or a batch of them) as one reversible global step.
+   * The inverse restores every id; redo trashes them again. The successful
+   * subset is captured, so a partially failed batch only advertises what can
+   * really be restored.
+   */
+  const recordRowsTrashed = (label: string, ids: readonly string[]) => {
+    if (ids.length === 0) return;
+    pushGlobal(
+      bulkEffectCommand<Record<string, unknown>>({
+        id: crypto.randomUUID(),
+        label,
+        rowIds: ids,
+        at: Date.now(),
+        undo: async (rowIds) => {
+          for (const id of rowIds) await restorePageAction(id);
+          router.refresh();
+        },
+        redo: async (rowIds) => {
+          for (const id of rowIds) await deleteRowAction(id);
+          router.refresh();
+        },
+      }),
+    );
+  };
+
   /** The confirmed half of `removeRow`: trash the row and refresh. */
   const confirmRemoveRow = (rowId: string) =>
     startTransition(async () => {
@@ -1807,7 +2045,41 @@ export function DatabaseView({
         toast.error(result.error);
         return;
       }
+      const title = rowsById.get(rowId)?.title || t(locale, "untitled");
+      recordRowsTrashed(`${t(locale, "deleteRow")}: ${title}`, [rowId]);
+      setSelectedRowIds((current) => current.filter((id) => id !== rowId));
       toast.success(t(locale, "dbRowTrashed"));
+      router.refresh();
+    });
+
+  /** Bulk trash for the table selection: one history entry for the batch. */
+  const confirmRemoveSelectedRows = () =>
+    startTransition(async () => {
+      const ids = selectedRowIds.slice();
+      if (ids.length === 0) {
+        setBulkDeleteOpen(false);
+        return;
+      }
+      const deleted: string[] = [];
+      let failure: string | null = null;
+      for (const id of ids) {
+        const result = await deleteRowAction(id);
+        if ("error" in result) {
+          failure ??= result.error;
+          continue;
+        }
+        deleted.push(id);
+      }
+      setBulkDeleteOpen(false);
+      setSelectedRowIds((current) => current.filter((id) => !deleted.includes(id)));
+      if (deleted.length > 0) {
+        recordRowsTrashed(
+          `${t(locale, "deleteRow")} (${deleted.length})`,
+          deleted,
+        );
+        toast.success(t(locale, "dbRowTrashed"));
+      }
+      if (failure) toast.error(failure);
       router.refresh();
     });
 
@@ -1932,6 +2204,23 @@ export function DatabaseView({
         toast.error(result.error);
         return;
       }
+      // Restoring is invertible too: undo trashes the row again.
+      pushGlobal(
+        bulkEffectCommand<Record<string, unknown>>({
+          id: crypto.randomUUID(),
+          label: t(locale, "restore"),
+          rowIds: [rowId],
+          at: Date.now(),
+          undo: async (rowIds) => {
+            for (const id of rowIds) await deleteRowAction(id);
+            router.refresh();
+          },
+          redo: async (rowIds) => {
+            for (const id of rowIds) await restorePageAction(id);
+            router.refresh();
+          },
+        }),
+      );
       toast.success(t(locale, "dbRowRestored"));
       const list = await listDeletedRowsAction(databasePageId);
       setDeletedRows("error" in list ? [] : list.rows);
@@ -2021,6 +2310,36 @@ export function DatabaseView({
           </p>
         )
       )}
+
+      {/* Bulk row actions: appears only while the table selection is non-empty,
+          and records one invertible step for the whole batch. */}
+      {editable && activeView.type === "TABLE" && selectedRowIds.length > 0 ? (
+        <div
+          data-testid="database-bulk-bar"
+          className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs"
+        >
+          <span className="font-medium text-fg">
+            {selectedRowIds.length} {t(locale, "selected")}
+          </span>
+          <Button
+            variant="danger"
+            tone="soft"
+            size="xs"
+            leftIcon={<Trash2 className="h-3.5 w-3.5" aria-hidden />}
+            onClick={() => setBulkDeleteOpen(true)}
+          >
+            {`${t(locale, "deleteRow")} (${selectedRowIds.length})`}
+          </Button>
+          <Button
+            variant="ghost"
+            size="xs"
+            className="ms-auto"
+            onClick={() => setSelectedRowIds([])}
+          >
+            {t(locale, "clear")}
+          </Button>
+        </div>
+      ) : null}
 
       {/* Deleted rows: soft-deleted rows of this database, restorable inline. */}
       {deletedRows !== null && (
@@ -2156,6 +2475,7 @@ export function DatabaseView({
           workspaceSlug={workspaceSlug}
           properties={properties}
           rows={viewRows}
+          edges={toTimelineEdges(allDependencyEdges)}
           editable={editable}
         />
       ) : activeView.type === "CHART" ? (
@@ -2168,15 +2488,29 @@ export function DatabaseView({
           aggregateFn={chartAggregate}
         />
       ) : activeView.type === "FORM" ? (
-        <LazyFormView
-          locale={locale}
-          properties={properties}
-          config={formConfig}
-          // A read-only database shows the questions without a submit seam,
-          // matching how every other view omits its editors when not editable.
-          onSubmit={editable ? submitForm : undefined}
-          loading={loading}
-        />
+        <div className="space-y-3">
+          {editable && (
+            <FormBuilder
+              locale={locale}
+              properties={properties}
+              config={formConfig}
+              viewId={activeView.id}
+              databaseId={databasePageId}
+              defaultTitle={activeView.name}
+              responseCount={rows.length}
+              onSave={(form) => setViewConfig({ form })}
+            />
+          )}
+          <LazyFormView
+            locale={locale}
+            properties={properties}
+            config={formConfig}
+            // A read-only database shows the questions without a submit seam,
+            // matching how every other view omits its editors when not editable.
+            onSubmit={editable ? submitForm : undefined}
+            loading={loading}
+          />
+        </div>
       ) : activeView.type === "TABLE" ? (
         <TableView
           locale={locale}
@@ -2228,6 +2562,26 @@ export function DatabaseView({
           loading={loading}
           onAddRow={editable ? addRow : undefined}
           footer={tableFooter}
+          selectedRowIds={selectedRowIds}
+          onToggleRow={
+            editable
+              ? (rowId) =>
+                  setSelectedRowIds((current) =>
+                    current.includes(rowId)
+                      ? current.filter((id) => id !== rowId)
+                      : [...current, rowId],
+                  )
+              : undefined
+          }
+          onToggleAllRows={
+            editable
+              ? (rowIds) =>
+                  setSelectedRowIds((current) => {
+                    const all = rowIds.length > 0 && rowIds.every((id) => current.includes(id));
+                    return all ? [] : [...rowIds];
+                  })
+              : undefined
+          }
         />
       ) : (
         <EmptyState
@@ -2241,6 +2595,19 @@ export function DatabaseView({
         />
       )}
       </div>
+
+      {rowCursor && activeView?.type !== "FORM" ? (
+        <div className="mt-3 flex justify-center">
+          <button
+            type="button"
+            onClick={loadMoreRows}
+            disabled={loadingMoreRows}
+            className="focus-ring rounded-control border border-border bg-bg px-3 py-1.5 text-sm text-fg hover:bg-surface-2 disabled:opacity-60"
+          >
+            {loadingMoreRows ? t(locale, "loading") : t(locale, "loadMore")}
+          </button>
+        </div>
+      ) : null}
 
       {addingProperty && (
         <AddPropertyForm
@@ -2262,6 +2629,17 @@ export function DatabaseView({
           blockedByTitles={(dependencyGraph.nodes.get(shownPeek.id)?.blockedBy ?? []).map(
             (id) => rowsById.get(id)?.title ?? id,
           )}
+          dependencyEditor={
+            editable ? (
+              <LazyRowDependencies
+                locale={locale}
+                databasePageId={databasePageId}
+                currentRowId={shownPeek.id}
+                rows={rows.map((row) => ({ id: row.id, title: row.title }))}
+                edges={allDependencyEdges}
+              />
+            ) : null
+          }
           subItemCount={
             nestSubItems ? subItemChildrenOf(effectiveSubItemRows, shownPeek.id).length : 0
           }
@@ -2273,6 +2651,11 @@ export function DatabaseView({
             effectiveSubItemRows.find((entry) => entry.id === shownPeek.id)?.parentId != null
           }
           onPromote={() => promoteSubIssue(shownPeek.id)}
+          nestTargetTitle={nestTargetFor(shownPeek.id)?.title ?? null}
+          onNest={() => {
+            const target = nestTargetFor(shownPeek.id);
+            if (target) void moveSubIssueRow(shownPeek.id, target.id);
+          }}
           mutualRelations={mutualRelationsFor(shownPeek.id)}
           properties={properties}
           primaryId={primary?.id ?? null}
@@ -2282,6 +2665,13 @@ export function DatabaseView({
           peopleOptions={members ?? []}
           workspaceId={workspaceId}
           editable={editable}
+          layout={viewConfig.propertyLayout}
+          {...(editable
+            ? {
+                onLayoutChange: (next: PropertyLayout) =>
+                  setViewConfig({ propertyLayout: next }),
+              }
+            : {})}
           onChange={(propertyId, value) => setValue(shownPeek.id, propertyId, value)}
           onRenamePrimary={(text) => setPrimary(shownPeek, text)}
         />
@@ -2417,6 +2807,17 @@ export function DatabaseView({
           setRowToDelete(null);
           confirmRemoveRow(target);
         }}
+      />
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        onOpenChange={setBulkDeleteOpen}
+        tone="danger"
+        title={`${t(locale, "deleteRow")} (${selectedRowIds.length})`}
+        description={t(locale, "dbRowTrashed")}
+        confirmLabel={t(locale, "delete")}
+        cancelLabel={t(locale, "cancel")}
+        onConfirm={confirmRemoveSelectedRows}
       />
     </div>
   );

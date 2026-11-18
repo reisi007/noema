@@ -3,12 +3,13 @@
 import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { CalendarDays, ChevronDown, ChevronUp, Plus, Trash2 } from "lucide-react";
+import { CalendarDays, Check, ChevronDown, ChevronUp, Play, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import {
   addMilestoneAction,
   deleteMilestoneAction,
   deleteProjectAction,
+  setPageProjectAction,
   updateMilestoneAction,
   updateProjectAction,
 } from "@/server/actions/projects";
@@ -32,6 +33,7 @@ import { Progress } from "@/components/ui/progress";
 import { Tag } from "@/components/ui/tag";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
 import { LocalTime } from "@/components/local-time";
 
 export type MilestoneRow = {
@@ -77,6 +79,8 @@ export type ProjectDetailData = {
   dueDate: string | null;
   milestones: MilestoneRow[];
   pages: { id: string; title: string; icon: string | null; type: string }[];
+  /** Live pages that can still be attached to this project. */
+  availablePages?: { id: string; title: string; icon: string | null; type: string }[];
   /** Optional ticket roll-up for the "Tickets" section. */
   tickets?: ProjectDetailTicket[];
   /** Optional activity timeline for the "Activity" section. */
@@ -101,6 +105,13 @@ export const MILESTONE_STATUS_TONE: Record<string, BadgeTone> = {
 export function milestoneStatusTone(status: string): BadgeTone {
   return MILESTONE_STATUS_TONE[status] ?? "neutral";
 }
+
+/** planned → in progress → done → planned, the milestone advance cycle. */
+const NEXT_MILESTONE_STATUS: Record<string, "planned" | "in_progress" | "done"> = {
+  planned: "in_progress",
+  in_progress: "done",
+  done: "planned",
+};
 
 /** Milestone-derived progress: done count + whole-percent completion. */
 export function milestoneProgress(
@@ -146,6 +157,8 @@ export function ProjectDetail({
   const [milestoneDue, setMilestoneDue] = useState("");
   const [order, setOrder] = useState<string[]>(() => project.milestones.map((m) => m.id));
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [attachSelected, setAttachSelected] = useState<string[]>([]);
 
   // Keep the local reorder in sync when the server re-renders the project.
   useEffect(() => {
@@ -163,6 +176,19 @@ export function ProjectDetail({
       if (label) toast.success(label);
       router.refresh();
     });
+
+  const attachExistingPages = () => {
+    if (attachSelected.length === 0) return;
+    run("Added to project", async () => {
+      for (const pageId of attachSelected) {
+        const result = await setPageProjectAction(pageId, project.id);
+        if ("error" in result) return { ok: false, message: result.error };
+      }
+      setAttachSelected([]);
+      setAttachOpen(false);
+      return { ok: true };
+    });
+  };
 
   const statusLabel = (value: string) =>
     value === "planned"
@@ -198,15 +224,6 @@ export function ProjectDetail({
       setMilestoneName("");
       setMilestoneDue("");
       return { ok: true };
-    });
-
-  const setMilestoneDone = (milestone: MilestoneRow, done: boolean) =>
-    run(null, async () => {
-      const result = await updateMilestoneAction({
-        milestoneId: milestone.id,
-        status: done ? "done" : "planned",
-      });
-      return "error" in result ? { ok: false, message: result.error } : { ok: true };
     });
 
   const setMilestoneDate = (milestone: MilestoneRow, value: string) =>
@@ -376,15 +393,38 @@ export function ProjectDetail({
             {ordered.map((milestone, index) => (
               <li
                 key={milestone.id}
+                id={`milestone-${milestone.id}`}
                 data-testid="milestone-row"
-                className="flex flex-wrap items-center gap-3 px-3 py-2"
+                className="flex scroll-mt-24 flex-wrap items-center gap-3 px-3 py-2"
               >
-                <Checkbox
-                  checked={milestone.status === "done"}
-                  onCheckedChange={(done) => setMilestoneDone(milestone, done)}
-                  aria-label={`${milestone.name}`}
+                <button
+                  type="button"
+                  aria-label={`${t(locale, "advancePrefix")} ${milestone.name}`}
                   disabled={pending}
-                />
+                  onClick={() =>
+                    run(null, async () => {
+                      const result = await updateMilestoneAction({
+                        milestoneId: milestone.id,
+                        status: NEXT_MILESTONE_STATUS[milestone.status] ?? "planned",
+                      });
+                      return "error" in result ? { ok: false, message: result.error } : { ok: true };
+                    })
+                  }
+                  className={cn(
+                    "grid h-5 w-5 shrink-0 place-items-center rounded-full border focus-ring u-interactive",
+                    milestone.status === "done"
+                      ? "border-transparent bg-success text-action-fg"
+                      : milestone.status === "in_progress"
+                        ? "border-accent text-accent"
+                        : "border-border text-transparent",
+                  )}
+                >
+                  {milestone.status === "done" ? (
+                    <Check className="h-3 w-3" aria-hidden />
+                  ) : milestone.status === "in_progress" ? (
+                    <Play className="h-2.5 w-2.5" aria-hidden />
+                  ) : null}
+                </button>
                 <div className="min-w-0 flex-1">
                   <p
                     className={cn(
@@ -536,12 +576,24 @@ export function ProjectDetail({
       )}
 
       <Section title={`${t(locale, "notesInProject")} · ${project.pages.length}`}>
-        {project.pages.length === 0 ? (
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <p className="text-sm text-muted">
             {t(locale, "attachNotesA")}
             <em>{t(locale, "attachNotesB")}</em>.
           </p>
-        ) : (
+          {project.availablePages && project.availablePages.length > 0 ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              leftIcon={<Plus className="h-3.5 w-3.5" aria-hidden />}
+              onClick={() => setAttachOpen(true)}
+            >
+              Attach existing page
+            </Button>
+          ) : null}
+        </div>
+        {project.pages.length === 0 ? null : (
           <ul className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
             {project.pages.map((page) => (
               <li key={page.id}>
@@ -557,6 +609,54 @@ export function ProjectDetail({
           </ul>
         )}
       </Section>
+
+      <Dialog open={attachOpen} onOpenChange={setAttachOpen}>
+        <DialogContent className="flex max-h-[85vh] max-w-lg flex-col p-4" aria-describedby="attach-pages-help">
+          <h2 className="text-sm font-semibold">Attach existing pages</h2>
+          <p id="attach-pages-help" className="mt-1 text-xs text-muted">
+            The page stays where it is in the sidebar and is also listed in this
+            project.
+          </p>
+          <div className="mt-3 min-h-0 flex-1 space-y-1 overflow-y-auto">
+            {(project.availablePages ?? []).map((page) => (
+              <label
+                key={page.id}
+                className="flex cursor-pointer items-start gap-2 rounded-control px-2 py-1.5 hover:bg-surface-2"
+              >
+                <Checkbox
+                  checked={attachSelected.includes(page.id)}
+                  onCheckedChange={(checked) =>
+                    setAttachSelected((current) =>
+                      checked
+                        ? [...current, page.id]
+                        : current.filter((id) => id !== page.id),
+                    )
+                  }
+                  aria-label={`Attach ${page.title || "Untitled"}`}
+                />
+                <span className="min-w-0 text-sm">
+                  <span aria-hidden>{page.icon ?? "📄"} </span>
+                  {page.title || t(locale, "untitled")}
+                </span>
+              </label>
+            ))}
+          </div>
+          <div className="mt-4 flex justify-end gap-2">
+            <Button type="button" size="sm" variant="secondary" onClick={() => setAttachOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={pending || attachSelected.length === 0}
+              loading={pending}
+              onClick={attachExistingPages}
+            >
+              Attach {attachSelected.length > 0 ? `(${attachSelected.length})` : ""}
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <ProjectRoleEditor projectId={project.id} locale={locale} />
 

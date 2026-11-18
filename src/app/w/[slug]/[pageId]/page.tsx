@@ -1,5 +1,5 @@
 import { Suspense, type ReactNode } from "react";
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import type { PropertyType } from "@prisma/client";
 import { cn } from "@/lib/utils";
 import { prosemirrorToText } from "@/lib/blocks";
@@ -7,6 +7,10 @@ import { prisma } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { t } from "@/lib/i18n";
 import { groupReactions } from "@/lib/comments";
+import {
+  blockTextById,
+  commentAnchorState,
+} from "@/lib/comment-anchors";
 import { getWorkspaceAccess, canPerformWorkspaceAction } from "@/lib/permissions";
 import { pageCapabilities } from "@/lib/page-access";
 import { viewerScopeFor, guestReadablePageIds } from "@/lib/guest-access";
@@ -35,10 +39,15 @@ import type {
 
 export default async function PageRoute({
   params,
+  searchParams,
 }: {
   params: Promise<{ slug: string; pageId: string }>;
+  searchParams?: Promise<{ comment?: string | string[] }>;
 }) {
   const { slug, pageId } = await params;
+  const query = (await searchParams) ?? {};
+  const focusCommentId =
+    typeof query.comment === "string" && query.comment !== "" ? query.comment : undefined;
   const user = await requireUser();
   const locale = user.locale ?? "en";
   const workspace = await getWorkspaceBySlug(slug);
@@ -61,8 +70,17 @@ export default async function PageRoute({
    * after the decision — an out-of-scope page ends in `notFound()` either way.
    */
   const page = await getPageDetail(pageId);
-  if (!page || page.workspaceId !== workspace.id || page.deletedAt) {
+  if (!page || page.workspaceId !== workspace.id) {
     notFound();
+  }
+  // A bookmarked or still-open route to a trashed page is not a 404: send the
+  // visitor to the parent when possible, else the workspace home.
+  if (page.deletedAt) {
+    redirect(
+      page.parentId
+        ? `/w/${workspace.slug}/${page.parentId}`
+        : `/w/${workspace.slug}`,
+    );
   }
 
   /**
@@ -114,7 +132,7 @@ export default async function PageRoute({
   );
 
   const [database, breadcrumbTrail, following, databases, userWorkspaces, members, pagePermissions, teamspaces, versionLabels] = await Promise.all([
-    page.type === "DATABASE" ? getDatabase(page.id, guestReadScope) : Promise.resolve(null),
+    page.type === "DATABASE" ? getDatabase(page.id, guestReadScope, { rowLimit: 100 }) : Promise.resolve(null),
     getAncestorTrail(workspace.id, page.id),
     prisma.pageFollow.findUnique({
       where: { userId_pageId: { userId: user.id, pageId: page.id } },
@@ -186,6 +204,16 @@ export default async function PageRoute({
     id: c.id,
     body: c.body,
     quote: c.quote,
+    blockId: c.blockId,
+    anchorFrom: c.anchorFrom,
+    anchorTo: c.anchorTo,
+    anchorState: commentAnchorState({
+      blockId: c.blockId,
+      blockText: c.blockId ? blockTextById(page.content, c.blockId) : null,
+      from: c.anchorFrom,
+      to: c.anchorTo,
+      quote: c.quote,
+    }),
     resolved: c.resolved,
     createdAt: c.createdAt.toISOString(),
     author: c.author,
@@ -198,6 +226,29 @@ export default async function PageRoute({
       reactions: groupReactions(r.reactions, user.id),
     })),
   }));
+
+  /**
+   * Persisted exact ranges for the editor's decoration layer. Only `valid`
+   * anchors are passed: a stale quote must not paint the wrong sentence. The
+   * editor re-checks each range against the live document anyway, so a local
+   * edit between render and mount cannot resurrect a stale highlight.
+   */
+  const commentAnchors = comments.flatMap((comment) =>
+    comment.anchorState === "valid" &&
+    comment.blockId &&
+    comment.anchorFrom !== null &&
+    comment.anchorTo !== null
+      ? [
+          {
+            commentId: comment.id,
+            blockId: comment.blockId,
+            from: comment.anchorFrom,
+            to: comment.anchorTo,
+            quote: comment.quote,
+          },
+        ]
+      : [],
+  );
 
   let surface: ReactNode;
   if (database) {
@@ -233,6 +284,8 @@ export default async function PageRoute({
             updatedAt: r.updatedAt.toISOString(),
             createdByName: r.createdBy?.name ?? null,
             lastEditedByName: database.lastEditedBy[r.id] ?? r.createdBy?.name ?? null,
+            subOfId: r.subOfId,
+            position: r.position,
             propertyValues: r.propertyValues.map((pv) => ({
               propertyId: pv.propertyId,
               value: pv.value,
@@ -241,6 +294,11 @@ export default async function PageRoute({
         }
         members={members.map((member) => ({ id: member.id, name: member.name }))}
         editable={editable}
+        nextRowCursor={database.nextRowCursor}
+        dependencyEdges={database.dependencies.map((edge) => ({
+          from: edge.blockerId,
+          to: edge.blockedId,
+        }))}
         schemaLocked={page.schemaLocked}
       />
     );
@@ -255,6 +313,7 @@ export default async function PageRoute({
         workspaceSlug={workspace.slug}
         breadcrumbTrail={breadcrumbTrail}
         initialContent={page.content}
+        commentAnchors={commentAnchors}
         editable={editable}
       />
     );
@@ -355,9 +414,12 @@ export default async function PageRoute({
       <DeferredCommentPanel
           locale={locale}
         pageId={page.id}
+        workspaceId={workspace.id}
+        workspaceSlug={slug}
         comments={comments}
         currentUserId={user.id}
         canComment={canComment}
+        focusCommentId={focusCommentId}
       />
     </div>
   );

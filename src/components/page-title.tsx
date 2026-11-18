@@ -21,15 +21,18 @@ import {
   Move,
   Redo2,
   Smile,
+  SpellCheck,
   Star,
   Trash2,
   Undo2,
   Upload,
 } from "lucide-react";
+import { UndoHistoryControl } from "@/components/undo-history";
 import {
   archivePageAction,
   getPageContentAction,
   movePageAction,
+  restorePageAction,
   toggleFavoriteAction,
   toggleFollowAction,
   transferPageAction,
@@ -64,6 +67,12 @@ import {
   type TopbarMember,
 } from "@/components/topbar/avatar-stack";
 import { useUndoRedo } from "@/components/providers/undo-redo-provider";
+import {
+  AUTOCORRECT_EVENT,
+  focusPageBody,
+  readAutocorrectPreference,
+  writeAutocorrectPreference,
+} from "@/lib/editor-events";
 import {
   describeLastEdited,
   lastEditor,
@@ -104,6 +113,7 @@ import { DUR, Z } from "@/lib/design-tokens";
 import { t } from "@/lib/i18n";
 import { estimateTextWidth } from "@/lib/text-measure";
 import { cn } from "@/lib/utils";
+import { contentDirProps } from "@/lib/bidi";
 import { toast } from "sonner";
 
 import {
@@ -163,6 +173,9 @@ export type PageTitleRowProps = {
   following: boolean;
   followPending?: boolean;
   starPopped?: boolean;
+  /** Per-page automatic typo correction; absent hides the toggle. */
+  autocorrect?: boolean;
+  onToggleAutocorrect?: () => void;
   scrolled: boolean;
   showStickyTitle: boolean;
   editedLabel?: string | null;
@@ -219,6 +232,8 @@ export function PageTitleRow({
   following,
   followPending = false,
   starPopped = false,
+  autocorrect,
+  onToggleAutocorrect,
   scrolled,
   showStickyTitle,
   editedLabel,
@@ -247,6 +262,11 @@ export function PageTitleRow({
 }: PageTitleRowProps) {
   const { visible, overflow } = layoutHeaderBreadcrumbs(crumbs, breadcrumbWidth);
   const displayTitle = title.trim() || "Untitled";
+  // The title is user-authored: lay it out on its own base direction so a
+  // Hebrew/Arabic name in an English page (or a Latin name in `ar`) keeps its
+  // punctuation on the correct side. An empty title stays `auto` and follows
+  // the document direction.
+  const titleDirection = contentDirProps(title);
   const iconStyle = pageIconToCss(icon);
 
   return (
@@ -375,7 +395,13 @@ export function PageTitleRow({
                   {icon.value}
                 </span>
               )}
-              <span className="truncate text-sm font-semibold tracking-title text-fg">
+              <span
+                dir={titleDirection.dir}
+                className={cn(
+                  "truncate text-sm font-semibold tracking-title text-fg",
+                  titleDirection.className,
+                )}
+              >
                 {displayTitle}
               </span>
             </span>
@@ -453,6 +479,21 @@ export function PageTitleRow({
               aria-hidden
             />
           </button>
+          {onToggleAutocorrect ? (
+            <button
+              type="button"
+              aria-label={autocorrect ? "Turn autocorrect off" : "Turn autocorrect on"}
+              aria-pressed={autocorrect === true}
+              title={autocorrect ? "Autocorrect is on" : "Autocorrect is off"}
+              onClick={onToggleAutocorrect}
+              className={cn(
+                "focus-ring u-interactive flex h-8 w-8 items-center justify-center rounded-control text-muted hover:bg-surface-2 sm:h-7 sm:w-7",
+                autocorrect && "bg-surface-2 text-fg",
+              )}
+            >
+              <SpellCheck className="h-4 w-4" aria-hidden />
+            </button>
+          ) : null}
           {undoRedo ? (
             <div
               className={cn(
@@ -535,10 +576,11 @@ export function PageTitleRow({
               aria-label={t(locale, "pageTitle")}
               aria-roledescription={t(locale, "pageTitleRoleDescription")}
               value={title}
+              dir={titleDirection.dir}
               readOnly={!canEdit}
               placeholder={t(locale, "untitled")}
               rows={1}
-              spellCheck={false}
+              spellCheck
               onChange={(event) => {
                 onTitleChange(event.target.value);
                 event.target.style.height = "auto";
@@ -619,6 +661,7 @@ export function PageTitle({
   // placeholder do its job; `saveTitle` never writes an empty title back, so the
   // page keeps the name it was created with until something real is typed.
   const [title, setTitle] = useState(initialTitle === t(locale, "untitled") ? "" : initialTitle);
+  const [autocorrect, setAutocorrect] = useState(false);
   const [icon, setIcon] = useState(initialIcon);
   const [cover, setCover] = useState(initialCover);
   const [favorite, setFavorite] = useState(initialFavorite);
@@ -666,6 +709,24 @@ export function PageTitle({
   const coverFileRef = useRef<HTMLInputElement | null>(null);
   const titleRef = useRef<HTMLTextAreaElement | null>(null);
   const h1Ref = useRef<HTMLHeadingElement | null>(null);
+
+  // Autocorrect is per page and off by default. localStorage is the right
+  // scope here: it follows the page across reloads but never leaks into a
+  // shared server preference.
+  useEffect(() => {
+    setAutocorrect(readAutocorrectPreference(pageId));
+  }, [pageId]);
+
+  const toggleAutocorrect = () => {
+    const next = !autocorrect;
+    setAutocorrect(next);
+    writeAutocorrectPreference(pageId, next);
+    // The editor restores the preference on mount; the live toggle must also
+    // reach the already-mounted extension or it only takes effect on reload.
+    window.dispatchEvent(
+      new CustomEvent(AUTOCORRECT_EVENT, { detail: { enabled: next } }),
+    );
+  };
   // The in-page `h1`'s offset inside the scroll container, cached so each scroll
   // tick compares against a stable threshold (re-measured on resize / cover swap).
   const h1TopRef = useRef(Number.POSITIVE_INFINITY);
@@ -689,7 +750,17 @@ export function PageTitle({
   const font = appearance.font;
 
   // Global undo/redo (mounted by the root layout) drives the topbar controls.
-  const { canUndo, canRedo, undo: undoGlobal, redo: redoGlobal } = useUndoRedo();
+  const {
+    canUndo,
+    canRedo,
+    history,
+    undo: undoGlobal,
+    redo: redoGlobal,
+    undoTo: undoGlobalTo,
+    redoTo: redoGlobalTo,
+    push: pushGlobal,
+  } = useUndoRedo();
+
   // Workspace members → the presence/avatar stack model (src/lib/avatars.ts).
   const avatarUsers = useMemo(() => toAvatarUsers(members), [members]);
 
@@ -837,31 +908,78 @@ export function PageTitle({
   // appearance state above; no localStorage layer remains. A server
   // `initialAppearance` still wins when present.
 
-  const save = (patch: Record<string, unknown>, revalidate = true) =>
+  const recordEffectUndo = (
+    label: string,
+    onUndo: () => void | Promise<void>,
+    onRedo: () => void | Promise<void>,
+  ) =>
+    pushGlobal({
+      id: crypto.randomUUID(),
+      label,
+      apply: (state) => state,
+      invert: (state) => state,
+      at: Date.now(),
+      onUndo,
+      onRedo,
+    });
+
+  const recordPageUndo = (
+    label: string,
+    undoPatch: Record<string, unknown>,
+    redoPatch: Record<string, unknown>,
+  ) =>
+    recordEffectUndo(
+      label,
+      async () => {
+        await updatePageAction(pageId, undoPatch);
+        router.refresh();
+      },
+      async () => {
+        await updatePageAction(pageId, redoPatch);
+        router.refresh();
+      },
+    );
+
+  const save = (
+    patch: Record<string, unknown>,
+    revalidate = true,
+    after?: () => void,
+  ) =>
     startTransition(async () => {
-      await updatePageAction(pageId, patch);
+      const result = await updatePageAction(pageId, patch);
+      if (!("error" in result)) after?.();
       if (revalidate) router.refresh();
     });
 
   const saveTitle = () => {
-    if (!canEdit || title === initialTitle) return;
+    const previous = initialTitle === t(locale, "untitled") ? "" : initialTitle;
+    if (!canEdit || title === previous) return;
     // A page is never nameless: abandoning the field leaves the placeholder (and
     // the stored name) alone rather than writing an empty title, which would also
     // mark the page as edited for a keystroke that never happened.
     if (!title.trim()) return;
-    save({ title });
+    const next = title;
+    save({ title: next }, true, () =>
+      recordPageUndo("Rename page", { title: previous }, { title: next }),
+    );
   };
 
   const pickIcon = (emoji: string) => {
+    const previous = icon;
     setIcon(emoji);
     setShowEmoji(false);
-    save({ icon: emoji });
+    save({ icon: emoji }, true, () =>
+      recordPageUndo("Change page icon", { icon: previous }, { icon: emoji }),
+    );
   };
 
   const pickCover = (value: string | null) => {
+    const previous = cover;
     setCover(value);
     setShowCover(false);
-    save({ coverUrl: value });
+    save({ coverUrl: value }, true, () =>
+      recordPageUndo("Change page cover", { coverUrl: previous }, { coverUrl: value }),
+    );
   };
 
   /**
@@ -935,8 +1053,20 @@ export function PageTitle({
     window.setTimeout(() => setStarPopped(false), DUR.slow);
     startTransition(async () => {
       const result = await toggleFavoriteAction(workspaceId, pageId);
-      if ("ok" in result) setFavorite(result.favorite);
-      else toast.error(result.error);
+      if ("ok" in result) {
+        setFavorite(result.favorite);
+        recordEffectUndo(
+          "Favorite page",
+          async () => {
+            await toggleFavoriteAction(workspaceId, pageId);
+            router.refresh();
+          },
+          async () => {
+            await toggleFavoriteAction(workspaceId, pageId);
+            router.refresh();
+          },
+        );
+      } else toast.error(result.error);
       router.refresh();
     });
   };
@@ -1033,8 +1163,20 @@ export function PageTitle({
 
   const moveTo = (targetId: string | null) =>
     startTransition(async () => {
+      const previousParent = breadcrumbTrail.at(-1)?.id ?? null;
       const result = await movePageAction(pageId, targetId);
       if ("ok" in result) {
+        recordEffectUndo(
+          "Move page",
+          async () => {
+            await movePageAction(pageId, previousParent);
+            router.refresh();
+          },
+          async () => {
+            await movePageAction(pageId, targetId);
+            router.refresh();
+          },
+        );
         toast.success("Page moved");
         router.refresh();
       } else {
@@ -1044,10 +1186,30 @@ export function PageTitle({
 
   const trash = () =>
     startTransition(async () => {
-      await archivePageAction(pageId);
+      const result = await archivePageAction(pageId);
+      if ("error" in result) {
+        toast.error(result.error);
+        return;
+      }
+      recordEffectUndo(
+        "Move page to trash",
+        async () => {
+          await restorePageAction(pageId);
+          router.refresh();
+        },
+        async () => {
+          await archivePageAction(pageId);
+          router.refresh();
+        },
+      );
       toast.success("Moved to trash");
-      router.push(`/w/${workspaceSlug}`);
-      router.refresh();
+      // The page being viewed is now gone. Leave its route before a refresh can
+      // render the deleted page as a 404: go to the parent when there is one,
+      // otherwise the workspace home.
+      const parentId = breadcrumbTrail.at(-1)?.id ?? null;
+      router.push(
+        parentId ? `/w/${workspaceSlug}/${parentId}` : `/w/${workspaceSlug}`,
+      );
     });
 
   const undoEditor = () => {
@@ -1125,11 +1287,15 @@ export function PageTitle({
     } else if (key === "fullWidth") {
       const next = !fullWidth;
       setFullWidth(next);
-      save({ fullWidth: next });
+      save({ fullWidth: next }, true, () =>
+        recordPageUndo("Page width", { fullWidth }, { fullWidth: next }),
+      );
     } else {
       const next = !locked;
       setLocked(next);
-      save({ locked: next });
+      save({ locked: next }, true, () =>
+        recordPageUndo("Page lock", { locked }, { locked: next }),
+      );
     }
   };
 
@@ -1180,6 +1346,8 @@ export function PageTitle({
         following={following}
         followPending={followPending}
         starPopped={starPopped}
+        autocorrect={autocorrect}
+        onToggleAutocorrect={toggleAutocorrect}
         scrolled={scrolled}
         showStickyTitle={showStickyTitle}
         locale={locale}
@@ -1189,9 +1357,11 @@ export function PageTitle({
         onTitleChange={setTitle}
         onTitleBlur={saveTitle}
         onTitleKeyDown={(event) => {
-          if (event.key === "Enter") {
+          if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             titleRef.current?.blur();
+            // Let the blur/save commit, then hand the caret to the body.
+            window.setTimeout(focusPageBody, 0);
           }
         }}
         onToggleIcon={() => setShowEmoji((value) => !value)}
@@ -1325,6 +1495,12 @@ export function PageTitle({
             >
               <Redo2 className="h-4 w-4" aria-hidden />
             </button>
+            <UndoHistoryControl
+              entries={history}
+              locale={locale}
+              onUndoTo={undoGlobalTo}
+              onRedoTo={redoGlobalTo}
+            />
           </div>
         }
         actions={

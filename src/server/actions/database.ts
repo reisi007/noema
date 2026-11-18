@@ -1,9 +1,11 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { headers } from "next/headers";
 import { randomUUID } from "node:crypto";
 import type { Prisma, PropertyType } from "@prisma/client";
 import { prisma } from "@/lib/db";
+import { logActivity } from "@/lib/activity";
 import { pageSearchText } from "@/lib/search";
 import { requireUser, type SessionUser } from "@/lib/auth";
 import {
@@ -13,6 +15,7 @@ import {
 import { pageCapabilitiesFromRelation, type PageCapabilities } from "@/lib/page-access";
 import { guestReadablePageIds } from "@/lib/guest-access";
 import { canEditSchema, type LockRole } from "@/lib/database-lock";
+import { wouldCreateCycle, type DependencyEdge } from "@/lib/dependencies";
 import { assertEditableParent } from "@/lib/page-parent";
 import { csvToMatrix } from "@/lib/serialize";
 import { coerceCsvValue, type CsvPropertyConfig } from "@/lib/csv-value-coercion";
@@ -24,12 +27,45 @@ import {
   validateCopy,
   type DatabaseStructure,
 } from "@/lib/database-copy";
-import { initializeRowValues } from "@/lib/property-defaults";
 import { dispatchWebhooks } from "@/lib/webhooks";
-import { nextRunFor } from "@/lib/recurrence";
+import {
+  nextRunForSchedule,
+  normalizeTemplateRecurrence,
+  templateAnchorFromConfig,
+  templateScheduleAnchor,
+  validateTemplateScheduleInput,
+} from "@/lib/template-schedule";
+import type { TemplateRecurrence } from "@/lib/recurrence";
+import { materializeTemplateRow } from "@/server/template-materialization";
 import { ORDER_STEP } from "@/lib/row-order";
-import { formatUniqueId, nextNumbers, type UniqueIdConfig } from "@/lib/unique-id";
+import { createRowCellsInTransaction } from "@/server/row-cells";
 import { fileUrlsAreAppOwned } from "@/lib/validation";
+import { validateCell } from "@/lib/cell-validation";
+import {
+  buildInverseBackfill,
+  normalizeRelationConfig,
+  normalizeRelationPageIds,
+  nextInversePageIds,
+} from "@/lib/relation-config";
+import { normalizeRollupConfig, validateRollupConfig } from "@/lib/rollup-config";
+import { parseFormula } from "@/lib/formula";
+import { decodeCursor } from "@/lib/cursor-pagination";
+import { getDatabase } from "@/server/queries/database";
+import {
+  buildFormSchema,
+  isAnswerablePropertyType,
+  parseFormSchema,
+  toRowValues,
+  validateFormSchema,
+  validateSubmission,
+  type FormSchema,
+} from "@/lib/form-view";
+import {
+  checkRateLimit,
+  checkUserRateLimit,
+  clientKeyFromHeaders,
+  userKey,
+} from "@/lib/rate-limit";
 
 type Result<T = unknown> = ({ ok: true } & T) | { error: string };
 
@@ -277,92 +313,6 @@ function revalidateDatabase(workspaceId: string) {
  * ID property (a property added later only allocates on the next row created).
  */
 
-/**
- * Does a stored property config carry an authored `default`? `initializeRowValues`
- * also yields empty container shapes for CHECKBOX, MULTI_SELECT, PEOPLE and FILES
- * even when no default was configured; a new row should only be seeded when
- * someone actually authored one, so this gates that call. Mirrors `readDefault`
- * in `property-options-editor.tsx` (`"default" in config`).
- */
-function hasConfiguredDefault(config: Prisma.JsonValue | null): boolean {
-  return (
-    !!config &&
-    typeof config === "object" &&
-    !Array.isArray(config) &&
-    "default" in config
-  );
-}
-
-/** The `config.uniqueId` block of a property, or `{}` when absent/malformed. */
-function readUniqueIdConfig(
-  config: Prisma.JsonValue | null,
-): Partial<UniqueIdConfig> {
-  if (!config || typeof config !== "object" || Array.isArray(config)) return {};
-  const uniqueId = (config as { uniqueId?: unknown }).uniqueId;
-  if (!uniqueId || typeof uniqueId !== "object" || Array.isArray(uniqueId)) return {};
-  return uniqueId as Partial<UniqueIdConfig>;
-}
-
-/**
- * Every id-shaped string a stored UNIQUE_ID cell contributes to `nextNumbers`.
- * Mirrors `uniqueIdNumber` in `view-parts.tsx`: the counter may live under any
- * of these keys, as a number or a digits-only string. Unparseable entries are
- * handed on unchanged — `nextNumbers` ignores them rather than throwing.
- */
-function existingUniqueIds(
-  values: (Prisma.JsonValue | null)[],
-  config: UniqueIdConfig,
-): string[] {
-  const out: string[] = [];
-  for (const value of values) {
-    if (typeof value === "string") {
-      out.push(value);
-      continue;
-    }
-    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-    const record = value as Record<string, unknown>;
-    for (const key of ["number", "value", "text", "id"] as const) {
-      const candidate = record[key];
-      if (typeof candidate === "string") {
-        out.push(candidate);
-      } else if (
-        typeof candidate === "number" &&
-        Number.isInteger(candidate) &&
-        candidate >= 1
-      ) {
-        out.push(formatUniqueId(config, candidate));
-      }
-    }
-  }
-  return out;
-}
-
-/** Allocate the next Unique ID for one property inside a row-create transaction. */
-async function allocateUniqueIdValue(
-  tx: Prisma.TransactionClient,
-  propertyId: string,
-  config: Partial<UniqueIdConfig>,
-): Promise<Prisma.InputJsonValue> {
-  const rows = await tx.propertyValue.findMany({
-    where: { propertyId },
-    select: { value: true },
-  });
-  // Resolve defaults exactly like the read-only cell so storage and display
-  // never disagree; the engine sanitises any malformed optional field.
-  const resolved: UniqueIdConfig = {
-    prefix: typeof config.prefix === "string" ? config.prefix : "",
-    ...(typeof config.zeroPad === "number" ? { zeroPad: config.zeroPad } : {}),
-    ...(typeof config.startAt === "number" ? { startAt: config.startAt } : {}),
-    ...(typeof config.separator === "string" ? { separator: config.separator } : {}),
-  };
-  const existing = existingUniqueIds(
-    rows.map((row) => row.value),
-    resolved,
-  );
-  const number = nextNumbers(resolved, existing, 1)[0];
-  return { number, text: formatUniqueId(resolved, number) };
-}
-
 export async function createPropertyAction(
   databasePageId: string,
   name: string,
@@ -388,7 +338,7 @@ export async function createPropertyAction(
         : type === "FORMULA"
           ? { expression: "" }
           : type === "RELATION"
-            ? { targetDatabaseId: null }
+            ? { targetDatabaseId: null, multi: true, inversePropertyId: null }
             : type === "ROLLUP"
               ? { relationPropertyId: null, targetPropertyId: null, function: "count" }
               : {};
@@ -413,7 +363,7 @@ export async function updatePropertyAction(
 ): Promise<Result> {
   const property = await prisma.property.findUnique({
     where: { id: propertyId },
-    select: { databasePageId: true },
+    select: { databasePageId: true, type: true, config: true },
   });
   if (!property) return { error: "Property not found." };
   const auth = await authorizeDatabase(property.databasePageId);
@@ -422,25 +372,154 @@ export async function updatePropertyAction(
   const schemaDenied = schemaLockDenied(auth);
   if (schemaDenied) return schemaDenied;
 
-  // B98 — the relation target must be a database of this workspace. The id is
-  // normalized once (in `relationTargetOf`), so the id that is checked here is
-  // the id that is stored below.
-  const { target, config: relationConfig } = relationTargetOf(patch.config);
-  if (target !== undefined) {
-    const allowed =
-      target !== null && (await relationTargetAllowed(target, auth.page.workspaceId));
-    if (!allowed) return { error: "Database not found." };
+  let nextConfig = patch.config;
+  let inverseSync: { id: string; config: Prisma.InputJsonValue } | null = null;
+
+  if (patch.config !== undefined) {
+    if (property.type === "RELATION") {
+      // R21.1/R21.2 - store the canonical relation shape and refuse a target
+      // that is not a live database of this workspace. The trimmed id that is
+      // checked is the id that is stored.
+      const normalized = normalizeRelationConfig(patch.config);
+      if (normalized.targetDatabaseId !== null) {
+        const allowed = await relationTargetAllowed(
+          normalized.targetDatabaseId,
+          auth.page.workspaceId,
+        );
+        if (!allowed) return { error: "Database not found." };
+      }
+
+      // A reciprocal id is only meaningful while it names a RELATION property
+      // of this relation's target database that points back here. A stale id
+      // is refused rather than persisted (the pair action clears/creates it).
+      if (normalized.inversePropertyId !== null) {
+        const target = normalized.targetDatabaseId;
+        if (target === null) return { error: "Configure the relation first." };
+        const inverse = await prisma.property.findFirst({
+          where: {
+            id: normalized.inversePropertyId,
+            databasePageId: target,
+            type: "RELATION",
+          },
+          select: { id: true, config: true },
+        });
+        const inverseConfig = normalizeRelationConfig(inverse?.config);
+        if (!inverse || inverseConfig.targetDatabaseId !== property.databasePageId) {
+          return { error: "Relation pair not found." };
+        }
+        if (
+          inverseConfig.inversePropertyId !== null &&
+          inverseConfig.inversePropertyId !== propertyId
+        ) {
+          return { error: "Relation pair not found." };
+        }
+        // Repair a half-pair and keep cardinality coherent: changing one side
+        // must not leave the reciprocal column pointing elsewhere or on a
+        // different setting.
+        if (
+          inverseConfig.inversePropertyId !== propertyId ||
+          inverseConfig.multi !== normalized.multi
+        ) {
+          inverseSync = {
+            id: inverse.id,
+            config: {
+              ...inverseConfig,
+              inversePropertyId: propertyId,
+              multi: normalized.multi,
+            } as Prisma.InputJsonValue,
+          };
+        }
+      }
+      nextConfig = normalized;
+    } else if (property.type === "ROLLUP") {
+      // R21.10 - validate the triple against the live schema before storing it.
+      const normalized = normalizeRollupConfig(patch.config);
+      const relation = normalized.relationPropertyId
+        ? await prisma.property.findFirst({
+            where: {
+              id: normalized.relationPropertyId,
+              databasePageId: property.databasePageId,
+              type: "RELATION",
+            },
+            select: { id: true, name: true, type: true, config: true },
+          })
+        : null;
+      const targetDatabaseId = normalizeRelationConfig(relation?.config)
+        .targetDatabaseId;
+      if (targetDatabaseId) {
+        const targetDatabase = await prisma.page.findFirst({
+          where: {
+            id: targetDatabaseId,
+            workspaceId: auth.page.workspaceId,
+            type: "DATABASE",
+            deletedAt: null,
+          },
+          select: { id: true },
+        });
+        if (!targetDatabase) return { error: "Database not found." };
+      }
+      const targetProperties = targetDatabaseId
+        ? await prisma.property.findMany({
+            where: { databasePageId: targetDatabaseId },
+            select: { id: true, name: true, type: true, config: true },
+          })
+        : [];
+      const properties = [
+        ...(relation
+          ? [{ ...relation, databaseId: property.databasePageId }]
+          : []),
+        ...targetProperties.map((candidate) => ({
+          ...candidate,
+          databaseId: targetDatabaseId ?? undefined,
+        })),
+      ];
+      const issues = validateRollupConfig(normalized, properties);
+      if (issues.length > 0) return { error: issues[0].message };
+      const raw = (patch.config ?? {}) as Record<string, unknown>;
+      nextConfig = {
+        relationPropertyId: normalized.relationPropertyId,
+        targetPropertyId: normalized.targetPropertyId,
+        function: normalized.aggregateFn,
+        ...(typeof raw.separator === "string" ? { separator: raw.separator } : {}),
+      };
+    } else if (property.type === "FORMULA") {
+      // R21.15 - an unparseable expression is never persisted. The editor uses
+      // the same parser for its live error line.
+      const raw = (patch.config ?? {}) as Record<string, unknown>;
+      const expression = typeof raw.expression === "string" ? raw.expression : "";
+      const parsed = parseFormula(expression);
+      if (!parsed.ok) return { error: parsed.error };
+      nextConfig = { ...raw, expression };
+    }
   }
 
-  await prisma.property.update({
-    where: { id: propertyId },
-    data: {
-      ...(patch.name !== undefined ? { name: patch.name.slice(0, 80) } : {}),
-      ...(patch.config !== undefined
-        ? { config: relationConfig as Prisma.InputJsonValue }
-        : {}),
-    },
-  });
+  if (inverseSync) {
+    await prisma.$transaction(async (tx) => {
+      await tx.property.update({
+        where: { id: propertyId },
+        data: {
+          ...(patch.name !== undefined ? { name: patch.name.slice(0, 80) } : {}),
+          ...(nextConfig !== undefined
+            ? { config: nextConfig as Prisma.InputJsonValue }
+            : {}),
+        },
+      });
+      await tx.property.update({
+        where: { id: inverseSync.id },
+        data: { config: inverseSync.config },
+      });
+    });
+  } else {
+    await prisma.property.update({
+      where: { id: propertyId },
+      data: {
+        ...(patch.name !== undefined ? { name: patch.name.slice(0, 80) } : {}),
+        ...(nextConfig !== undefined
+          ? { config: nextConfig as Prisma.InputJsonValue }
+          : {}),
+      },
+    });
+  }
   revalidateDatabase(auth.page.workspaceId);
   return { ok: true };
 }
@@ -632,9 +711,205 @@ export async function setPropertyValueAction(
   // id — no existence oracle.
   const property = await prisma.property.findFirst({
     where: { id: propertyId, databasePageId: auth.page.id },
-    select: { id: true },
+    select: { id: true, type: true, config: true },
   });
   if (!property) return { error: "Property not found." };
+
+  if (property.type === "RELATION") {
+    // R21.3 - a relation value is not an arbitrary id list. The target must be
+    // configured, every id must resolve to a live row of that target database
+    // in this workspace, and a single relation is clamped to its first id.
+    const config = normalizeRelationConfig(property.config);
+    if (!config.targetDatabaseId) return { error: "Configure the relation first." };
+    const target = await prisma.page.findFirst({
+      where: {
+        id: config.targetDatabaseId,
+        workspaceId: row.workspaceId,
+        type: "DATABASE",
+        deletedAt: null,
+      },
+      select: { id: true },
+    });
+    if (!target) return { error: "Database not found." };
+
+    const requested = normalizeRelationPageIds(value, true);
+    if (requested === null) return { error: "Relation value is not valid." };
+    // A row can never link itself, even in a self-relation.
+    const candidates = requested.filter((id) => id !== rowPageId);
+    const rows = candidates.length
+      ? await prisma.page.findMany({
+          where: {
+            id: { in: candidates },
+            parentId: target.id,
+            workspaceId: row.workspaceId,
+            deletedAt: null,
+          },
+          select: { id: true },
+        })
+      : [];
+    const valid = new Set(rows.map((entry) => entry.id));
+    const nextIds = candidates.filter((id) => valid.has(id));
+    const clamped = config.multi ? nextIds : nextIds.slice(0, 1);
+
+    const touched = await prisma.$transaction(async (tx) => {
+      const current = await tx.propertyValue.findUnique({
+        where: { propertyId_pageId: { propertyId, pageId: rowPageId } },
+        select: { value: true },
+      });
+      const currentIds = normalizeRelationPageIds(current?.value, true) ?? [];
+      await tx.propertyValue.upsert({
+        where: { propertyId_pageId: { propertyId, pageId: rowPageId } },
+        create: {
+          propertyId,
+          pageId: rowPageId,
+          value: { pageIds: clamped } as Prisma.InputJsonValue,
+        },
+        update: { value: { pageIds: clamped } as Prisma.InputJsonValue },
+      });
+
+      const affected = new Set<string>([rowPageId]);
+      if (config.inversePropertyId) {
+        const inverse = await tx.property.findFirst({
+          where: {
+            id: config.inversePropertyId,
+            databasePageId: target.id,
+            type: "RELATION",
+          },
+          select: { id: true, config: true },
+        });
+        if (inverse) {
+          const inverseConfig = normalizeRelationConfig(inverse.config);
+          if (
+            inverseConfig.targetDatabaseId !== auth.page.id ||
+            (inverseConfig.inversePropertyId !== null &&
+              inverseConfig.inversePropertyId !== property.id)
+          ) {
+            // A stale half-pair must not receive reciprocal writes. The source
+            // write still lands; the pair can be repaired from the header.
+            return [...affected];
+          }
+          const inverseMulti = inverseConfig.multi;
+          const added = clamped.filter((id) => !currentIds.includes(id));
+          const removed = currentIds.filter((id) => !clamped.includes(id));
+
+          for (const targetRowId of added) {
+            const existing = await tx.propertyValue.findUnique({
+              where: {
+                propertyId_pageId: { propertyId: inverse.id, pageId: targetRowId },
+              },
+              select: { value: true },
+            });
+            const previousSources =
+              normalizeRelationPageIds(existing?.value, true) ?? [];
+
+            // A single reciprocal keeps one source. Detach the target from any
+            // other source row first, so both stored sides stay symmetric.
+            if (!inverseMulti) {
+              for (const otherSource of previousSources) {
+                if (otherSource === rowPageId || otherSource === targetRowId) continue;
+                const otherRow = await tx.page.findFirst({
+                  where: {
+                    id: otherSource,
+                    parentId: auth.page.id,
+                    workspaceId: row.workspaceId,
+                    deletedAt: null,
+                  },
+                  select: { id: true },
+                });
+                if (!otherRow) continue;
+                const otherCell = await tx.propertyValue.findUnique({
+                  where: {
+                    propertyId_pageId: { propertyId, pageId: otherSource },
+                  },
+                  select: { value: true },
+                });
+                if (!otherCell) continue;
+                const otherIds = normalizeRelationPageIds(otherCell.value, true) ?? [];
+                await tx.propertyValue.upsert({
+                  where: {
+                    propertyId_pageId: { propertyId, pageId: otherSource },
+                  },
+                  create: {
+                    propertyId,
+                    pageId: otherSource,
+                    value: { pageIds: otherIds } as Prisma.InputJsonValue,
+                  },
+                  update: {
+                    value: {
+                      pageIds: otherIds.filter((id) => id !== targetRowId),
+                    } as Prisma.InputJsonValue,
+                  },
+                });
+                affected.add(otherSource);
+              }
+            }
+
+            const inverseNext = nextInversePageIds(
+              existing?.value,
+              rowPageId,
+              "add",
+              inverseMulti,
+            );
+            await tx.propertyValue.upsert({
+              where: {
+                propertyId_pageId: { propertyId: inverse.id, pageId: targetRowId },
+              },
+              create: {
+                propertyId: inverse.id,
+                pageId: targetRowId,
+                value: { pageIds: inverseNext } as Prisma.InputJsonValue,
+              },
+              update: { value: { pageIds: inverseNext } as Prisma.InputJsonValue },
+            });
+            affected.add(targetRowId);
+          }
+
+          for (const targetRowId of removed) {
+            const existing = await tx.propertyValue.findUnique({
+              where: {
+                propertyId_pageId: { propertyId: inverse.id, pageId: targetRowId },
+              },
+              select: { value: true },
+            });
+            if (!existing) continue;
+            const inverseNext = nextInversePageIds(
+              existing.value,
+              rowPageId,
+              "remove",
+              inverseMulti,
+            );
+            await tx.propertyValue.upsert({
+              where: {
+                propertyId_pageId: { propertyId: inverse.id, pageId: targetRowId },
+              },
+              create: {
+                propertyId: inverse.id,
+                pageId: targetRowId,
+                value: { pageIds: inverseNext } as Prisma.InputJsonValue,
+              },
+              update: { value: { pageIds: inverseNext } as Prisma.InputJsonValue },
+            });
+            affected.add(targetRowId);
+          }
+        }
+      }
+      return [...affected];
+    });
+
+    // One activity line per row a two-way write changed, so both sides surface
+    // the edit in LAST_EDITED_BY. The write above is already atomic.
+    for (const targetId of touched) {
+      await logActivity({
+        workspaceId: row.workspaceId,
+        actorId: auth.user.id,
+        action: "row.edited",
+        targetType: "page",
+        targetId,
+      });
+    }
+    revalidateDatabase(row.workspaceId);
+    return { ok: true };
+  }
 
   await prisma.propertyValue.upsert({
     where: { propertyId_pageId: { propertyId, pageId: rowPageId } },
@@ -647,24 +922,404 @@ export async function setPropertyValueAction(
   });
 
   // One activity line per property write: this is what the LAST_EDITED_BY
-  // property surfaces as the row's last editor. An audit line must never
-  // break the write it records, so failures are swallowed.
-  try {
-    await prisma.activity.create({
-      data: {
-        workspaceId: row.workspaceId,
-        actorId: auth.user.id,
-        action: "row.edited",
-        targetType: "page",
-        targetId: rowPageId,
-      },
-    });
-  } catch {
-    /* see above */
-  }
+  // property surfaces as the row's last editor. `logActivity` already swallows
+  // transport failures, so an audit line can never break the write it records.
+  await logActivity({
+    workspaceId: row.workspaceId,
+    actorId: auth.user.id,
+    action: "row.edited",
+    targetType: "page",
+    targetId: rowPageId,
+  });
 
   revalidateDatabase(row.workspaceId);
   return { ok: true };
+}
+
+/**
+ * Load the next keyset page of a database's rows.
+ *
+ * The database page is authorized exactly like the initial read, including the
+ * guest read scope used for relation targets. `rows` and `nextRowCursor` are
+ * the same shape the route receives from `getDatabase`, so the client can append
+ * without a second mapping. The activity/dependency projections are refreshed
+ * too, keeping LAST_EDITED_BY and the timeline complete for the new window.
+ */
+export async function loadMoreDatabaseRowsAction(
+  databasePageId: string,
+  cursor: string,
+): Promise<
+  Result<{
+    rows: Awaited<ReturnType<typeof getDatabase>>["rows"];
+    nextRowCursor: string | null;
+    lastEditedBy: Awaited<ReturnType<typeof getDatabase>>["lastEditedBy"];
+    dependencies: Awaited<ReturnType<typeof getDatabase>>["dependencies"];
+  }>
+> {
+  if (!cursor || decodeCursor(cursor) === null) {
+    return { error: "Invalid cursor." };
+  }
+  const auth = await authorizeDatabase(databasePageId);
+  if ("error" in auth) return auth;
+  const readable =
+    auth.access.role === "GUEST"
+      ? await guestReadablePageIds(auth.user.id, auth.page.workspaceId)
+      : null;
+  const page = await getDatabase(databasePageId, readable, {
+    rowLimit: 100,
+    rowCursor: cursor,
+  });
+  return {
+    ok: true,
+    rows: page.rows,
+    nextRowCursor: page.nextRowCursor,
+    lastEditedBy: page.lastEditedBy,
+    dependencies: page.dependencies,
+  };
+}
+
+/**
+ * Cursor-paginated page search for a relation cell (R21.5).
+ *
+ * The picker no longer has to receive every target row: 20 rows are returned
+ * per call, ordered by id, with `nextCursor` pointing at the last id. The
+ * property id is the authorization anchor - the viewer must be able to read the
+ * source database, the target must be a live database of the same workspace,
+ * and a guest's row results are further limited to their read scope.
+ */
+export async function searchRelationTargetsAction(
+  propertyId: string,
+  query = "",
+  cursor: string | null = null,
+): Promise<
+  Result<{
+    items: { id: string; title: string; icon: string | null }[];
+    nextCursor: string | null;
+  }>
+> {
+  const property = await prisma.property.findUnique({
+    where: { id: propertyId },
+    select: { databasePageId: true, type: true, config: true },
+  });
+  if (!property || property.type !== "RELATION") {
+    return { error: "Property not found." };
+  }
+  const auth = await authorizeDatabase(property.databasePageId);
+  if ("error" in auth) return auth;
+
+  const config = normalizeRelationConfig(property.config);
+  if (!config.targetDatabaseId) return { error: "Configure the relation first." };
+  const target = await prisma.page.findFirst({
+    where: {
+      id: config.targetDatabaseId,
+      workspaceId: auth.page.workspaceId,
+      type: "DATABASE",
+      deletedAt: null,
+    },
+    select: { id: true },
+  });
+  if (!target) return { error: "Database not found." };
+
+  let readable: Set<string> | null = null;
+  if (auth.access.role === "GUEST") {
+    readable = await guestReadablePageIds(auth.user.id, auth.page.workspaceId);
+    // A guest outside the target's read scope gets the same empty answer as a
+    // search with no matches: a refusal must not confirm the target exists.
+    if (!readable.has(target.id)) {
+      return { ok: true, items: [], nextCursor: null };
+    }
+  }
+
+  const search = query.trim().slice(0, 80);
+  const after = typeof cursor === "string" ? cursor.trim() : "";
+  const conditions: Prisma.PageWhereInput[] = [
+    { parentId: target.id },
+    { workspaceId: auth.page.workspaceId },
+    { deletedAt: null },
+  ];
+  if (search) {
+    conditions.push({ title: { contains: search, mode: "insensitive" } });
+  }
+  if (after) conditions.push({ id: { gt: after } });
+  if (readable) conditions.push({ id: { in: [...readable] } });
+
+  const rows = await prisma.page.findMany({
+    where: { AND: conditions },
+    orderBy: { id: "asc" },
+    take: 21,
+    select: { id: true, title: true, icon: true },
+  });
+  const items = rows.slice(0, 20);
+  return {
+    ok: true,
+    items,
+    nextCursor: rows.length > 20 ? items[items.length - 1].id : null,
+  };
+}
+
+/**
+ * Enable or disable the reciprocal half of a relation (R21.7).
+ *
+ * Enabling creates (or reuses) a RELATION property on the target database in
+ * one transaction, cross-references both configs and backfills every existing
+ * link. A self-relation uses the same property on both sides. Disabling clears
+ * the `inversePropertyId` on both properties and leaves the columns (and their
+ * values) in place, so no data disappears by toggling a setting.
+ */
+export async function setRelationTwoWayAction(
+  propertyId: string,
+  enabled: boolean,
+): Promise<Result<{ inversePropertyId: string | null }>> {
+  const property = await prisma.property.findUnique({
+    where: { id: propertyId },
+    select: {
+      id: true,
+      databasePageId: true,
+      name: true,
+      type: true,
+      config: true,
+    },
+  });
+  if (!property || property.type !== "RELATION") {
+    return { error: "Property not found." };
+  }
+  const auth = await authorizeDatabase(property.databasePageId);
+  if ("error" in auth) return auth;
+  if (!auth.capabilities.edit) return { error: "No permission." };
+  const schemaDenied = schemaLockDenied(auth);
+  if (schemaDenied) return schemaDenied;
+
+  const config = normalizeRelationConfig(property.config);
+  if (!enabled) {
+    const inverseId = config.inversePropertyId;
+    await prisma.$transaction(async (tx) => {
+      await tx.property.update({
+        where: { id: property.id },
+        data: {
+          config: {
+            ...config,
+            inversePropertyId: null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      if (!inverseId || !config.targetDatabaseId) return;
+      const inverse = await tx.property.findFirst({
+        where: {
+          id: inverseId,
+          databasePageId: config.targetDatabaseId,
+          type: "RELATION",
+        },
+        select: { id: true, config: true },
+      });
+      if (!inverse) return;
+      await tx.property.update({
+        where: { id: inverse.id },
+        data: {
+          config: {
+            ...normalizeRelationConfig(inverse.config),
+            inversePropertyId: null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+    });
+    revalidateDatabase(auth.page.workspaceId);
+    return { ok: true, inversePropertyId: null };
+  }
+
+  if (!config.targetDatabaseId) return { error: "Configure the relation first." };
+  const target = await prisma.page.findFirst({
+    where: {
+      id: config.targetDatabaseId,
+      workspaceId: auth.page.workspaceId,
+      type: "DATABASE",
+      deletedAt: null,
+    },
+    select: { id: true },
+  });
+  if (!target) return { error: "Database not found." };
+
+  const inversePropertyId = await prisma.$transaction(async (tx) => {
+    let inverseId: string;
+
+    if (target.id === property.databasePageId) {
+      // A self-relation can be its own inverse: a link stored on one row is
+      // the reciprocal link stored on the other row of the same column.
+      inverseId = property.id;
+    } else {
+      const existing = await tx.property.findFirst({
+        where: {
+          id: config.inversePropertyId ?? "",
+          databasePageId: target.id,
+          type: "RELATION",
+        },
+        select: { id: true, config: true },
+      });
+      const existingConfig = normalizeRelationConfig(existing?.config);
+      const existingPointsBack =
+        existingConfig.targetDatabaseId === property.databasePageId &&
+        (existingConfig.inversePropertyId === null ||
+          existingConfig.inversePropertyId === property.id);
+      if (existing && existingPointsBack) {
+        inverseId = existing.id;
+      } else {
+        // Reuse an unpaired relation that already points back at this database
+        // (a previous toggle-off followed by a toggle-on), so repeated toggles
+        // do not multiply columns.
+        const candidates = await tx.property.findMany({
+          where: { databasePageId: target.id, type: "RELATION" },
+          orderBy: { position: "asc" },
+          select: { id: true, name: true, config: true },
+        });
+        const reusable = candidates.find((candidate) => {
+          const candidateConfig = normalizeRelationConfig(candidate.config);
+          return (
+            candidateConfig.targetDatabaseId === property.databasePageId &&
+            candidateConfig.inversePropertyId === null &&
+            candidate.name === property.name
+          );
+        });
+        if (reusable) {
+          inverseId = reusable.id;
+        } else {
+          const last = await tx.property.findFirst({
+            where: { databasePageId: target.id },
+            orderBy: { position: "desc" },
+            select: { position: true },
+          });
+          const created = await tx.property.create({
+            data: {
+              databasePageId: target.id,
+              name: property.name,
+              type: "RELATION",
+              position: (last?.position ?? 0) + 1000,
+              config: {
+                targetDatabaseId: property.databasePageId,
+                multi: config.multi,
+                inversePropertyId: property.id,
+              } as Prisma.InputJsonValue,
+            },
+            select: { id: true },
+          });
+          inverseId = created.id;
+        }
+      }
+    }
+
+    await tx.property.update({
+      where: { id: property.id },
+      data: {
+        config: {
+          targetDatabaseId: target.id,
+          multi: config.multi,
+          inversePropertyId: inverseId,
+        } as Prisma.InputJsonValue,
+      },
+    });
+    if (inverseId !== property.id) {
+      await tx.property.update({
+        where: { id: inverseId },
+        data: {
+          config: {
+            targetDatabaseId: property.databasePageId,
+            multi: config.multi,
+            inversePropertyId: property.id,
+          } as Prisma.InputJsonValue,
+        },
+      });
+    }
+
+    // Backfill every existing source link. Only target rows that still resolve
+    // inside the configured target database are written.
+    const sourceValues = await tx.propertyValue.findMany({
+      where: { propertyId: property.id },
+      select: { pageId: true, value: true },
+    });
+    const links: { sourceRowId: string; targetRowId: string }[] = [];
+    const sourceById = new Map<string, string[]>();
+    for (const entry of sourceValues) {
+      const ids = normalizeRelationPageIds(entry.value, true) ?? [];
+      sourceById.set(entry.pageId, ids);
+      for (const targetRowId of ids) {
+        links.push({ sourceRowId: entry.pageId, targetRowId });
+      }
+    }
+    const targetIds = [...new Set(links.map((link) => link.targetRowId))];
+    const targetRows = targetIds.length
+      ? await tx.page.findMany({
+          where: {
+            id: { in: targetIds },
+            parentId: target.id,
+            workspaceId: auth.page.workspaceId,
+            deletedAt: null,
+          },
+          select: { id: true },
+        })
+      : [];
+    const validTargets = new Set(targetRows.map((row) => row.id));
+    const validLinks = links.filter((link) => validTargets.has(link.targetRowId));
+
+    const existingValues = await tx.propertyValue.findMany({
+      where: { propertyId: inverseId },
+      select: { pageId: true, value: true },
+    });
+    const existingByTarget: Record<string, string[]> = {};
+    for (const entry of existingValues) {
+      if (!validTargets.has(entry.pageId) && inverseId === property.id) continue;
+      const ids = normalizeRelationPageIds(entry.value, true) ?? [];
+      if (ids.length > 0) existingByTarget[entry.pageId] = ids;
+    }
+    const backfill = buildInverseBackfill({
+      links: validLinks,
+      existing: existingByTarget,
+      multi: config.multi,
+    });
+    for (const [targetRowId, pageIds] of Object.entries(backfill)) {
+      await tx.propertyValue.upsert({
+        where: {
+          propertyId_pageId: { propertyId: inverseId, pageId: targetRowId },
+        },
+        create: {
+          propertyId: inverseId,
+          pageId: targetRowId,
+          value: { pageIds } as Prisma.InputJsonValue,
+        },
+        update: { value: { pageIds } as Prisma.InputJsonValue },
+      });
+    }
+
+    // A single reciprocal can keep only one source per target. Make the source
+    // cells agree with the chosen backfill instead of storing asymmetry.
+    if (!config.multi) {
+      for (const [targetRowId, pageIds] of Object.entries(backfill)) {
+        const chosen = pageIds[0];
+        for (const [sourceRowId, ids] of sourceById) {
+          if (sourceRowId === chosen || !ids.includes(targetRowId)) continue;
+          await tx.propertyValue.upsert({
+            where: {
+              propertyId_pageId: { propertyId: property.id, pageId: sourceRowId },
+            },
+            create: {
+              propertyId: property.id,
+              pageId: sourceRowId,
+              value: {
+                pageIds: ids.filter((id) => id !== targetRowId),
+              } as Prisma.InputJsonValue,
+            },
+            update: {
+              value: {
+                pageIds: ids.filter((id) => id !== targetRowId),
+              } as Prisma.InputJsonValue,
+            },
+          });
+        }
+      }
+    }
+
+    return inverseId;
+  });
+
+  revalidateDatabase(auth.page.workspaceId);
+  return { ok: true, inversePropertyId };
 }
 
 export async function createRowAction(
@@ -688,7 +1343,7 @@ export async function createRowAction(
       data: {
         workspaceId: auth.page.workspaceId,
         // The parent is the database page `authorizeDatabase` just checked and
-        // the row is written into that very page's workspace — parent and row
+        // the row is written into that very page's workspace - parent and row
         // share one workspace by construction, so no second lookup is needed
         // (B08: `assertScopedParent` would be redundant here).
         parentId: databasePageId,
@@ -701,62 +1356,192 @@ export async function createRowAction(
       },
       select: { id: true },
     });
-
-    const properties = await tx.property.findMany({
-      where: { databasePageId },
-      orderBy: { position: "asc" },
-      select: { id: true, type: true, config: true },
-    });
-
-    // One cell per property: the primary text cell yields to a Unique ID
-    // allocation when the primary column is itself a UNIQUE_ID property, and
-    // every UNIQUE_ID column gets a fresh id derived from its own stored
-    // values (multiple Unique ID properties number independently).
-    const values = new Map<string, Prisma.InputJsonValue>();
-    const primary = properties[0];
-    if (primary && primary.type !== "UNIQUE_ID") {
-      values.set(primary.id, { text: title || "" });
-    }
-    for (const property of properties) {
-      if (property.type !== "UNIQUE_ID") continue;
-      values.set(
-        property.id,
-        await allocateUniqueIdValue(
-          tx,
-          property.id,
-          readUniqueIdConfig(property.config),
-        ),
-      );
-    }
-
-    // An authored `config.default` seeds the fresh row (e.g. a Status, Number or
-    // Date starting value), unless the primary text cell or a UNIQUE_ID
-    // allocation already owns that column — the same override order the read-only
-    // grid uses. `initializeRowValues` validates each stored config and omits
-    // computed types, so a malformed config can never break row creation.
-    for (const seeded of initializeRowValues(
-      properties.filter(
-        (property) =>
-          !values.has(property.id) && hasConfiguredDefault(property.config),
-      ),
-    )) {
-      values.set(seeded.propertyId, seeded.value as Prisma.InputJsonValue);
-    }
-    if (values.size > 0) {
-      await tx.propertyValue.createMany({
-        data: [...values].map(([propertyId, value]) => ({
-          propertyId,
-          pageId: row.id,
-          value,
-        })),
-      });
-    }
+    await createRowCellsInTransaction(tx, databasePageId, row.id, title);
     return row.id;
   });
 
   await dispatchWebhooks(auth.page.workspaceId, "row.created", {
     rowId,
     databasePageId,
+  });
+  revalidateDatabase(auth.page.workspaceId);
+  return { ok: true, id: rowId };
+}
+
+/**
+ * Submit an internal FORM view.
+ *
+ * The browser validates the same schema before it calls this action, but that
+ * is only a UX shortcut: this action re-authorizes the view's database, reads
+ * the view's *stored* `config.form`, re-validates every answer with the shared
+ * cell rules, and creates the row plus all cells in one transaction. A
+ * hand-crafted client call therefore cannot write an unknown column, a computed
+ * cell, an unowned file URL, or a row that only partially commits.
+ */
+export async function submitFormAction(
+  viewId: string,
+  answers: unknown,
+): Promise<Result<{ id: string }>> {
+  const view = await prisma.databaseView.findUnique({
+    where: { id: viewId },
+    select: {
+      id: true,
+      databasePageId: true,
+      name: true,
+      type: true,
+      config: true,
+    },
+  });
+  if (!view || view.type !== "FORM") return { error: "Form not found." };
+
+  const auth = await authorizeDatabase(view.databasePageId);
+  if ("error" in auth) return auth;
+  if (!auth.capabilities.edit) return { error: "No permission." };
+
+  const config = (view.config ?? {}) as { form?: unknown };
+  const parsed = parseFormSchema(config.form);
+  const properties = await prisma.property.findMany({
+    where: { databasePageId: view.databasePageId },
+    orderBy: { position: "asc" },
+    select: { id: true, name: true, type: true, config: true },
+  });
+  const propertyById = new Map(properties.map((property) => [property.id, property]));
+
+  // A stored FormSchema is authoritative. A legacy `fieldIds` config (or no
+  // config at all) is resolved against the live properties exactly like the
+  // renderer does, so an old form keeps accepting its answers.
+  const storedFields =
+    parsed.fields.length > 0
+      ? parsed.fields
+      : buildFormSchema(properties, config.form);
+  const schema: FormSchema = {
+    ...parsed,
+    id: view.id,
+    databaseId: view.databasePageId,
+    title: parsed.title.trim() || view.name || "Form",
+    fields: storedFields.map((field) => {
+      const property = propertyById.get(field.propertyId);
+      return property
+        ? {
+            ...field,
+            type: property.type,
+            config: (property.config ?? {}) as Record<string, unknown>,
+          }
+        : field;
+    }),
+  };
+
+  const formCheck = validateFormSchema(schema, { properties });
+  if (!formCheck.ok) return { error: "This form has an invalid configuration." };
+  if (schema.accepting !== true) {
+    return { error: "This form is not accepting responses." };
+  }
+
+  // Per-user fixed window. It is deliberately charged before the row write, so
+  // even a script that keeps malformed submissions coming cannot use this
+  // action as an unthrottled database writer.
+  const userLimit = checkUserRateLimit(
+    userKey(`form-submit:${view.id}`, auth.user.id),
+    20,
+    60_000,
+  );
+  const addressLimit = checkRateLimit(
+    clientKeyFromHeaders(await headers(), `form-submit:${view.id}`),
+    60,
+    60_000,
+  );
+  if (!userLimit.ok || !addressLimit.ok) {
+    return { error: "Too many submissions. Try again shortly." };
+  }
+
+  const validation = validateSubmission(schema, answers);
+  if (!validation.ok) {
+    return { error: "Please check the answers and try again." };
+  }
+  const cells = toRowValues(schema, answers);
+  const submitted = new Map<string, Prisma.InputJsonValue>();
+  for (const cell of cells) {
+    const property = propertyById.get(cell.propertyId);
+    if (!property || !isAnswerablePropertyType(property.type)) {
+      return { error: "This form has an invalid question." };
+    }
+    if (!fileUrlsAreAppOwned(cell.value)) {
+      return { error: "That file link is not allowed." };
+    }
+    submitted.set(cell.propertyId, cell.value as Prisma.InputJsonValue);
+  }
+
+  // Re-check the *mapped* cells, including defaults that were never in the
+  // answer map. `validateSubmission` already checks the answers, but validating
+  // the final values here means a stored default cannot bypass the shared cell
+  // rules and a fail-open validation edge cannot reach the writer.
+  for (const field of schema.fields) {
+    if (field.hidden === true) continue;
+    const property = propertyById.get(field.propertyId);
+    if (!property || !isAnswerablePropertyType(property.type)) {
+      return { error: "This form has an invalid question." };
+    }
+    const result = validateCell(
+      {
+        id: property.id,
+        name: field.label,
+        type: property.type,
+        required: field.required === true,
+        config: (property.config ?? {}) as Record<string, unknown>,
+      },
+      submitted.get(field.propertyId),
+    );
+    if (!result.ok) {
+      return { error: "Please check the answers and try again." };
+    }
+  }
+
+  // The primary text answer also becomes the row title, matching the table's
+  // blank-row path. `createRowCellsInTransaction` seeds that same cell from the
+  // title, so the answer is written once.
+  const primary = properties[0];
+  const primaryCell = primary
+    ? cells.find((cell) => cell.propertyId === primary.id)
+    : undefined;
+  const primaryText =
+    primaryCell && primaryCell.value && typeof primaryCell.value === "object"
+      ? (primaryCell.value as { text?: unknown }).text
+      : undefined;
+  const title = typeof primaryText === "string" ? primaryText : "";
+
+  const rowId = await prisma.$transaction(async (tx) => {
+    const last = await tx.page.findFirst({
+      where: { parentId: view.databasePageId },
+      orderBy: { position: "desc" },
+      select: { position: true },
+    });
+    const rowTitle = title || "Untitled";
+    const row = await tx.page.create({
+      data: {
+        workspaceId: auth.page.workspaceId,
+        // `authorizeDatabase(view.databasePageId)` proved this parent above and
+        // the row is written into that very page's workspace.
+        parentId: view.databasePageId,
+        title: rowTitle,
+        createdById: auth.user.id,
+        position: (last?.position ?? 0) + 1000,
+        searchText: pageSearchText(rowTitle, null),
+      },
+      select: { id: true },
+    });
+    await createRowCellsInTransaction(
+      tx,
+      view.databasePageId,
+      row.id,
+      title,
+      submitted,
+    );
+    return row.id;
+  });
+
+  await dispatchWebhooks(auth.page.workspaceId, "row.created", {
+    rowId,
+    databasePageId: view.databasePageId,
   });
   revalidateDatabase(auth.page.workspaceId);
   return { ok: true, id: rowId };
@@ -800,6 +1585,200 @@ export async function deleteRowAction(rowId: string): Promise<Result> {
   return { ok: true };
 }
 
+/**
+ * Nest a row under another row of the same database, or promote it back to the
+ * top level with `parentRowId = null`.
+ *
+ * `Page.parentId` is the database itself and never changes here; the optional
+ * `Page.subOfId` is the sub-item edge. The tree is deliberately one level deep:
+ * a parent that is itself nested and a row that already has children are both
+ * rejected, so a malformed client cannot build an unbounded chain (and the
+ * read/query path never needs a recursive walk). A row carries its own
+ * page-level restriction, so the same workspace/row edit checks as a property
+ * write apply before the move is committed.
+ */
+export async function setSubItemParentAction(
+  rowId: string,
+  parentRowId: string | null,
+): Promise<Result> {
+  const row = await prisma.page.findUnique({
+    where: { id: rowId },
+    select: {
+      parentId: true,
+      workspaceId: true,
+      permissions: { select: { userId: true, level: true } },
+    },
+  });
+  if (!row?.parentId) return { error: "Row not found." };
+  const auth = await authorizeDatabase(row.parentId);
+  if ("error" in auth) return auth;
+  if (row.workspaceId !== auth.page.workspaceId) {
+    return { error: "Row not found." };
+  }
+  if (!auth.capabilities.edit) return { error: "No permission." };
+  const rowPermissions = (row.permissions ?? []).filter(
+    (permission) => permission.userId === auth.user.id,
+  );
+  if (!pageCapabilitiesFromRelation(auth.access.role, rowPermissions).edit) {
+    return { error: "No permission." };
+  }
+  if (parentRowId === rowId) return { error: "A row cannot be its own parent." };
+
+  if (parentRowId !== null) {
+    const parent = await prisma.page.findUnique({
+      where: { id: parentRowId },
+      select: {
+        parentId: true,
+        workspaceId: true,
+        subOfId: true,
+        deletedAt: true,
+      },
+    });
+    if (
+      !parent ||
+      parent.parentId !== auth.page.id ||
+      parent.workspaceId !== auth.page.workspaceId ||
+      parent.deletedAt !== null
+    ) {
+      return { error: "Parent row not found." };
+    }
+    if (parent.subOfId !== null) {
+      return { error: "Sub-items can only be one level deep." };
+    }
+    const childCount = await prisma.page.count({
+      where: {
+        subOfId: rowId,
+        workspaceId: auth.page.workspaceId,
+        deletedAt: null,
+      },
+    });
+    if (childCount > 0) {
+      return { error: "Move this row's sub-items out first." };
+    }
+  }
+
+  await prisma.page.update({
+    where: { id: rowId },
+    data: { subOfId: parentRowId },
+  });
+  await logActivity({
+    workspaceId: auth.page.workspaceId,
+    actorId: auth.user.id,
+    action: "row.edited",
+    targetType: "page",
+    targetId: rowId,
+    meta: { subOfId: parentRowId },
+  });
+  revalidateDatabase(auth.page.workspaceId);
+  return { ok: true };
+}
+
+/** The write-time cap on blocking edges in one database (R89.31). */
+const DEPENDENCY_EDGE_LIMIT = 500;
+
+/**
+ * Add or remove one blocking edge between two rows of a database.
+ *
+ * `blockerId` must finish before `blockedId` can start. Both rows have to be
+ * live pages of `databasePageId` in the database's workspace, and the caller
+ * needs edit rights on the database **and** on both rows. The write-time graph
+ * check rejects self-edges and any edge that would close a loop, and the
+ * per-database edge cap keeps `wouldCreateCycle`'s DFS bounded. The operation
+ * is idempotent: adding an existing edge and removing a missing one both
+ * succeed, so a stale client can safely replay it.
+ */
+export async function setRowDependencyAction(
+  databasePageId: string,
+  blockerId: string,
+  blockedId: string,
+  linked: boolean,
+): Promise<Result> {
+  const auth = await authorizeDatabase(databasePageId);
+  if ("error" in auth) return auth;
+  if (!auth.capabilities.edit) return { error: "No permission." };
+  if (blockerId === blockedId) return { error: "A row cannot depend on itself." };
+
+  const rows = await prisma.page.findMany({
+    where: {
+      parentId: databasePageId,
+      workspaceId: auth.page.workspaceId,
+      deletedAt: null,
+    },
+    select: {
+      id: true,
+      permissions: {
+        where: { userId: auth.user.id },
+        select: { level: true },
+      },
+    },
+  });
+  const blocker = rows.find((row) => row.id === blockerId);
+  const blocked = rows.find((row) => row.id === blockedId);
+  if (!blocker || !blocked) return { error: "Row not found." };
+  const canEditRow = (row: (typeof rows)[number]) =>
+    pageCapabilitiesFromRelation(auth.access.role, row.permissions).edit;
+  if (!canEditRow(blocker) || !canEditRow(blocked)) return { error: "No permission." };
+
+  if (!linked) {
+    const removed = await prisma.rowDependency.deleteMany({
+      where: { blockerId, blockedId },
+    });
+    if (removed.count > 0) {
+      await logActivity({
+        workspaceId: auth.page.workspaceId,
+        actorId: auth.user.id,
+        action: "row.edited",
+        targetType: "page",
+        targetId: blockedId,
+        meta: { dependency: "removed", blockerId },
+      });
+    }
+    revalidateDatabase(auth.page.workspaceId);
+    return { ok: true };
+  }
+
+  const existing = await prisma.rowDependency.findMany({
+    where: {
+      blockerId: { in: rows.map((row) => row.id) },
+      blockedId: { in: rows.map((row) => row.id) },
+    },
+    select: { blockerId: true, blockedId: true },
+  });
+  const alreadyLinked = existing.some(
+    (edge) => edge.blockerId === blockerId && edge.blockedId === blockedId,
+  );
+  if (!alreadyLinked) {
+    if (existing.length >= DEPENDENCY_EDGE_LIMIT) {
+      return { error: "This database has too many dependencies." };
+    }
+    const edges: DependencyEdge[] = existing.map((edge) => ({
+      from: edge.blockerId,
+      to: edge.blockedId,
+    }));
+    if (wouldCreateCycle(edges, { from: blockerId, to: blockedId })) {
+      return { error: "That would create a dependency cycle." };
+    }
+  }
+
+  await prisma.rowDependency.upsert({
+    where: { blockerId_blockedId: { blockerId, blockedId } },
+    create: { blockerId, blockedId },
+    update: {},
+  });
+  if (!alreadyLinked) {
+    await logActivity({
+      workspaceId: auth.page.workspaceId,
+      actorId: auth.user.id,
+      action: "row.edited",
+      targetType: "page",
+      targetId: blockedId,
+      meta: { dependency: "added", blockerId },
+    });
+  }
+  revalidateDatabase(auth.page.workspaceId);
+  return { ok: true };
+}
+
 /** Soft-deleted rows of one database, most recently deleted first. */
 export async function listDeletedRowsAction(
   databasePageId: string,
@@ -838,6 +1817,7 @@ const VIEW_TYPES = [
   "CALENDAR",
   "TIMELINE",
   "CHART",
+  "FORM",
 ] as const;
 type ViewType = (typeof VIEW_TYPES)[number];
 
@@ -847,7 +1827,15 @@ function isViewType(value: unknown): value is ViewType {
 
 export async function createViewAction(
   databasePageId: string,
-  type: "TABLE" | "BOARD" | "LIST" | "GALLERY" | "CALENDAR" | "TIMELINE" | "CHART",
+  type:
+    | "TABLE"
+    | "BOARD"
+    | "LIST"
+    | "GALLERY"
+    | "CALENDAR"
+    | "TIMELINE"
+    | "CHART"
+    | "FORM",
   name: string,
 ): Promise<Result<{ id: string }>> {
   const auth = await authorizeDatabase(databasePageId);
@@ -1202,6 +2190,7 @@ export async function duplicateDatabaseAction(
         icon: template.icon,
         recurrence: template.recurrence,
         nextRunAt: template.nextRunAt,
+        createdById: auth.user.id,
         ...(content !== undefined ? { content } : {}),
         ...(config !== undefined ? { config } : {}),
       };
@@ -1274,6 +2263,7 @@ export async function saveRowAsTemplateAction(
       name: name.trim().slice(0, 80) || "Template",
       icon: row.icon,
       content: (row.content ?? undefined) as Prisma.InputJsonValue | undefined,
+      createdById: auth.user.id,
       config: {
         values: row.propertyValues.map((value) => ({
           propertyId: value.propertyId,
@@ -1303,58 +2293,34 @@ export async function createRowFromTemplateAction(
   const template = await prisma.template.findUnique({
     where: { id: templateId },
     select: {
+      id: true,
       databasePageId: true,
       content: true,
       config: true,
       name: true,
       icon: true,
+      createdById: true,
     },
   });
   if (!template || template.databasePageId !== databasePageId) {
     return { error: "Template not found." };
   }
 
-  const last = await prisma.page.findFirst({
-    where: { parentId: databasePageId },
-    orderBy: { position: "desc" },
-    select: { position: true },
+  // One materializer for manual and scheduled rows (R31.4/R31.5/R89.17): the
+  // pure planner drops stale property ids, the body/title variables resolve at
+  // this instant, and row + values commit together.
+  const materialized = await materializeTemplateRow({
+    template,
+    database: { id: databasePageId, workspaceId: auth.page.workspaceId },
+    actorId: auth.user.id,
+    now: new Date(),
   });
-  const row = await prisma.page.create({
-    data: {
-      workspaceId: auth.page.workspaceId,
-      // The parent is the database page `authorizeDatabase` just checked and
-      // the row is written into that very page's workspace — parent and row
-      // share one workspace by construction (B08: `assertScopedParent` would
-      // be redundant here).
-      parentId: databasePageId,
-      title: template.name,
-      icon: template.icon,
-      createdById: auth.user.id,
-      position: (last?.position ?? 0) + 1000,
-      content: (template.content ?? undefined) as Prisma.InputJsonValue | undefined,
-      // A row materialized from a template carries that template's body, so
-      // index title and body together from the first write.
-      searchText: pageSearchText(template.name, template.content),
-    },
-    select: { id: true },
-  });
-
-  const configured = (template.config ?? {}) as {
-    values?: { propertyId: string; value: unknown }[];
-  };
-  const values = configured.values ?? [];
-  if (values.length > 0) {
-    await prisma.propertyValue.createMany({
-      data: values.map((entry) => ({
-        propertyId: entry.propertyId,
-        pageId: row.id,
-        value: entry.value as Prisma.InputJsonValue,
-      })),
-    });
+  if (materialized.status !== "created") {
+    return { error: "Template not found." };
   }
 
   revalidateDatabase(auth.page.workspaceId);
-  return { ok: true, id: row.id };
+  return { ok: true, id: materialized.pageId };
 }
 
 export async function deleteTemplateAction(
@@ -1375,16 +2341,38 @@ export async function deleteTemplateAction(
   return { ok: true };
 }
 
-export type TemplateRecurrence = "daily" | "weekly" | "monthly";
+export type TemplateScheduleOptions = {
+  /** Optional wall-clock time the schedule is pinned to (R31.20). */
+  hour?: number | null;
+  minute?: number | null;
+  /** Injectable clock for tests; defaults to `new Date()`. */
+  now?: Date;
+};
 
-/** Set or clear a template's recurrence (drives the cron materializer). */
+/** A JSON object copy of `Template.config` (arrays/null become `{}`). */
+function templateConfigObject(config: unknown): Record<string, unknown> {
+  return typeof config === "object" && config !== null && !Array.isArray(config)
+    ? { ...(config as Record<string, unknown>) }
+    : {};
+}
+
+/**
+ * Set, edit or clear a template's recurrence (drives the cron materializer).
+ *
+ * Durable state is `Template.recurrence` + `nextRunAt` + `config.anchorAt`;
+ * the anchor pins the wall clock so a 09:00 schedule stays 09:00 however late
+ * the tick fires (R31.20). Setting a schedule clears a previous pause.
+ * Passing "off"/`null` clears all three and leaves unrelated config (such as
+ * saved `values`) untouched.
+ */
 export async function setTemplateRecurrenceAction(
   templateId: string,
-  recurrence: TemplateRecurrence | null,
-): Promise<Result> {
+  recurrence: TemplateRecurrence | string | null,
+  options: TemplateScheduleOptions = {},
+): Promise<Result<{ nextRunAt: string | null; paused: boolean }>> {
   const template = await prisma.template.findUnique({
     where: { id: templateId },
-    select: { databasePageId: true },
+    select: { databasePageId: true, config: true },
   });
   if (!template) return { error: "Template not found." };
   const auth = await authorizeDatabase(template.databasePageId);
@@ -1392,15 +2380,91 @@ export async function setTemplateRecurrenceAction(
   if (!auth.capabilities.edit) return { error: "No permission." };
   const schemaDenied = schemaLockDenied(auth);
   if (schemaDenied) return schemaDenied;
+
+  const validation = validateTemplateScheduleInput({
+    recurrence,
+    hour: options.hour,
+    minute: options.minute,
+  });
+  if (!validation.ok) return { error: validation.error };
+
+  const now =
+    options.now instanceof Date && Number.isFinite(options.now.getTime())
+      ? options.now
+      : new Date();
+  const config = templateConfigObject(template.config);
+  let nextRunAt: Date | null = null;
+
+  if (validation.recurrence) {
+    const anchor = templateScheduleAnchor(now, validation.hour, validation.minute);
+    nextRunAt = nextRunForSchedule(validation.recurrence, now, anchor);
+    config.anchorAt = anchor.toISOString();
+  } else {
+    delete config.anchorAt;
+  }
+
   await prisma.template.update({
     where: { id: templateId },
     data: {
-      recurrence: recurrence ?? null,
-      nextRunAt: recurrence ? nextRunFor(recurrence) : null,
+      recurrence: validation.recurrence,
+      nextRunAt,
+      paused: false,
+      config: config as Prisma.InputJsonValue,
     },
   });
   revalidateDatabase(auth.page.workspaceId);
-  return { ok: true };
+  return {
+    ok: true,
+    nextRunAt: nextRunAt?.toISOString() ?? null,
+    paused: false,
+  };
+}
+
+/**
+ * Pause or resume a template schedule.
+ *
+ * Pausing keeps the cadence (and the displayed next run) but the cron query
+ * excludes paused rows. Resuming re-derives `nextRunAt` from `now` + the
+ * stored anchor, so a long pause never back-fills the pause window (R31.22).
+ */
+export async function setTemplatePausedAction(
+  templateId: string,
+  paused: boolean,
+  options: { now?: Date } = {},
+): Promise<Result<{ paused: boolean; nextRunAt: string | null }>> {
+  const template = await prisma.template.findUnique({
+    where: { id: templateId },
+    select: { databasePageId: true, recurrence: true, config: true },
+  });
+  if (!template) return { error: "Template not found." };
+  const auth = await authorizeDatabase(template.databasePageId);
+  if ("error" in auth) return auth;
+  if (!auth.capabilities.edit) return { error: "No permission." };
+  const schemaDenied = schemaLockDenied(auth);
+  if (schemaDenied) return schemaDenied;
+
+  const recurrence = normalizeTemplateRecurrence(template.recurrence);
+  if (!recurrence) return { error: "Template has no schedule." };
+
+  const now =
+    options.now instanceof Date && Number.isFinite(options.now.getTime())
+      ? options.now
+      : new Date();
+  const nextRunAt = paused
+    ? null
+    : nextRunForSchedule(recurrence, now, templateAnchorFromConfig(template.config));
+
+  await prisma.template.update({
+    where: { id: templateId },
+    data: {
+      paused,
+      // On pause keep the last projected run for display; on resume replace it
+      // with the freshly computed one.
+      ...(paused ? {} : { nextRunAt }),
+    },
+  });
+  revalidateDatabase(auth.page.workspaceId);
+  return { ok: true, paused, nextRunAt: nextRunAt?.toISOString() ?? null };
 }
 
 /**

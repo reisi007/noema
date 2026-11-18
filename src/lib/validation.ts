@@ -204,6 +204,12 @@ export const commentSchema = z.object({
   parentId: z.string().cuid().nullable().optional(),
   blockId: z.string().max(200).optional(),
   quote: z.string().max(500).optional(),
+  // Offsets are UTF-16 positions inside the anchored block's plain text. They
+  // are re-validated against the page's stored content by the action; this
+  // schema only pins the transport shape so a string/negative value fails
+  // before any read.
+  anchorFrom: z.number().int().min(0).optional(),
+  anchorTo: z.number().int().min(0).optional(),
 });
 
 /**
@@ -236,6 +242,10 @@ export const aiRequestSchema = z.object({
   // would turn a foreign or malformed id into a 400 instead of the answer the
   // access check gives.
   workspaceId: z.string().min(1).nullish(),
+  // An Ask-AI block names the page it lives in. The route derives the page
+  // text itself after checking access — a client-supplied `context` is never
+  // trusted as a page's content when this id is present.
+  pageId: z.string().min(1).nullish(),
   maxTokens: z.number().int().optional(),
 });
 

@@ -67,14 +67,8 @@
  */
 
 /**
- * Accepted on 2026-11-18. Two pre-existing advisories are present in the
+ * Accepted on 2026-11-18. One pre-existing advisory is present in the
  * lockfile and cannot be lifted in this ratchet-migration maintenance change:
- *
- *   · GHSA-238p-pmpm-9mq7 (`katex`, low) — prototype pollution that can bypass
- *     trust restrictions. The affected copy is the nested `katex` under
- *     `mermaid` (the direct `^0.18.10` dependency already resolves outside the
- *     affected `>=0.11.0 <0.18.2` range). Clearing it needs the semver-major
- *     bump `mermaid` 11 → 12, which is out of scope here.
  *
  *   · GHSA-g3hv-75wg-m249 (`minimatch`, moderate) — denial of service via
  *     globparts amplification. The affected copy is nested under
@@ -89,13 +83,6 @@
  * @type {AcceptedAdvisory[]}
  */
 export const ACCEPTED_ADVISORIES = [
-  {
-    id: "GHSA-238p-pmpm-9mq7",
-    package: "katex",
-    severity: "low",
-    reason:
-      "affected copy is mermaid's nested katex; the direct katex ^0.18.10 dependency already resolves outside the vulnerable range. Fixing it needs the semver-major mermaid 11 -> 12 bump, out of scope in this maintenance change.",
-  },
   {
     id: "GHSA-g3hv-75wg-m249",
     package: "minimatch",

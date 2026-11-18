@@ -40,19 +40,8 @@ const total = rows.length;
 
 /** The shortlist a maintainer should read first (kept in sync by hand). */
 const PRIORITY = [
-  ["Filter tree UI", "The AND/OR filter tree already evaluates; the nested group builder UI is not exposed.", "3. Databases"],
-  ["Conditional formatting", "ColorRule is modelled and evaluated; the rule-authoring and render path are partial.", "3. Databases"],
-  ["Form view", "No ViewType.FORM yet; the builder + public submit path are spec'd but unwired.", "3. Databases"],
-  ["Linked database views", "The read-only node exists; view identity and per-instance overrides are missing.", "3. Databases"],
-  ["Synced blocks", "Mirror one block's content in many places with a canonical source marker.", "1. Editor & blocks"],
-  ["Suggestions mode", "Propose edits for approval with a diff overlay.", "7. Collaboration"],
-  ["Comment depth", "Server-side depth validation, block anchors and dispatch scoping on page threads.", "7. Collaboration"],
-  ["Notification inbox & preferences", "Per-user delivery preferences, digests and PageFollow dispatch are missing.", "7. Collaboration"],
-  ["Pagination everywhere", "Databases, tickets and audit lists load bounded sets; cursor pagination is pending.", "17. Data model & platform"],
-  ["Audit log UI", "Activity is recorded per ticket/page; a workspace-wide, filterable audit view is missing.", "8. Sharing & permissions"],
-  ["Object storage & backups", "Uploads and scheduled backups to S3-compatible storage.", "17. Data model & platform"],
-  ["SAML SSO", "OIDC is implemented and tested; SAML needs a provider-agnostic strategy layer.", "8. Sharing & permissions"],
-  ["Undo/redo (global)", "App-wide undo beyond the editor's local history.", "16. Navigation & UX"],
+  ["SAML SSO", "Login, per-workspace connections, domain auto-join, metadata rotation, SLO, settings/activity UI, invite precedence and SCIM Users/Groups→teamspaces+roles are implemented; a dry test-connection action and split per-IdP pages remain.", "8. Sharing & permissions"],
+  ["Undo/redo (global)", "Page rename/icon/cover/move/archive/favorite/layout and property edits are undoable; bulk row actions and a history list remain.", "16. Navigation & UX"],
   ["Self-hosting & auth", "Packaging, provider-agnostic sign-in and documented deployment remain.", "17. Data model & platform"],
 ];
 

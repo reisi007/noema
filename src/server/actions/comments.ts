@@ -11,6 +11,12 @@ import { commentSchema } from "@/lib/validation";
 import { dispatchWebhooks } from "@/lib/webhooks";
 import { logActivity } from "@/lib/activity";
 import { extractMentions, mentionMatches } from "@/lib/comments";
+import { commentMentionedUserIds } from "@/lib/comment-body";
+import {
+  blockTextById,
+  validateCommentAnchor,
+  type CommentAnchorRange,
+} from "@/lib/comment-anchors";
 import {
   validateThreadDepth,
   type Comment as ThreadComment,
@@ -61,14 +67,25 @@ export async function addCommentAction(input: {
   parentId?: string | null;
   blockId?: string;
   quote?: string;
+  /** Exact selection start inside `blockId`'s plain text (root comments). */
+  anchorFrom?: number;
+  /** Exact selection end inside `blockId`'s plain text (root comments). */
+  anchorTo?: number;
+  /** Aliases matching the editor/event vocabulary. */
+  from?: number;
+  to?: number;
 }): Promise<Result<{ id: string }>> {
   const user = await requireUser();
+  const anchorFrom = input.anchorFrom ?? input.from;
+  const anchorTo = input.anchorTo ?? input.to;
   const parsed = commentSchema.safeParse({
     pageId: input.pageId,
     body: input.body,
     parentId: input.parentId ?? null,
     blockId: input.blockId,
     quote: input.quote,
+    anchorFrom,
+    anchorTo,
   });
   if (!parsed.success) {
     return { error: parsed.error.issues[0]?.message ?? "Invalid comment." };
@@ -97,11 +114,49 @@ export async function addCommentAction(input: {
   });
   if (denied) return { error: denied };
 
+  /**
+   * Exact-range anchors are root-only and validated against the page's current
+   * stored content before any row is written. The client sends offsets inside
+   * one block's plain text; a stale quote, an out-of-bounds range, a missing
+   * block or an id belonging to another page fails closed. Legacy callers that
+   * send only `blockId`/`quote` keep the block-level anchor they had.
+   */
+  let anchor: CommentAnchorRange | null = null;
+  if (
+    !parsed.data.parentId &&
+    (parsed.data.anchorFrom !== undefined || parsed.data.anchorTo !== undefined)
+  ) {
+    const content = await prisma.page.findUnique({
+      where: { id: parsed.data.pageId },
+      select: { content: true },
+    });
+    const validation = validateCommentAnchor({
+      blockId: parsed.data.blockId,
+      blockText: content
+        ? blockTextById(content.content, parsed.data.blockId ?? "")
+        : null,
+      from: parsed.data.anchorFrom,
+      to: parsed.data.anchorTo,
+      quote: parsed.data.quote,
+    });
+    if (!validation.ok) return { error: validation.error };
+    anchor = validation.anchor;
+  }
+
   // Thread depth is enforced before the write (R79.1): a reply may only target
   // a thread root, so a reply-to-a-reply creates no row. We walk the prospective
   // parent's ancestor chain, add the pending reply, and let the pure thread model
   // (`validateThreadDepth`, maxDepth 1) flag it. Done before `create` so a bad
   // target never reaches the database.
+  //
+  // The notification deep-link target: the block anchor belongs to the thread
+  // root, so a reply reuses the parent's anchor instead of the reply's own
+  // (null) one.
+  let threadBlockId: string | undefined = parsed.data.blockId;
+  // The exact range belongs to the thread root too. A reply reuses it for its
+  // deep-link payload; the reply row itself stores no second anchor.
+  let threadAnchor: CommentAnchorRange | null = anchor;
+
   if (parsed.data.parentId) {
     const parentId = parsed.data.parentId;
     const ancestors: ThreadComment[] = [];
@@ -164,8 +219,17 @@ export async function addCommentAction(input: {
     data: {
       pageId: parsed.data.pageId,
       parentId: parsed.data.parentId ?? null,
-      blockId: parsed.data.blockId,
-      quote: parsed.data.quote?.trim() || null,
+      // Anchors belong to the thread root: a reply is rendered inside its
+      // parent's thread, so storing a second anchor would only create a jump
+      // target that the thread UI never shows.
+      blockId: parsed.data.parentId ? undefined : parsed.data.blockId,
+      quote: parsed.data.parentId
+        ? null
+        : (anchor?.quote ?? parsed.data.quote?.trim()) || null,
+      // A reply inherits the root's anchor through `parent`; it never stores a
+      // second range that the thread UI would not render.
+      anchorFrom: parsed.data.parentId ? undefined : (anchor?.from ?? null),
+      anchorTo: parsed.data.parentId ? undefined : (anchor?.to ?? null),
       authorId: user.id,
       body: parsed.data.body,
     },
@@ -175,8 +239,26 @@ export async function addCommentAction(input: {
   if (parsed.data.parentId) {
     const parent = await prisma.comment.findUnique({
       where: { id: parsed.data.parentId },
-      select: { authorId: true },
+      select: {
+        authorId: true,
+        blockId: true,
+        anchorFrom: true,
+        anchorTo: true,
+        quote: true,
+      },
     });
+    threadBlockId = parent?.blockId ?? undefined;
+    threadAnchor =
+      parent &&
+      typeof parent.anchorFrom === "number" &&
+      typeof parent.anchorTo === "number" &&
+      parent.quote !== null
+        ? {
+            from: parent.anchorFrom,
+            to: parent.anchorTo,
+            quote: parent.quote,
+          }
+        : null;
     if (parent && parent.authorId !== user.id) {
       // The reply reaches the author of the parent comment only while they
       // still are a member of the workspace — the mention path below resolves
@@ -195,6 +277,13 @@ export async function addCommentAction(input: {
               workspaceId: page.workspaceId,
               pageId: parsed.data.pageId,
               commentId: comment.id,
+              ...(threadBlockId ? { blockId: threadBlockId } : {}),
+              ...(threadBlockId && threadAnchor
+                ? {
+                    anchorFrom: threadAnchor.from,
+                    anchorTo: threadAnchor.to,
+                  }
+                : {}),
             },
           },
         });
@@ -203,21 +292,47 @@ export async function addCommentAction(input: {
   }
 
   // Mentions: `@Ada` or `@ada@example.com` notifies workspace members whose name
-  // (or email address) matches. The author is never notified of themselves.
+  // (or email address) matches. Typed mention tokens from the composer
+  // (`@[Ada](user:<id>)`) carry the user id directly and must notify too; page,
+  // project and milestone tokens are navigable references, not user mentions.
+  // The author is never notified of themselves.
   const mentions = extractMentions(parsed.data.body);
-  if (mentions.length > 0) {
+  const mentionedUserIds = new Set(commentMentionedUserIds(parsed.data.body));
+  if (mentions.length > 0 || mentionedUserIds.size > 0) {
     const members = await prisma.workspaceMember.findMany({
       where: { workspaceId: page.workspaceId },
-      select: { userId: true, user: { select: { name: true, email: true } } },
+      select: {
+        userId: true,
+        role: true,
+        user: { select: { name: true, email: true } },
+      },
     });
     const targets = members.filter(
       (member) =>
         member.userId !== user.id &&
-        mentions.some((mention) => mentionMatches(mention, member.user)),
+        (mentionedUserIds.has(member.userId) ||
+          mentions.some((mention) => mentionMatches(mention, member.user))),
     );
-    if (targets.length > 0) {
+    // A guest only reaches the pages in their read scope. A mention is a
+    // notification carrying the page id, so a guest outside that scope must
+    // not receive it (and must not learn that the page exists) even though
+    // they are a workspace member. Members and admins reach the whole
+    // workspace, and an explicit page READ row still lets them open the page.
+    const deliverable: typeof targets = [];
+    for (const target of targets) {
+      if (target.role !== "GUEST") {
+        deliverable.push(target);
+        continue;
+      }
+      const readable = await guestReadablePageIds(
+        target.userId,
+        page.workspaceId,
+      );
+      if (readable.has(parsed.data.pageId)) deliverable.push(target);
+    }
+    if (deliverable.length > 0) {
       await prisma.notification.createMany({
-        data: targets.map((target) => ({
+        data: deliverable.map((target) => ({
           userId: target.userId,
           type: "page.mention",
           // B136: the payload names the workspace, like the other two
@@ -227,6 +342,13 @@ export async function addCommentAction(input: {
             workspaceId: page.workspaceId,
             pageId: parsed.data.pageId,
             commentId: comment.id,
+            ...(threadBlockId ? { blockId: threadBlockId } : {}),
+            ...(threadBlockId && threadAnchor
+              ? {
+                  anchorFrom: threadAnchor.from,
+                  anchorTo: threadAnchor.to,
+                }
+              : {}),
           },
         })),
       });
@@ -348,6 +470,14 @@ export async function editCommentAction(
   }
 
   await prisma.comment.update({ where: { id: commentId }, data: { body: text } });
+  await logActivity({
+    workspaceId: comment.page.workspaceId,
+    actorId: user.id,
+    action: "comment.edited",
+    targetType: "comment",
+    targetId: commentId,
+    meta: { pageId: comment.pageId },
+  });
   revalidatePath("/w", "layout");
   return { ok: true, edited: true };
 }
@@ -388,6 +518,14 @@ export async function resolveCommentAction(
   await prisma.comment.update({
     where: { id: commentId },
     data: { resolved },
+  });
+  await logActivity({
+    workspaceId: comment.page.workspaceId,
+    actorId: user.id,
+    action: "comment.resolved",
+    targetType: "comment",
+    targetId: commentId,
+    meta: { pageId: comment.pageId, resolved },
   });
   revalidatePath(`/w`, "layout");
   return { ok: true };
@@ -434,6 +572,14 @@ export async function deleteCommentAction(
     return { error: "You can only delete your own comments." };
   }
   await prisma.comment.delete({ where: { id: commentId } });
+  await logActivity({
+    workspaceId: comment.page.workspaceId,
+    actorId: user.id,
+    action: "comment.deleted",
+    targetType: "comment",
+    targetId: commentId,
+    meta: { pageId: comment.pageId },
+  });
   revalidatePath(`/w`, "layout");
   return { ok: true };
 }

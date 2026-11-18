@@ -1,6 +1,6 @@
 [package]
 name = "noema-desktop"
-version = "1.4.1"
+version = "1.4.3"
 description = "Noema — local-first workspace, as an installable desktop app"
 authors = ["Bilel Guembri", "Wissal Ben Othmen"]
 edition = "2021"
@@ -23,11 +23,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
-tauri-plugin-os = "2"
-tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-log = "2"
 tauri-plugin-window-state = "2"
@@ -42,6 +38,12 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 directories = "5"
 url = "2"
+
+# Keep target-specific dependency tables *after* the general block. A TOML
+# table runs until the next header, so putting this above `serde`, `tokio`,
+# `reqwest`, ... silently made every one of them Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

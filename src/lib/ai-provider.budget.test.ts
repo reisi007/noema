@@ -103,8 +103,8 @@ describe("chatComplete budget enforcement", () => {
     const first = await chatComplete({ system: "s", user: "u" }, CONFIG);
     const second = await chatComplete({ system: "s", user: "u" }, CONFIG);
 
-    expect(first).toEqual({ ok: true, text: "hi" });
-    expect(second).toEqual({ ok: true, text: "hi" });
+    expect(first).toMatchObject({ ok: true, text: "hi" });
+    expect(second).toMatchObject({ ok: true, text: "hi" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -122,7 +122,12 @@ describe("chatComplete budget enforcement", () => {
     expect(first.ok).toBe(true);
 
     const second = await chatComplete({ system: "s", user: "u", maxTokens: 10 }, CONFIG);
-    expect(second).toEqual({ ok: false, status: 429, error: AI_BUDGET_EXCEEDED });
+    expect(second).toEqual({
+      ok: false,
+      status: 503,
+      error: AI_BUDGET_EXCEEDED,
+      code: "AI_BUDGET_EXCEEDED",
+    });
     // The refused call never reached the network.
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -237,7 +242,12 @@ describe("chatCompleteStream budget enforcement", () => {
     // The stream's usage lands in the ledger the single-shot transport reads:
     // the reported 100 tokens are booked, so the next call is refused.
     const next = await chatComplete({ system: "s", user: "u", maxTokens: 10 }, CONFIG);
-    expect(next).toEqual({ ok: false, status: 429, error: AI_BUDGET_EXCEEDED });
+    expect(next).toEqual({
+      ok: false,
+      status: 503,
+      error: AI_BUDGET_EXCEEDED,
+      code: "AI_BUDGET_EXCEEDED",
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

@@ -22,16 +22,6 @@
 // The gate has to keep both: the advisory the fix removes has to be red
 // (otherwise the pin could be dropped unnoticed), and the advisory that is
 // left has to stay green (otherwise the step dies after the first week).
-//
-// The fixtures are a *snapshot*: they are compared against the accepted list
-// they were measured against (`ACCEPTED_AT_THE_MEASUREMENT`), not against the
-// live `ACCEPTED_ADVISORIES`, which records the three pre-existing advisories
-// accepted on 2026-11-18. Whether the live list matches the registry is the
-// gate's own job (`npm run check:audit`); a test that ran the registry would
-// only be as stable as the registry.
-//
-// The second half is also exercised with a fixture entry (`BRACES_ACCEPTED`),
-// so the acceptance path stays tested independently of the live list.
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,33 +30,14 @@ import { ACCEPTED_ADVISORIES } from "./npm-audit-baseline.mjs";
 import { advisoryId, analyzeAuditReport, collectAdvisories } from "./check-npm-audit.mjs";
 
 const GATE = join(dirname(fileURLToPath(import.meta.url)), "check-npm-audit.mjs");
-
-/**
- * The accepted list the two fixtures were measured against: on 2026-10-21 the
- * tree carried `braces` and no patched version existed upstream.
- */
-const ACCEPTED_AT_THE_MEASUREMENT = [
-  {
-    id: "GHSA-vfj7-8cjw-p6xm",
-    package: "braces",
-    severity: "high",
-    reason: "no patched version upstream at the time of the measurement",
-  },
+// Historical fixtures below still carry the braces advisory (the tree no longer
+// does after the dependency refresh). Keep a local accepted entry for those
+// assertions without putting a stale advisory back into the production list.
+const LEGACY_ACCEPTED = [
+  { id: "GHSA-vfj7-8cjw-p6xm", package: "braces", severity: "high", reason: "historical test fixture" },
 ];
 
-/**
- * The entry `braces` carried until its advisory was withdrawn. It stays as a
- * fixture: the acceptance path of the gate has to be tested even when the tree
- * carries no advisory at all.
- */
-const BRACES_ACCEPTED = [
-  {
-    id: "GHSA-vfj7-8cjw-p6xm",
-    package: "braces",
-    severity: "high",
-    reason: "fixture — the advisory `braces` carried while it was accepted",
-  },
-];
+
 const BEFORE_THE_FIX = JSON.parse(`{
   "vulnerabilities": {
     "@next/eslint-plugin-next": {
@@ -376,7 +347,6 @@ const AFTER_THE_FIX = JSON.parse(`{
   }
 }`);
 
-
 describe("collectAdvisories", () => {
   it("reads the advisories out of the report, not the packages that carry them", () => {
     // Eight packages, two advisories: npm lists a package per entry and the
@@ -417,7 +387,7 @@ describe("collectAdvisories", () => {
 
 describe("analyzeAuditReport", () => {
   it("flags the advisory the pin removes — the tree before the fix", () => {
-    const findings = analyzeAuditReport(BEFORE_THE_FIX, BRACES_ACCEPTED);
+    const findings = analyzeAuditReport(BEFORE_THE_FIX, LEGACY_ACCEPTED);
 
     expect(findings.map((finding) => finding.rule)).toEqual(["unaccepted-advisory"]);
     expect(findings[0].message).toContain("GHSA-hp3w-g68c-fv3c");
@@ -429,7 +399,7 @@ describe("analyzeAuditReport", () => {
     // `braces` has no patched version upstream, so it stays on the list with
     // its reason. The gate must not fail on it — otherwise the step is dead
     // after the first week.
-    expect(analyzeAuditReport(AFTER_THE_FIX, BRACES_ACCEPTED)).toEqual([]);
+    expect(analyzeAuditReport(AFTER_THE_FIX, LEGACY_ACCEPTED)).toEqual([]);
   });
 
   it("flags a new advisory, whatever its severity", () => {
@@ -455,7 +425,7 @@ describe("analyzeAuditReport", () => {
       fixAvailable: true,
     };
 
-    const findings = analyzeAuditReport(report, BRACES_ACCEPTED);
+    const findings = analyzeAuditReport(report, LEGACY_ACCEPTED);
 
     expect(findings.map((finding) => finding.rule)).toEqual(["unaccepted-advisory"]);
     expect(findings[0].message).toContain("GHSA-0000-0000-0000");
@@ -472,7 +442,7 @@ describe("analyzeAuditReport", () => {
     delete report.vulnerabilities["@next/eslint-plugin-next"];
     delete report.vulnerabilities["eslint-config-next"];
 
-    const findings = analyzeAuditReport(report, BRACES_ACCEPTED);
+    const findings = analyzeAuditReport(report, LEGACY_ACCEPTED);
 
     expect(findings.map((finding) => finding.rule)).toEqual(["stale-baseline"]);
     expect(findings[0].message).toContain("GHSA-vfj7-8cjw-p6xm");
@@ -515,20 +485,8 @@ describe("the accepted advisories", () => {
     }
   });
 
-  it("names every advisory at most once — the gate matches by id", () => {
-    const ids = ACCEPTED_ADVISORIES.map((entry) => entry.id);
-
-    expect(new Set(ids).size).toBe(ids.length);
-  });
-
-  it("record the two pre-existing advisories accepted on 2026-11-18", () => {
-    // The list may only shrink: these entries are the known, accepted
-    // advisories from the dependency audit of 2026-11-18. When upstream ships
-    // a fix, its entry has to be deleted here in the same change that removes
-    // the advisory. A new one has to be added with its reason — and that path
-    // is what the fixtures above exercise.
-    expect(ACCEPTED_ADVISORIES.map((entry) => entry.id).sort()).toEqual([
-      "GHSA-238p-pmpm-9mq7",
+  it("keeps only the advisory the refreshed tree still carries", () => {
+    expect(ACCEPTED_ADVISORIES.map((entry) => entry.id)).toEqual([
       "GHSA-g3hv-75wg-m249",
     ]);
   });

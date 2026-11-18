@@ -35,7 +35,14 @@ async function authorizePage(
   | {
       /** The caller, so a caller-scoped check (the guest page scope) can run. */
       userId: string;
-      page: { id: string; workspaceId: string; parentId: string | null; deletedAt: Date | null };
+      page: {
+        id: string;
+        workspaceId: string;
+        parentId: string | null;
+        deletedAt: Date | null;
+        /** Parent kind, so a database row can be audited as a row edit. */
+        parent: { type: string } | null;
+      };
       access: NonNullable<WorkspaceAccess>;
       /** Effective page rights after the page-level restriction row. */
       capabilities: PageCapabilities;
@@ -49,6 +56,7 @@ async function authorizePage(
       workspaceId: true,
       parentId: true,
       deletedAt: true,
+      parent: { select: { type: true } },
       permissions: {
         where: { userId: user.id },
         select: { level: true },
@@ -364,6 +372,18 @@ export async function updatePageAction(
     },
   });
   await dispatchWebhooks(auth.page.workspaceId, "page.updated", { pageId });
+  // A database row is a Page whose parent is the database. Record real title or
+  // body edits here too, not only property-cell writes, so LAST_EDITED_BY names
+  // the author of the latest edit wherever it was made.
+  if (materiallyChanged && auth.page.parent?.type === "DATABASE") {
+    await logActivity({
+      workspaceId: auth.page.workspaceId,
+      actorId: author.id,
+      action: "row.edited",
+      targetType: "page",
+      targetId: pageId,
+    });
+  }
   // R82.12 — a material edit reaches the page's followers. `notifyPageUpdated`
   // is best-effort and never throws, so the edit's success is unaffected.
   if (materiallyChanged) {
@@ -777,8 +797,15 @@ export async function archivePageAction(pageId: string): Promise<Result> {
   if (!auth.capabilities.edit) {
     return { error: "You do not have permission to delete this page." };
   }
-  await prisma.page.update({
-    where: { id: pageId },
+  // Trash the whole subtree in one update. A child left live would still be
+  // reachable by its direct URL even though its parent is hidden from the tree.
+  const nodes = await prisma.page.findMany({
+    where: { workspaceId: auth.page.workspaceId },
+    select: { id: true, parentId: true },
+  });
+  const ids = subtreeClosure(nodes, [pageId]);
+  await prisma.page.updateMany({
+    where: { id: { in: ids }, workspaceId: auth.page.workspaceId, deletedAt: null },
     data: { deletedAt: new Date(), isArchived: true },
   });
   await logActivity({
@@ -812,10 +839,18 @@ export async function restorePageAction(pageId: string): Promise<Result> {
         select: { id: true },
       })
     : null;
-  await prisma.page.update({
-    where: { id: pageId },
-    data: { deletedAt: null, isArchived: false, ...(parentTrashed ? { parentId: null } : {}) },
+  const nodes = await prisma.page.findMany({
+    where: { workspaceId: auth.page.workspaceId },
+    select: { id: true, parentId: true },
   });
+  const ids = subtreeClosure(nodes, [pageId]);
+  await prisma.page.updateMany({
+    where: { id: { in: ids }, workspaceId: auth.page.workspaceId },
+    data: { deletedAt: null, isArchived: false },
+  });
+  if (parentTrashed) {
+    await prisma.page.update({ where: { id: pageId }, data: { parentId: null } });
+  }
   await logActivity({
     workspaceId: auth.page.workspaceId,
     actorId: null,

@@ -1,16 +1,29 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { Node, mergeAttributes } from "@tiptap/core";
 import {
   NodeViewWrapper,
   ReactNodeViewRenderer,
   type NodeViewProps,
 } from "@tiptap/react";
-import { ExternalLink, Loader2, Pencil, Trash2 } from "lucide-react";
-import { formatCell, type QueryProperty, type ViewConfig } from "@/lib/database-query";
+import { ExternalLink, ListFilter, Loader2, Pencil, Plus, Trash2 } from "lucide-react";
+import {
+  addSort as appendSort,
+  applyView,
+  formatCell,
+  operatorsFor,
+  removeSort,
+  type FilterOperator,
+  type QueryProperty,
+  type QueryRow,
+  type Sort,
+  type ViewConfig,
+} from "@/lib/database-query";
 import { t } from "@/lib/i18n";
 import {
+  canWriteLinkedRows,
   convertMode,
   createLinkedView,
   describeLinkedView,
@@ -21,6 +34,18 @@ import {
   type LinkedViewOverrides,
 } from "@/lib/linked-view";
 import {
+  addFilterLeaf,
+  clearFilterAndSortOverrides,
+  filterBuilderFromConfig,
+  filterLeaves,
+  removeFilterLeaf,
+  setFilterMatch,
+  updateFilterLeaf,
+} from "@/lib/linked-overrides";
+import type { FilterGroup, FilterLeaf } from "@/lib/filter-tree-ui";
+import { guarded } from "@/lib/actions-client";
+import { createRowAction } from "@/server/actions/database";
+import {
   DEFAULT_ROW_HEIGHT,
   parseInlineDatabaseBlock,
   resolveShell,
@@ -30,6 +55,15 @@ import {
   type RowWindow,
   type ShellLayout,
 } from "@/lib/inline-database";
+import {
+  INLINE_SETTABLE_DISPLAYS,
+  resolveInlineView,
+  setInlineOverride,
+  toggleVisibleProperty,
+  visibleInlineProperties,
+  type InlineSettableDisplay,
+} from "@/lib/inline-view-config";
+import { groupRowsByProperty } from "@/lib/board-groups";
 import {
   CARD_SIZES,
   cardFieldOrder,
@@ -45,6 +79,27 @@ import {
   type LinkedDatabaseData,
 } from "@/server/actions/linked-database";
 
+// Transport failures become `{ error }` values, matching the action's own
+// refusal shape. The audit gate treats a `guarded(...)` wrapper as adopted.
+const createLinkedRow = guarded(createRowAction);
+
+// The row editor reuses the full database `Cell` (every property type). It is
+// split out so the editor route does not pay for that surface until a reader
+// actually opens a row.
+const LinkedRowEditor = dynamic(
+  () =>
+    import("./linked-row-editor").then((module) => ({
+      default: module.LinkedRowEditor,
+    })),
+  {
+    ssr: false,
+    loading: () => (
+      <span className="noema-linked-loading">
+        <Loader2 className="h-4 w-4 animate-spin" />
+      </span>
+    ),
+  },
+);
 
 declare module "@tiptap/core" {
   interface Commands<ReturnType> {
@@ -52,6 +107,10 @@ declare module "@tiptap/core" {
       setLinkedDatabase: (attrs?: {
         databasePageId?: string;
         title?: string;
+        sourceViewId?: string;
+        mode?: string;
+        display?: string;
+        overrides?: unknown;
       }) => ReturnType;
     };
   }
@@ -85,6 +144,10 @@ export const LinkedDatabase = Node.create<LinkedDatabaseOptions>({
       mode: { default: "synced", rendered: false },
       /** The bound source view (`@/lib/linked-view` `sourceViewId`). */
       sourceViewId: { default: null, rendered: false },
+      /** Per-instance display overrides (`@/lib/linked-view` `overrides`). */
+      overrides: { default: null, rendered: false },
+      /** Per-instance presentation (table/list/board/gallery), null = source view. */
+      display: { default: null, rendered: false },
       /** Rows the inline shell grows to before scrolling (`@/lib/inline-database`). */
       maxRows: { default: null, rendered: false },
     };
@@ -235,9 +298,44 @@ export function toggleLinkedMode(
   return convertMode(linked, linked.mode === "synced" ? "detached" : "synced", sourceConfig);
 }
 
-function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: NodeViewProps) {
+/**
+ * Apply a source view's saved filters/sorts to the linked rows, preserving the
+ * original row objects (and their `values` maps) in the returned order. A
+ * linked view is a real view: a filter that hides a row in the database must
+ * hide it in the embed too.
+ */
+export function linkedRowsForView(
+  rows: LinkedDatabaseData["rows"],
+  properties: LinkedDatabaseData["properties"],
+  config: ViewConfig | null,
+): LinkedDatabaseData["rows"] {
+  if (!config) return rows;
+  const queryProperties: QueryProperty[] = properties.map((property) => ({
+    id: property.id,
+    name: property.name,
+    type: property.type,
+    config: (property.config ?? null) as QueryProperty["config"],
+  }));
+  const queryRows: QueryRow[] = rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    icon: row.icon,
+    propertyValues: Object.entries(row.values).map(([propertyId, value]) => ({
+      propertyId,
+      value,
+    })),
+  }));
+  const ordered = applyView(queryRows, queryProperties, config).rows;
+  const byId = new Map(rows.map((row) => [row.id, row] as const));
+  return ordered
+    .map((row) => byId.get(row.id))
+    .filter((row): row is LinkedDatabaseData["rows"][number] => row !== undefined);
+}
+
+function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension, editor }: NodeViewProps) {
   const options = extension.options as LinkedDatabaseOptions;
   const locale = options.locale ?? "en";
+  const canConfigure = editor.isEditable;
   const databasePageId = node.attrs.databasePageId as string | null;
   const [query, setQuery] = useState("");
   const [options_, setOptions] = useState<{ id: string; title: string; icon: string | null }[]>([]);
@@ -250,6 +348,11 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
   const [picking, setPicking] = useState(false);
   const [data, setData] = useState<LinkedDatabaseData | null>(null);
   const [loading, setLoading] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [editingRowId, setEditingRowId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [writeError, setWriteError] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   // Gallery card preview: the size follows the measured body width, mirroring
   // `GalleryView` (the initial width of 0 keeps server and client identical).
@@ -288,7 +391,7 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
           setData(null);
         } else {
           setData(result);
-          updateAttributes({ title: result.title });
+          if (canConfigure) updateAttributes({ title: result.title });
         }
       })
       .finally(() => !cancelled && setLoading(false));
@@ -296,7 +399,7 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [databasePageId]);
+  }, [databasePageId, reloadKey]);
 
   useEffect(() => {
     const element = containerRef.current;
@@ -342,9 +445,17 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
                   // Binds a fresh node or repoints an existing one; the read
                   // path resolves the canonical title through
                   // `getLinkedDatabaseAction` once the id lands.
+                  if (!canConfigure) return;
                   setQuery("");
                   setPicking(false);
-                  updateAttributes({ databasePageId: option.id, title: option.title });
+                  updateAttributes({
+                    databasePageId: option.id,
+                    title: option.title,
+                    sourceViewId: null,
+                    mode: "synced",
+                    overrides: null,
+                    display: null,
+                  });
                 }}
                 className="noema-linked-result"
               >
@@ -368,40 +479,79 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
   }
 
   const primary = data?.properties[0];
-  // fix04 — the linked-view identity + inline shell for this instance. Mode and
-  // the bound source view come from the node's attributes; the shell height,
-  // scroll flag and visible row window replace the fixed `slice(0, 20)`.
-  const sourceRows = data?.rows ?? [];
+  // Resolve the node's persisted view choice against the live source database.
+  // A stale/foreign `sourceViewId` falls back to the first view and drops the
+  // instance overrides, so no other view's filters or property ids leak in.
+  const resolved = resolveInlineView({
+    instanceId: databasePageId,
+    databaseId: databasePageId,
+    views: data?.views ?? [],
+    properties: data?.properties ?? [],
+    sourceViewId: node.attrs.sourceViewId as string | null,
+    mode: node.attrs.mode as string | null,
+    display: node.attrs.display as string | null,
+    overrides: node.attrs.overrides,
+  });
+  const sourceView = resolved.sourceView;
+  const sourceConfig = resolved.sourceConfig;
+  // The first pass resolves the instance's effective config (source + local
+  // overrides). The second pass sizes the scroll shell from the rows that
+  // config actually selects: a detached filter that hides half the source must
+  // also shrink the embed instead of leaving dead scroll space.
+  const sizingEmbed = linkedEmbedModel({
+    instanceId: databasePageId,
+    databaseId: databasePageId,
+    sourceViewId: sourceView?.id ?? null,
+    mode: resolved.linked.mode,
+    overrides: resolved.linked.overrides,
+    sourceConfig,
+    sourceViewType: sourceView?.type ?? null,
+    display: resolved.display,
+    maxRows: typeof node.attrs.maxRows === "number" ? (node.attrs.maxRows as number) : 20,
+    contentHeight: 0,
+    viewportHeight: 0,
+    overscan: 0,
+  });
+  const sourceRows = linkedRowsForView(
+    data?.rows ?? [],
+    data?.properties ?? [],
+    sizingEmbed.effective,
+  );
   const embed = linkedEmbedModel({
     instanceId: databasePageId,
     databaseId: databasePageId,
-    sourceViewId: node.attrs.sourceViewId as string | null,
-    mode: node.attrs.mode as string | null,
-    overrides: null,
-    sourceConfig: null,
-    sourceViewType: data?.views[0]?.type ?? null,
+    sourceViewId: sourceView?.id ?? null,
+    mode: resolved.linked.mode,
+    overrides: resolved.linked.overrides,
+    sourceConfig,
+    sourceViewType: sourceView?.type ?? null,
+    display: resolved.display,
     maxRows: typeof node.attrs.maxRows === "number" ? (node.attrs.maxRows as number) : 20,
     contentHeight: sourceRows.length * DEFAULT_ROW_HEIGHT,
     viewportHeight: 0,
     overscan: 0,
   });
   const visibleRows = sourceRows.slice(embed.window.start, embed.window.end);
+  const canWrite = canWriteLinkedRows(embed.linked.mode, data?.canEdit === true);
+  const editingRow = data?.rows.find((row) => row.id === editingRowId) ?? null;
+  const filterTree = filterBuilderFromConfig(embed.effective);
+  const overrideSorts = embed.effective.sorts ?? [];
   // A per-instance override of `visiblePropertyIds` narrows the embed; with no
-  // source config (and so no override) every property renders, as before.
-  const effectiveIds = embed.effective.visiblePropertyIds;
+  // source config (and so no override) every property renders, as before. The
+  // resolver clamps the list to the live schema, so a stale/foreign id can
+  // never hide every column.
+  const effectiveIds = resolved.visiblePropertyIds;
   const visibleProperties =
     effectiveIds === undefined
       ? data?.properties ?? []
       : (data?.properties ?? []).filter(
           (property) => property.id === primary?.id || effectiveIds.includes(property.id),
         );
-  // The source database's first view decides how the embed renders. `table` and
-  // `list` get their own read-only renderers below; `gallery` (and any other or
-  // absent view type — board, calendar, …) uses the card grid this node has
-  // always rendered.
-  const firstViewType = data?.views[0]?.type?.toUpperCase();
-  const viewMode: "table" | "list" | "gallery" =
-    firstViewType === "TABLE" ? "table" : firstViewType === "LIST" ? "list" : "gallery";
+  // The persisted per-instance display (or the source view's type) decides how
+  // the embed renders. Table, list, board and gallery each have a renderer; the
+  // remaining source types use the gallery card grid.
+  const viewMode: InlineSettableDisplay = resolved.display;
+  const groupPropertyId = resolved.groupByPropertyId;
   // The shared view-presets engine reads lower-case property types (e.g.
   // "files"), matching `COVER_PROPERTY_TYPES`; the linked-database payload
   // stores them upper-case.
@@ -430,9 +580,72 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
   )
     .map((id) => data?.properties.find((property) => property.id === id))
     .filter(
-      (property): property is { id: string; name: string; type: string } =>
+      (property): property is LinkedDatabaseData["properties"][number] =>
         property !== undefined,
     );
+  const overrides = resolved.linked.overrides;
+
+  const updateOverrides = (next: LinkedViewOverrides) => {
+    setWriteError(null);
+    updateAttributes({ overrides: next });
+  };
+
+  const applyViewSettings = (nextTree: FilterGroup, nextSorts: Sort[]) => {
+    updateOverrides({
+      ...overrides,
+      filterBuilder: nextTree,
+      sorts: nextSorts,
+    });
+  };
+
+  const applyDisplay = (display: InlineSettableDisplay) => {
+    setWriteError(null);
+    updateAttributes({ display });
+  };
+
+  const applyVisibleProperty = (propertyId: string, checked: boolean) => {
+    const selected = visibleInlineProperties(data?.properties ?? [], embed.effective);
+    updateOverrides(
+      setInlineOverride(
+        overrides,
+        "visiblePropertyIds",
+        toggleVisibleProperty(selected, propertyId, checked),
+      ) as LinkedViewOverrides,
+    );
+  };
+
+  const applyGroupBy = (propertyId: string) => {
+    updateOverrides(
+      setInlineOverride(
+        overrides,
+        "groupByPropertyId",
+        propertyId === "" ? undefined : propertyId,
+      ) as LinkedViewOverrides,
+    );
+  };
+
+  const createRow = async () => {
+    setCreating(true);
+    setWriteError(null);
+    const result = await createLinkedRow(databasePageId);
+    if ("error" in result) {
+      setWriteError(result.error);
+      setCreating(false);
+      return;
+    }
+    // Read once so the new empty row is present before the editor opens. The
+    // block remains usable if that read fails; the next explicit reload will
+    // pick the row up.
+    const refreshed = await getLinkedDatabaseAction(databasePageId);
+    if ("error" in refreshed) {
+      setWriteError(refreshed.error);
+      setReloadKey((key) => key + 1);
+    } else {
+      setData(refreshed);
+      setEditingRowId(result.id);
+    }
+    setCreating(false);
+  };
 
   return (
     <NodeViewWrapper className="noema-linked-db" data-linked-database="">
@@ -442,16 +655,76 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
             {data?.icon ?? "🗂️"}{" "}
             {String(node.attrs.title ?? data?.title ?? t(locale, "linkedDatabaseFallback"))}
           </span>
+          {data && data.views.length > 0 && (
+            <select
+              aria-label={t(locale, "linkedViewLabel")}
+              className="noema-linked-open noema-linked-view"
+              value={sourceView?.id ?? ""}
+              disabled={!canConfigure}
+              onChange={(event) => {
+                // Rebinding starts from the source again: a detached instance
+                // must not carry the previous view's filters into the new one.
+                updateAttributes({
+                  sourceViewId: event.target.value,
+                  mode: "synced",
+                  overrides: null,
+                  display: null,
+                });
+              }}
+            >
+              {data.views.map((view) => (
+                <option key={view.id} value={view.id}>
+                  {view.name || t(locale, "untitled")}
+                </option>
+              ))}
+            </select>
+          )}
           <button
             type="button"
             aria-pressed={embed.linked.mode === "detached"}
             aria-label={t(locale, "syncedViewHint")}
             title={t(locale, "syncedViewHint")}
-            onClick={() => updateAttributes({ mode: toggleLinkedMode(embed.linked, null).mode })}
+            disabled={!canConfigure}
+            onClick={() => {
+              const next = toggleLinkedMode(embed.linked, embed.effective);
+              updateAttributes({
+                sourceViewId: next.sourceViewId ?? null,
+                mode: next.mode,
+                overrides: next.overrides,
+              });
+            }}
             className="noema-linked-open"
           >
             {embed.linked.mode}
           </button>
+          {data && canConfigure && (
+            <button
+              type="button"
+              aria-pressed={settingsOpen}
+              aria-label={`${t(locale, "linkedViewLabel")} / ${t(locale, "dbFilter")} / ${t(locale, "dbSort")}`}
+              title={`${t(locale, "linkedViewLabel")} / ${t(locale, "dbFilter")} / ${t(locale, "dbSort")}`}
+              onClick={() => setSettingsOpen((open) => !open)}
+              className="noema-linked-open inline-flex items-center gap-1"
+            >
+              <ListFilter className="h-3.5 w-3.5" />
+            </button>
+          )}
+          {canWrite && (
+            <button
+              type="button"
+              aria-label={t(locale, "newRow")}
+              title={t(locale, "newRow")}
+              disabled={creating}
+              onClick={() => void createRow()}
+              className="noema-linked-open inline-flex items-center gap-1"
+            >
+              {creating ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Plus className="h-3.5 w-3.5" />
+              )}
+            </button>
+          )}
           <a
             href={`/w/${options.workspaceSlug}/${databasePageId}`}
             className="noema-linked-open"
@@ -481,6 +754,29 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
             <Trash2 className="h-3.5 w-3.5" />
           </button>
         </div>
+        {writeError && (
+          <p role="alert" className="noema-linked-empty border-t border-border px-3 py-2">
+            {writeError}
+          </p>
+        )}
+        {settingsOpen && canConfigure && data && (
+          <LinkedViewSettingsPanel
+            locale={locale}
+            properties={data.properties}
+            mode={resolved.linked.mode}
+            display={resolved.display}
+            visiblePropertyIds={visibleInlineProperties(data.properties, embed.effective)}
+            groupByPropertyId={resolved.groupByPropertyId ?? ""}
+            primaryId={primary?.id ?? null}
+            builder={filterTree}
+            sorts={overrideSorts}
+            onDisplayChange={applyDisplay}
+            onVisiblePropertyChange={applyVisibleProperty}
+            onGroupByChange={applyGroupBy}
+            onChange={applyViewSettings}
+            onReset={() => updateOverrides(clearFilterAndSortOverrides(overrides))}
+          />
+        )}
         <div
           className="noema-linked-body"
           contentEditable={false}
@@ -504,12 +800,25 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
               columns={visibleProperties}
               rows={visibleRows}
               primaryId={primary?.id ?? null}
+              canWrite={canWrite}
+              onEdit={(rowId) => setEditingRowId(rowId)}
             />
           ) : viewMode === "list" ? (
             <LinkedListView
               locale={locale}
               properties={presetProperties}
               rows={visibleRows}
+              canWrite={canWrite}
+              onEdit={(rowId) => setEditingRowId(rowId)}
+            />
+          ) : viewMode === "board" ? (
+            <LinkedBoardView
+              locale={locale}
+              properties={data.properties}
+              groupPropertyId={groupPropertyId ?? ""}
+              rows={sourceRows}
+              canWrite={canWrite}
+              onEdit={(rowId) => setEditingRowId(rowId)}
             />
           ) : (
             <div
@@ -533,8 +842,19 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
                 return (
                   <div
                     key={row.id}
-                    className="overflow-hidden rounded-lg border border-border bg-bg"
+                    className="relative overflow-hidden rounded-lg border border-border bg-bg"
                   >
+                    {canWrite && (
+                      <button
+                        type="button"
+                        aria-label={t(locale, "edit")}
+                        title={t(locale, "edit")}
+                        onClick={() => setEditingRowId(row.id)}
+                        className="noema-linked-open absolute right-1 top-1 bg-bg/80 backdrop-blur"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                    )}
                     {spec.showPreview && (
                       <div
                         className="grid place-items-center overflow-hidden bg-surface text-3xl"
@@ -571,7 +891,7 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
                                   id: property.id,
                                   name: property.name,
                                   type: property.type,
-                                  config: null,
+                                  config: (property.config ?? null) as QueryProperty["config"],
                                 } as QueryProperty,
                               ) || "—"}
                             </dd>
@@ -586,6 +906,28 @@ function LinkedDatabaseView({ node, updateAttributes, deleteNode, extension }: N
           )}
         </div>
       </div>
+      {editingRow && data && (
+        <LinkedRowEditor
+          row={editingRow}
+          data={data}
+          workspaceId={options.workspaceId}
+          locale={locale}
+          onClose={() => setEditingRowId(null)}
+          onSaved={() => setReloadKey((key) => key + 1)}
+          onDeleted={() => {
+            const deletedId = editingRow.id;
+            setEditingRowId(null);
+            setData((current) =>
+              current
+                ? {
+                    ...current,
+                    rows: current.rows.filter((candidate) => candidate.id !== deletedId),
+                  }
+                : current,
+            );
+          }}
+        />
+      )}
     </NodeViewWrapper>
   );
 }
@@ -618,11 +960,15 @@ function LinkedTableView({
   columns,
   rows,
   primaryId,
+  canWrite,
+  onEdit,
 }: {
   locale: string;
   columns: { id: string; name: string; type: string }[];
   rows: readonly LinkedDatabaseRow[];
   primaryId: string | null;
+  canWrite: boolean;
+  onEdit: (rowId: string) => void;
 }) {
   return (
     <table className="noema-linked-table">
@@ -631,6 +977,7 @@ function LinkedTableView({
           {columns.map((property) => (
             <th key={property.id}>{property.name}</th>
           ))}
+          {canWrite && <th aria-label={t(locale, "edit")} />}
         </tr>
       </thead>
       <tbody>
@@ -651,10 +998,454 @@ function LinkedTableView({
                     ) || "—"}
               </td>
             ))}
+            {canWrite && (
+              <td className="w-8">
+                <button
+                  type="button"
+                  aria-label={t(locale, "edit")}
+                  title={t(locale, "edit")}
+                  onClick={() => onEdit(row.id)}
+                  className="noema-linked-open"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+              </td>
+            )}
           </tr>
         ))}
       </tbody>
     </table>
+  );
+}
+
+/**
+ * The in-block view editor for a linked instance. View type, visible properties
+ * and group-by are display-level overrides and work in both synced and detached
+ * mode; filters and sorts are row-selection overrides and only editable once the
+ * instance is detached (a synced block mirrors the source view's rows). Every
+ * edit writes the node's own attrs — the source view is never written.
+ */
+const INLINE_DISPLAY_LABELS: Record<InlineSettableDisplay, string> = {
+  table: "Table",
+  list: "List",
+  board: "Board",
+  gallery: "Gallery",
+};
+
+const INLINE_GROUPABLE_TYPES = new Set(["SELECT", "STATUS", "MULTI_SELECT"]);
+
+function LinkedViewSettingsPanel({
+  locale,
+  properties,
+  mode,
+  display,
+  visiblePropertyIds,
+  groupByPropertyId,
+  primaryId,
+  builder,
+  sorts,
+  onDisplayChange,
+  onVisiblePropertyChange,
+  onGroupByChange,
+  onChange,
+  onReset,
+}: {
+  locale: string;
+  properties: LinkedDatabaseData["properties"];
+  mode: "synced" | "detached";
+  display: InlineSettableDisplay;
+  visiblePropertyIds: readonly string[];
+  groupByPropertyId: string;
+  primaryId: string | null;
+  builder: FilterGroup;
+  sorts: readonly Sort[];
+  onDisplayChange: (display: InlineSettableDisplay) => void;
+  onVisiblePropertyChange: (propertyId: string, checked: boolean) => void;
+  onGroupByChange: (propertyId: string) => void;
+  onChange: (builder: FilterGroup, sorts: Sort[]) => void;
+  onReset: () => void;
+}) {
+  const leaves = filterLeaves(builder);
+  const firstProperty = properties[0] ?? null;
+  const groupableProperties = properties.filter((property) =>
+    INLINE_GROUPABLE_TYPES.has(property.type.toUpperCase()),
+  );
+  const selectedVisible = new Set(visiblePropertyIds);
+  const noValue = new Set<FilterOperator>([
+    "is_empty",
+    "is_not_empty",
+    "checked",
+    "unchecked",
+  ]);
+  const propertyFor = (propertyId: string) =>
+    properties.find((property) => property.id === propertyId) ?? null;
+  const defaultOperator = (type: string): FilterOperator =>
+    (operatorsFor(type)[0]?.value as FilterOperator | undefined) ?? "is";
+
+  const addFilter = () => {
+    if (!firstProperty) return;
+    const op = defaultOperator(firstProperty.type);
+    onChange(
+      addFilterLeaf(builder, {
+        propertyId: firstProperty.id,
+        op,
+        ...(noValue.has(op) ? {} : { value: "" }),
+      }),
+      [...sorts],
+    );
+  };
+
+  const changeFilter = (leaf: FilterLeaf, patch: Partial<FilterLeaf>) => {
+    onChange(updateFilterLeaf(builder, leaf.id, patch), [...sorts]);
+  };
+
+  const changeFilterProperty = (leaf: FilterLeaf, propertyId: string) => {
+    const property = propertyFor(propertyId);
+    if (!property) return;
+    const op = defaultOperator(property.type);
+    changeFilter(leaf, {
+      propertyId,
+      op,
+      ...(noValue.has(op) ? {} : { value: "" }),
+    });
+  };
+
+  const changeFilterOperator = (leaf: FilterLeaf, op: FilterOperator) => {
+    changeFilter(leaf, {
+      op,
+      ...(noValue.has(op) ? {} : { value: leaf.value ?? "" }),
+    });
+  };
+
+  const addSort = () => {
+    const used = new Set(sorts.map((sort) => sort.propertyId));
+    const candidate = properties.find((property) => !used.has(property.id));
+    if (candidate) onChange(builder, appendSort([...sorts], candidate.id, "asc"));
+  };
+
+  return (
+    <div
+      className="space-y-2 border-t border-border px-3 py-2 text-xs"
+      data-testid="linked-view-overrides"
+      contentEditable={false}
+    >
+      <div className="space-y-2" data-testid="linked-view-config">
+        <label className="flex items-center gap-2">
+          <span className="font-medium text-muted">{t(locale, "linkedViewLabel")}</span>
+          <select
+            aria-label={t(locale, "linkedViewLabel")}
+            data-testid="linked-view-display"
+            value={display}
+            onChange={(event) =>
+              onDisplayChange(event.target.value as InlineSettableDisplay)
+            }
+            className="h-7 rounded-control border border-border bg-bg px-1"
+          >
+            {INLINE_SETTABLE_DISPLAYS.map((candidate) => (
+              <option key={candidate} value={candidate}>
+                {INLINE_DISPLAY_LABELS[candidate]}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <fieldset className="space-y-1" data-testid="linked-view-properties">
+          <legend className="font-medium text-muted">{t(locale, "dbProperties")}</legend>
+          {properties.map((property) => {
+            const isPrimary = property.id === primaryId;
+            return (
+              <label key={property.id} className="flex items-center gap-1">
+                <input
+                  type="checkbox"
+                  data-testid={`linked-view-property-${property.id}`}
+                  checked={isPrimary || selectedVisible.has(property.id)}
+                  disabled={isPrimary}
+                  onChange={(event) =>
+                    onVisiblePropertyChange(property.id, event.target.checked)
+                  }
+                />
+                <span className="truncate">{property.name}</span>
+              </label>
+            );
+          })}
+        </fieldset>
+
+        <label className="flex items-center gap-2">
+          <span className="font-medium text-muted">{t(locale, "groupByLabel")}</span>
+          <select
+            aria-label={t(locale, "groupByLabel")}
+            data-testid="linked-view-group"
+            value={groupByPropertyId}
+            onChange={(event) => onGroupByChange(event.target.value)}
+            className="h-7 min-w-0 flex-1 rounded-control border border-border bg-bg px-1"
+          >
+            <option value="">—</option>
+            {groupableProperties.map((property) => (
+              <option key={property.id} value={property.id}>
+                {property.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      {mode === "detached" ? (
+        <>
+      <div className="flex items-center gap-2">
+        <span className="font-medium text-muted">{t(locale, "dbFilter")}</span>
+        {leaves.length > 1 && (
+          <select
+            aria-label={t(locale, "filterMatchModeAria")}
+            value={builder.op}
+            onChange={(event) =>
+              onChange(setFilterMatch(builder, event.target.value === "or" ? "or" : "and"), [
+                ...sorts,
+              ])
+            }
+            className="h-7 rounded-control border border-border bg-bg px-1"
+          >
+            <option value="and">AND</option>
+            <option value="or">OR</option>
+          </select>
+        )}
+        <button
+          type="button"
+          onClick={addFilter}
+          disabled={!firstProperty}
+          className="noema-linked-open ml-auto inline-flex items-center gap-1 disabled:opacity-50"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t(locale, "add")}
+        </button>
+      </div>
+      {leaves.map((leaf) => {
+        const property = propertyFor(leaf.propertyId);
+        const operators = property ? operatorsFor(property.type) : [];
+        return (
+          <div key={leaf.id} className="flex flex-wrap items-center gap-1">
+            <select
+              aria-label={t(locale, "properties")}
+              value={leaf.propertyId}
+              onChange={(event) => changeFilterProperty(leaf, event.target.value)}
+              className="h-7 max-w-36 rounded-control border border-border bg-bg px-1"
+            >
+              {!property && <option value={leaf.propertyId}>{leaf.propertyId}</option>}
+              {properties.map((candidate) => (
+                <option key={candidate.id} value={candidate.id}>
+                  {candidate.name}
+                </option>
+              ))}
+            </select>
+            <select
+              aria-label={t(locale, "filterOperatorAria")}
+              value={leaf.op}
+              onChange={(event) =>
+                changeFilterOperator(leaf, event.target.value as FilterOperator)
+              }
+              className="h-7 max-w-36 rounded-control border border-border bg-bg px-1"
+            >
+              {operators.map((operator) => (
+                <option key={operator.value} value={operator.value}>
+                  {operator.label}
+                </option>
+              ))}
+            </select>
+            {!noValue.has(leaf.op) && (
+              <input
+                aria-label={t(locale, "filterGroupValueAria")}
+                value={leaf.value ?? ""}
+                onChange={(event) => changeFilter(leaf, { value: event.target.value })}
+                className="h-7 min-w-20 flex-1 rounded-control border border-border bg-bg px-1"
+              />
+            )}
+            <button
+              type="button"
+              aria-label={t(locale, "remove")}
+              title={t(locale, "remove")}
+              onClick={() => onChange(removeFilterLeaf(builder, leaf.id), [...sorts])}
+              className="noema-linked-open"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        );
+      })}
+
+      <div className="flex items-center gap-2 border-t border-border pt-2">
+        <span className="font-medium text-muted">{t(locale, "dbSort")}</span>
+        <button
+          type="button"
+          onClick={addSort}
+          disabled={properties.length === 0}
+          className="noema-linked-open ml-auto inline-flex items-center gap-1 disabled:opacity-50"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          {t(locale, "add")}
+        </button>
+      </div>
+      {sorts.map((sort) => (
+        <div key={sort.propertyId} className="flex items-center gap-1">
+          <select
+            aria-label={t(locale, "properties")}
+            value={sort.propertyId}
+            onChange={(event) =>
+              onChange(
+                builder,
+                sorts.map((candidate) =>
+                  candidate.propertyId === sort.propertyId
+                    ? { ...candidate, propertyId: event.target.value }
+                    : candidate,
+                ),
+              )
+            }
+            className="h-7 min-w-0 flex-1 rounded-control border border-border bg-bg px-1"
+          >
+            {properties.map((property) => (
+              <option key={property.id} value={property.id}>
+                {property.name}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            aria-label={t(locale, "sortDirection")}
+            title={t(locale, "sortDirection")}
+            onClick={() =>
+              onChange(
+                builder,
+                sorts.map((candidate) =>
+                  candidate.propertyId === sort.propertyId
+                    ? {
+                        ...candidate,
+                        direction: candidate.direction === "asc" ? "desc" : "asc",
+                      }
+                    : candidate,
+                ),
+              )
+            }
+            className="noema-linked-open"
+          >
+            {sort.direction === "asc" ? "↑" : "↓"}
+          </button>
+          <button
+            type="button"
+            aria-label={t(locale, "remove")}
+            title={t(locale, "remove")}
+            onClick={() => onChange(builder, removeSort([...sorts], sort.propertyId))}
+            className="noema-linked-open"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+
+      {(leaves.length > 0 || sorts.length > 0) && (
+        <button
+          type="button"
+          onClick={onReset}
+          className="noema-linked-open text-xs"
+        >
+          {t(locale, "clear")}
+        </button>
+      )}
+        </>
+      ) : (
+        <p className="border-t border-border pt-2 text-xs text-muted">
+          {t(locale, "syncedViewHint")}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Read-only board mode. Columns follow the instance's `groupByPropertyId`
+ * (the source view's group when unset), using the same bucket engine as the
+ * full database board. A missing/foreign group property shows the shared
+ * "needs a select or status property" hint instead of empty columns.
+ */
+function LinkedBoardView({
+  locale,
+  properties,
+  groupPropertyId,
+  rows,
+  canWrite,
+  onEdit,
+}: {
+  locale: string;
+  properties: LinkedDatabaseData["properties"];
+  groupPropertyId: string;
+  rows: readonly LinkedDatabaseRow[];
+  canWrite: boolean;
+  onEdit: (rowId: string) => void;
+}) {
+  const groupProperty = properties.find(
+    (property) => property.id === groupPropertyId,
+  );
+  if (!groupProperty) {
+    return <p className="noema-linked-empty">{t(locale, "boardNeedsGroup")}</p>;
+  }
+
+  const descriptors = properties.map((property) => ({
+    id: property.id,
+    name: property.name,
+    type: property.type,
+    config: (property.config ?? null) as { options?: { id: string; name: string; color?: string }[] } | null,
+  }));
+  const boardRows = rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    icon: row.icon,
+    propertyValues: Object.entries(row.values).map(([propertyId, value]) => ({
+      propertyId,
+      value,
+    })),
+  }));
+  const groups = groupRowsByProperty(boardRows, descriptors, groupPropertyId);
+
+  return (
+    <div
+      data-testid="linked-board"
+      data-group-property={groupPropertyId}
+      className="flex snap-x gap-2 overflow-x-auto p-2"
+    >
+      {groups.map((group) => (
+        <section
+          key={group.key}
+          data-group={group.key}
+          className="min-w-40 flex-1 snap-start rounded-lg border border-border bg-surface p-2"
+        >
+          <header className="mb-2 flex items-center justify-between gap-2 text-xs font-medium">
+            <span className="truncate">{group.label}</span>
+            <span className="text-muted">{group.rows.length}</span>
+          </header>
+          <ul className="space-y-1">
+            {group.rows.map((row) => (
+              <li
+                key={row.id}
+                className="flex items-center gap-1 rounded-md border border-border bg-bg px-2 py-1 text-xs"
+              >
+                <span className="w-4 shrink-0 text-center">{row.icon ?? "📄"}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  {row.title || t(locale, "untitled")}
+                </span>
+                {canWrite && (
+                  <button
+                    type="button"
+                    aria-label={t(locale, "edit")}
+                    title={t(locale, "edit")}
+                    onClick={() => onEdit(row.id)}
+                    className="noema-linked-open shrink-0"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ))}
+    </div>
   );
 }
 
@@ -668,10 +1459,14 @@ function LinkedListView({
   locale,
   properties,
   rows,
+  canWrite,
+  onEdit,
 }: {
   locale: string;
   properties: readonly ViewPropertyLike[];
   rows: readonly LinkedDatabaseRow[];
+  canWrite: boolean;
+  onEdit: (rowId: string) => void;
 }) {
   return (
     <ul className="divide-y divide-border">
@@ -682,7 +1477,7 @@ function LinkedListView({
         return (
           <li key={row.id} className="flex items-center gap-2 py-1.5">
             <span className="w-4 text-center">{row.icon ?? "📄"}</span>
-            <span className="min-w-0">
+            <span className="min-w-0 flex-1">
               <span className="block truncate text-sm">
                 {model.primary || t(locale, "untitled")}
               </span>
@@ -692,6 +1487,17 @@ function LinkedListView({
                 </span>
               )}
             </span>
+            {canWrite && (
+              <button
+                type="button"
+                aria-label={t(locale, "edit")}
+                title={t(locale, "edit")}
+                onClick={() => onEdit(row.id)}
+                className="noema-linked-open shrink-0"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+            )}
           </li>
         );
       })}

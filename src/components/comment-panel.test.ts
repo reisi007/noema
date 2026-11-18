@@ -26,6 +26,8 @@ vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 const {
   CommentPanel,
   commentAvatar,
+  commentComposerAnchor,
+  commentJumpTarget,
   mentionHints,
   relativeTimestamp,
   resolveState,
@@ -91,6 +93,72 @@ describe("relativeTimestamp", () => {
   });
 });
 
+describe("commentComposerAnchor", () => {
+  it("keeps the exact captured range and quote", () => {
+    expect(
+      commentComposerAnchor({
+        quote: "selected words",
+        blockId: "b1",
+        from: 4,
+        to: 18,
+      }),
+    ).toEqual({
+      quote: "selected words",
+      blockId: "b1",
+      from: 4,
+      to: 18,
+    });
+  });
+
+  it("drops a half or inverted range instead of guessing", () => {
+    expect(
+      commentComposerAnchor({ quote: "x", blockId: "b1", from: 4 }),
+    ).toMatchObject({ from: null, to: null });
+    expect(
+      commentComposerAnchor({ quote: "x", blockId: "b1", from: 9, to: 4 }),
+    ).toMatchObject({ from: null, to: null });
+  });
+
+  it("keeps a block-only or page-level hand-off usable", () => {
+    expect(commentComposerAnchor({ quote: "whole block", blockId: "b1" })).toEqual({
+      quote: "whole block",
+      blockId: "b1",
+      from: null,
+      to: null,
+    });
+    expect(commentComposerAnchor(undefined)).toEqual({
+      quote: "",
+      blockId: null,
+      from: null,
+      to: null,
+    });
+  });
+});
+
+describe("commentJumpTarget", () => {
+  it("carries the persisted range to the editor", () => {
+    expect(
+      commentJumpTarget({
+        id: "c1",
+        blockId: "b1",
+        quote: "selected words",
+        anchorFrom: 4,
+        anchorTo: 18,
+      }),
+    ).toEqual({
+      commentId: "c1",
+      blockId: "b1",
+      quote: "selected words",
+      from: 4,
+      to: 18,
+    });
+  });
+
+  it("is null for an unanchored comment", () => {
+    expect(commentJumpTarget({ id: "c1", blockId: null })).toBeNull();
+  });
+});
+
 /* ------------------------------------------------------------- markup ---- */
 
 type Comment = Parameters<typeof CommentPanel>[0]["comments"][number];
@@ -100,6 +168,7 @@ function makeComment(overrides: Partial<Comment> = {}): Comment {
     id: "c1",
     body: "First!",
     quote: "the anchored words",
+    blockId: null,
     resolved: false,
     reactions: [{ emoji: "👍", count: 2, mine: false }],
     createdAt: "2026-03-16T00:00:00.000Z",
@@ -139,6 +208,53 @@ describe("CommentPanel markup", () => {
     expect(html).toContain('data-testid="reaction-chip-👍"');
     expect(html).toContain("Reply");
     expect(html).toContain("Resolve");
+    // No block anchor was stored, so there is no jump affordance.
+    expect(html).not.toContain('data-testid="comment-jump-c1"');
+  });
+
+  it("offers a jump to a persisted block anchor", () => {
+    const html = render({ comments: [makeComment({ blockId: "block-42" })] });
+    expect(html).toContain('data-testid="comment-jump-c1"');
+    expect(html).toContain('data-comment-block-id="block-42"');
+    expect(html).toContain("Jump to block");
+    expect(html).toContain('aria-label="Jump to block: block-42"');
+  });
+
+  it("offers a jump to a live exact range", () => {
+    const html = render({
+      comments: [
+        makeComment({
+          blockId: "block-42",
+          anchorFrom: 4,
+          anchorTo: 18,
+          anchorState: "valid",
+        }),
+      ],
+    });
+    expect(html).toContain('data-testid="comment-jump-c1"');
+    expect(html).toContain('data-comment-anchor-state="valid"');
+    expect(html).toContain("Jump to text");
+    expect(html).toContain('aria-label="Jump to text: block-42"');
+    expect(html).not.toContain('data-testid="comment-anchor-stale"');
+  });
+
+  it("keeps the quote but marks a stale range instead of implying it is intact", () => {
+    const html = render({
+      comments: [
+        makeComment({
+          blockId: "block-42",
+          anchorFrom: 4,
+          anchorTo: 18,
+          anchorState: "stale",
+        }),
+      ],
+    });
+    // The quote is still shown, and the jump still lands on the block.
+    expect(html).toContain("the anchored words");
+    expect(html).toContain('data-testid="comment-anchor-stale"');
+    expect(html).toContain("Text changed");
+    expect(html).toContain('data-comment-anchor-state="stale"');
+    expect(html).toContain("Jump to block");
   });
 
   it("renders a resolved thread muted with a Resolved tag", () => {
@@ -162,6 +278,31 @@ describe("CommentPanel markup", () => {
     const html = render({ loading: true });
     expect(html).toContain('data-testid="comment-list-loading"');
     expect(html).not.toContain('data-testid="comment-c1"');
+  });
+
+  it("lays a comment body and its quote out on their own bidi direction", () => {
+    const arabic = "\u0645\u0631\u062D\u0628\u0627"; // مرحبا
+    const html = render({ comments: [makeComment({ body: arabic, quote: arabic })] });
+    // The body paragraph and the quote both resolve RTL from their content,
+    // instead of inheriting the English document direction.
+    expect(html).toMatch(/<p dir="rtl"[^>]*dir-rtl/);
+    expect(html).toMatch(/<blockquote[^>]*dir="rtl"/);
+    expect(html).toContain(arabic);
+  });
+
+  it("isolates rich segments and author names so punctuation cannot jump", () => {
+    const arabic = "\u0645\u0631\u062D\u0628\u0627";
+    const html = render({
+      comments: [
+        makeComment({
+          body: `See @[${arabic}](u2) at https://example.com/${arabic}.`,
+        }),
+      ],
+    });
+    // Mentions and links are native <bdi> isolates; so is the author name.
+    expect(html.match(/<bdi>/g)?.length).toBeGreaterThanOrEqual(3);
+    expect(html).toContain(`<bdi>@${arabic}</bdi>`);
+    expect(html).toContain(`<bdi>https://example.com/${arabic}</bdi>`);
   });
 
   it("renders the error state with a retry action", () => {

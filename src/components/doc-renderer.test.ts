@@ -20,6 +20,15 @@ const render = (doc: unknown): string =>
 const hrefsOf = (html: string): string[] =>
   [...html.matchAll(/href="([^"]*)"/g)].map((match) => match[1]);
 
+const mathDoc = (type: "inlineMath" | "blockMath", latex: string) => ({
+  type: "doc",
+  content: [
+    type === "inlineMath"
+      ? { type: "paragraph", content: [{ type, attrs: { latex } }] }
+      : { type, attrs: { latex } },
+  ],
+});
+
 const linkDoc = (href: string) => ({
   type: "doc",
   content: [
@@ -106,6 +115,67 @@ describe("DocRenderer href scheme gate (H2)", () => {
 });
 
 /**
+ * User-authored prose (the read side of the editor) carries the same bidi
+ * treatment as the editing surface: each block resolves its own direction and
+ * mixed runs are isolated, so an Arabic fragment inside an English paragraph
+ * never reorders the punctuation around it.
+ */
+describe("DocRenderer bidi isolation", () => {
+  const arabic = "\u0645\u0631\u062D\u0628\u0627"; // مرحبا
+  const hebrew = "\u05D0\u05D1\u05D2"; // אבג
+
+  const blockDoc = (type: "paragraph" | "heading", text: string) => ({
+    type: "doc",
+    content: [
+      {
+        type,
+        ...(type === "heading" ? { attrs: { level: 2 } } : {}),
+        content: [{ type: "text", text }],
+      },
+    ],
+  });
+
+  it("resolves a paragraph's base direction from its own first strong character", () => {
+    expect(render(blockDoc("paragraph", "hello"))).toMatch(
+      /<p dir="ltr"[^>]*class="[^"]*dir-ltr/,
+    );
+    expect(render(blockDoc("paragraph", arabic))).toMatch(
+      /<p dir="rtl"[^>]*class="[^"]*dir-rtl/,
+    );
+    // No strong character: defer to the surrounding document direction.
+    expect(render(blockDoc("paragraph", "123"))).toMatch(
+      /<p dir="auto"[^>]*class="[^"]*dir-auto/,
+    );
+  });
+
+  it("isolates mixed prose without flipping its base direction", () => {
+    expect(render(blockDoc("paragraph", `hello ${arabic}`))).toMatch(
+      /<p dir="ltr"[^>]*class="[^"]*dir-mixed/,
+    );
+    expect(render(blockDoc("heading", `${arabic} hello`))).toMatch(
+      /<h2 dir="rtl"[^>]*class="[^"]*dir-rtl dir-mixed/,
+    );
+  });
+
+  it("carries the same treatment to a blockquote", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "blockquote",
+          content: [
+            { type: "paragraph", content: [{ type: "text", text: hebrew }] },
+          ],
+        },
+      ],
+    });
+    expect(html).toMatch(/<blockquote[^>]*dir="rtl"/);
+    // The quote rail is logical (border-inline-start), so it mirrors in RTL.
+    expect(html).toContain("border-inline-start");
+  });
+});
+
+/**
  * B69 - the read path never points a browser at a third party.
  *
  * The renderer used to emit the stored `src` verbatim, so opening a shared
@@ -144,6 +214,22 @@ describe("DocRenderer external images (B69)", () => {
     expect(srcsOf(render(imageDoc("javascript:alert(1)")))).toEqual([]);
   });
 
+  it("shrink-wraps an unsized picture so centring can take effect", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "image",
+          attrs: { src: "/api/files/ws-1/a.png", align: "center", alt: "centred" },
+        },
+      ],
+    });
+    expect(html).toContain("width:fit-content");
+    expect(html).toContain("max-width:100%");
+    expect(html).toContain("margin-left:auto");
+    expect(html).toContain("margin-right:auto");
+  });
+
   it("proxies the favicon and the og:image of a bookmark card", () => {
     const html = render({
       type: "doc",
@@ -167,6 +253,103 @@ describe("DocRenderer external images (B69)", () => {
     ]);
   });
 });
+
+
+describe("DocRenderer template button / Button atoms", () => {
+  it("renders a template button as a labelled, read-only card", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "templateButton",
+          attrs: { id: "tb1", templateId: "meeting", label: "Meeting notes" },
+        },
+      ],
+    });
+    expect(html).toContain('data-template-button=""');
+    expect(html).toContain('data-template-id="meeting"');
+    expect(html).toContain("Meeting notes");
+  });
+
+  it("renders a Button block as a disabled labelled action summary", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "button",
+          attrs: {
+            id: "b1",
+            label: "Open report",
+            style: "primary",
+            action: { kind: "open_url", url: "https://example.com/report" },
+          },
+        },
+      ],
+    });
+    expect(html).toContain('data-button-block=""');
+    expect(html).toContain("Open report");
+    expect(html).toContain("disabled");
+    expect(html).toContain("Open &quot;https://example.com/report&quot;");
+  });
+
+  it("renders an unconfigured Button honestly instead of a silent no-op", () => {
+    const html = render({
+      type: "doc",
+      content: [{ type: "button", attrs: { id: "b2", label: "" } }],
+    });
+    expect(html).toContain("Button");
+    expect(html).toContain("disabled");
+    expect(html).toContain("Configure the button first");
+  });
+});
+
+describe("DocRenderer Ask AI block", () => {
+  it("renders the prompt and the stored answer, with no interactive control", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "askAi",
+          attrs: {
+            id: "ask1",
+            prompt: "What changed this week?",
+            mode: "ask",
+            answer: "Two releases shipped.",
+            status: "done",
+          },
+        },
+      ],
+    });
+    expect(html).toContain('data-ask-ai=""');
+    expect(html).toContain('data-ask-ai-read=""');
+    expect(html).toContain("What changed this week?");
+    expect(html).toContain("Two releases shipped.");
+    expect(html).not.toContain("<button");
+  });
+
+  it("renders the error honestly and remains readable when AI failed", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "askAi",
+          attrs: {
+            id: "ask2",
+            prompt: "Summarize this page",
+            mode: "summarize",
+            status: "error",
+            error: "AI is not configured.",
+          },
+        },
+      ],
+    });
+    expect(html).toContain('data-mode="summarize"');
+    expect(html).toContain('role="alert"');
+    expect(html).toContain("AI is not configured.");
+    expect(html).not.toContain("<button");
+  });
+});
+
 describe("DocRenderer Mermaid blocks", () => {
   it("routes Mermaid code to the client diagram renderer", () => {
     const html = render({
@@ -181,5 +364,182 @@ describe("DocRenderer Mermaid blocks", () => {
     });
     expect(html).toContain('data-mermaid-diagram="ready"');
     expect(html).toContain("Rendering diagram");
+  });
+});
+
+
+describe("DocRenderer UML blocks", () => {
+  it("renders the visual UML client surface with a loading fallback", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "umlDiagram",
+          attrs: { data: { nodes: [{ id: "a", kind: "class", label: "Page" }], edges: [] } },
+        },
+      ],
+    });
+    expect(html).toContain('data-uml-diagram="loading"');
+    expect(html).toContain("UML diagram");
+  });
+});
+
+describe("DocRenderer attachments and PDF previews", () => {
+  it("renders a media file node as a download link, not a broken image", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "image",
+          attrs: {
+            src: "/api/files/ws-1/report.docx",
+            alt: "report.docx",
+            mediaType: "file",
+          },
+        },
+      ],
+    });
+    expect(html).not.toMatch(/<img\b/);
+    expect(hrefsOf(html)).toContain("/api/files/ws-1/report.docx");
+    expect(html).toContain("report.docx");
+  });
+
+  it("renders an authenticated PDF preview", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "pdfPreview",
+          attrs: { url: "/api/files/ws-1/report.pdf", title: "Report" },
+        },
+      ],
+    });
+    expect(html).toContain('data-pdf-preview=""');
+    expect(html).toContain('src="/api/files/ws-1/report.pdf"');
+    expect(html).toContain('title="Report"');
+  });
+});
+
+describe("DocRenderer animated media / device previews", () => {
+  const animatedDoc = (attrs: Record<string, unknown>) => ({
+    type: "doc",
+    content: [{ type: "animatedImage", attrs }],
+  });
+
+  it("renders an animated GIF from its original bytes, never a lossy transform", () => {
+    const html = render(
+      animatedDoc({
+        src: "/api/files/ws-1/token.gif?w=320&format=webp&q=40&v=2",
+        alt: "loop",
+        mediaType: "image",
+        animated: true,
+        staticFallback: false,
+      }),
+    );
+    expect(html).toContain('data-animated-image=""');
+    expect(html).toContain('data-animated="true"');
+    expect(srcsOf(html)).toEqual(["/api/files/ws-1/token.gif?v=2"]);
+    expect(html).not.toContain("format=webp");
+    expect(html).not.toContain("w=320");
+  });
+
+  it("keeps a GIF visible even when its stored playback policy is a static fallback", () => {
+    const html = render(
+      animatedDoc({
+        src: "/api/files/ws-1/still.gif",
+        alt: "still",
+        animated: true,
+        staticFallback: true,
+      }),
+    );
+    expect(html).toContain('data-static-fallback="true"');
+    expect(srcsOf(html)).toEqual(["/api/files/ws-1/still.gif"]);
+  });
+
+  it("proxies an external animated GIF and still renders an image", () => {
+    const html = render(
+      animatedDoc({
+        src: "https://images.example.com/loop.gif?format=webp",
+        alt: "loop",
+        animated: true,
+      }),
+    );
+    expect(srcsOf(html)).toEqual([
+      "/api/external-image?url=https%3A%2F%2Fimages.example.com%2Floop.gif",
+    ]);
+    expect(html).toContain('data-animated-image=""');
+  });
+
+  it("wraps an animated media block in a device frame", () => {
+    const html = render(
+      animatedDoc({
+        src: "/api/files/ws-1/loop.gif",
+        alt: "loop",
+        animated: true,
+        device: "phone",
+      }),
+    );
+    expect(html).toContain('data-device-preview="phone"');
+    expect(html).toContain("max-width:390px");
+    expect(srcsOf(html)).toEqual(["/api/files/ws-1/loop.gif"]);
+  });
+
+  it("wraps a provider embed in a device frame without weakening sandbox policy", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "embed",
+          attrs: { url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", device: "phone" },
+        },
+      ],
+    });
+    expect(html).toContain('data-device-preview="phone"');
+    expect(html).toContain('src="https://www.youtube.com/embed/dQw4w9WgXcQ"');
+    expect(html).toContain("sandbox=");
+    expect(html).toContain("allow-scripts");
+  });
+
+  it("unwraps an unknown device id but keeps the provider iframe live", () => {
+    const html = render({
+      type: "doc",
+      content: [
+        {
+          type: "embed",
+          attrs: { url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ", device: "toaster" },
+        },
+      ],
+    });
+    expect(html).not.toContain("data-device-preview");
+    expect(html).toContain('src="https://www.youtube.com/embed/dQw4w9WgXcQ"');
+  });
+});
+
+describe("DocRenderer equations", () => {
+  it("keeps valid LaTeX as escaped source without injecting HTML", () => {
+    const html = render(mathDoc("inlineMath", "x^2 < y"));
+    expect(html).toContain('data-latex="x^2 &lt; y"');
+    expect(html).toContain("x^2 &lt; y");
+    expect(html).not.toContain('data-math-error');
+    expect(html).not.toContain("<script");
+  });
+
+  it("shows a structural error inline for broken LaTeX", () => {
+    const inline = render(mathDoc("inlineMath", "\\frac{1}{"));
+    expect(inline).toContain("data-math-error");
+    expect(inline).toContain('role="alert"');
+    expect(inline).toContain("Unclosed");
+
+    const block = render(mathDoc("blockMath", "\\begin{matrix} a & b"));
+    expect(block).toContain("data-math-error");
+    expect(block).toContain('role="alert"');
+    expect(block).toContain("Unclosed environment");
+  });
+
+  it("rejects banned commands inline instead of rendering them as valid math", () => {
+    const html = render(mathDoc("blockMath", "\\input{secret}"));
+    expect(html).toContain("data-math-error");
+    expect(html).toContain("not allowed");
+    expect(html).toContain("\\input{secret}");
   });
 });

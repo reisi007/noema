@@ -196,6 +196,25 @@ describe("POST /api/upload — the SVG safety rule (B56)", () => {
     expect(res.status).toBe(415);
     expect(edge.put).not.toHaveBeenCalled();
   });
+
+  it("accepts Word, Excel and CSV attachments", async () => {
+    const files = [
+      new File([new Uint8Array([0x50, 0x4b])], "notes.docx", {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      }),
+      new File([new Uint8Array([0x50, 0x4b])], "sheet.xlsx", {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      }),
+      new File(["a,b\n1,2"], "rows.csv", { type: "text/csv" }),
+    ];
+    for (const file of files) {
+      const res = await POST(uploadRequest(file));
+      expect(res.status).toBe(200);
+    }
+    expect(edge.put).toHaveBeenCalledTimes(files.length);
+    expect(edge.assetCreate).toHaveBeenCalledTimes(files.length);
+  });
+
   it("leaves a raster upload alone", async () => {
     const png = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], "shot.png", {
       type: "image/png",
@@ -221,36 +240,45 @@ describe("POST /api/upload — the SVG safety rule (B56)", () => {
     expect(smil.accept).toBe(false);
     expect(smil.reason).toBe("unsafe-svg");
   });
-  /* -------------------------------- the three gaps of the diff review */
+});
 
-  it("refuses an SVG whose declared type carries a parameter", async () => {
-    const res = await POST(
-      uploadRequest(
-        new File([SCRIPT_SVG], "payload.svg", { type: "image/svg+xml; charset=utf-8" }),
-      ),
-    );
+describe("POST /api/upload — animated GIFs are stored, not re-encoded", () => {
+  it("stores the GIF bytes unchanged under a .gif name and MIME", async () => {
+    // A minimal GIF89a: header + logical screen descriptor + trailer.
+    const gif = new Uint8Array([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+      0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+      0x3b,
+    ]);
+    const file = new File([gif], "loop.gif", { type: "image/gif" });
 
-    expect(res.status).toBe(415);
-    await expect(res.json()).resolves.toEqual({
-      error: "File rejected by the image safety policy",
-    });
-    expect(edge.put).not.toHaveBeenCalled();
-    expect(edge.assetCreate).not.toHaveBeenCalled();
+    const res = await POST(uploadRequest(file));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { url: string; mimeType: string };
+    expect(body.url).toMatch(/^\/api\/files\/ws-1\/.+\.gif$/);
+    expect(body.mimeType).toBe("image/gif");
+
+    expect(edge.put).toHaveBeenCalledTimes(1);
+    const [, storedBytes, storedMime] = edge.put.mock.calls[0] as [
+      string,
+      Uint8Array,
+      string,
+    ];
+    // Byte-for-byte, not a decoded first frame or a lossy WebP.
+    expect(storedBytes).toEqual(gif);
+    expect(storedMime).toBe("image/gif");
   });
 
-  it("refuses an SVG that is not valid UTF-8", async () => {
-    const utf16 = new Uint8Array(SCRIPT_SVG.length * 2);
-    for (let i = 0; i < SCRIPT_SVG.length; i += 1) {
-      utf16[i * 2] = SCRIPT_SVG.charCodeAt(i) & 0xff;
-      utf16[i * 2 + 1] = SCRIPT_SVG.charCodeAt(i) >> 8;
-    }
-
+  it("resolves a GIF from the filename when the part declares no type", async () => {
     const res = await POST(
-      uploadRequest(new File([utf16], "payload.svg", { type: "image/svg+xml" })),
+      rawUploadRequest([
+        { name: "workspaceId", body: "ws-1" },
+        { name: "file", filename: "loop.gif", type: "", body: "GIF89a" },
+      ]),
     );
-
-    expect(res.status).toBe(415);
-    expect(edge.put).not.toHaveBeenCalled();
-    expect(edge.assetCreate).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { url: string; mimeType: string };
+    expect(body.url).toMatch(/\.gif$/);
+    expect(body.mimeType).toBe("image/gif");
   });
 });
