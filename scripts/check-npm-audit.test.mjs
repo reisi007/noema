@@ -25,13 +25,13 @@
 //
 // The fixtures are a *snapshot*: they are compared against the accepted list
 // they were measured against (`ACCEPTED_AT_THE_MEASUREMENT`), not against the
-// live `ACCEPTED_ADVISORIES`, which is empty since GitHub withdrew
-// GHSA-vfj7-8cjw-p6xm on 2026-10-23. Whether the live list matches the
-// registry is the gate's own job (`npm run check:audit`); a test that ran the
-// registry would only be as stable as the registry.
+// live `ACCEPTED_ADVISORIES`, which records the three pre-existing advisories
+// accepted on 2026-11-18. Whether the live list matches the registry is the
+// gate's own job (`npm run check:audit`); a test that ran the registry would
+// only be as stable as the registry.
 //
 // The second half is also exercised with a fixture entry (`BRACES_ACCEPTED`),
-// because the tree carries no advisory now.
+// so the acceptance path stays tested independently of the live list.
 import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -521,11 +521,16 @@ describe("the accepted advisories", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("are empty — the tree carries no advisory after the nodemailer fix", () => {
-    // The list only shrinks: the nodemailer advisories are fixed in 10.1.4,
-    // and the `braces` advisory is no longer reported at all. A new one has
-    // to be added here with its reason — and that entry is what the fixture
-    // above exercises.
-    expect(ACCEPTED_ADVISORIES).toEqual([]);
+  it("record the three pre-existing advisories accepted on 2026-11-18", () => {
+    // The list may only shrink: these entries are the known, accepted
+    // advisories from the dependency audit of 2026-11-18. When upstream ships
+    // a fix, its entry has to be deleted here in the same change that removes
+    // the advisory. A new one has to be added with its reason — and that path
+    // is what the fixtures above exercise.
+    expect(ACCEPTED_ADVISORIES.map((entry) => entry.id).sort()).toEqual([
+      "GHSA-238p-pmpm-9mq7",
+      "GHSA-fc5q-39xc-vjpf",
+      "GHSA-g3hv-75wg-m249",
+    ]);
   });
 });

@@ -67,14 +67,55 @@
  */
 
 /**
- * Empty on 2026-10-23. The only entry, GHSA-vfj7-8cjw-p6xm (`braces`, high),
- * left the audit because GitHub **withdrew** the advisory that day
- * (2026-10-23T12:53:02Z) — not because the tree changed: `package-lock.json`
- * still resolves `braces` 3.0.3. The gate reports the entry as stale, and the
- * list may only shrink, so the entry is gone rather than kept against an
- * advisory the registry no longer publishes. A new advisory fails the gate
- * and has to be added here with its reason.
+ * Accepted on 2026-11-18. Three pre-existing advisories are present in the
+ * lockfile and cannot be lifted in this ratchet-migration maintenance change:
+ *
+ *   · GHSA-fc5q-39xc-vjpf (`picomatch`, high) — ReDoS through single-branch
+ *     repeated extglobs. `picomatch` is a dev-only transitive dependency of
+ *     `vite`, `vitest`, `tinyglobby`, `fdir` and the `@typescript-eslint` /
+ *     `eslint-config-next` chain; it is never shipped to users. Every released
+ *     `picomatch` version (range `<=4.0.7`) is affected, so there is no patched
+ *     version to upgrade to — npm's only "fix" is a semver-major downgrade of
+ *     `vitest`. Accepted until upstream publishes a patched release.
+ *
+ *   · GHSA-238p-pmpm-9mq7 (`katex`, low) — prototype pollution that can bypass
+ *     trust restrictions. The affected copy is the nested `katex` under
+ *     `mermaid` (the direct `^0.18.10` dependency already resolves outside the
+ *     affected `>=0.11.0 <0.18.2` range). Clearing it needs the semver-major
+ *     bump `mermaid` 11 → 12, which is out of scope here.
+ *
+ *   · GHSA-g3hv-75wg-m249 (`minimatch`, moderate) — denial of service via
+ *     globparts amplification. The affected copy is nested under
+ *     `@typescript-eslint/typescript-estree`, i.e. dev-only ESLint tooling, not
+ *     part of the shipped application. A patched `minimatch` 11.0.1 exists, but
+ *     it is pulled through a range pinned by the `@typescript-eslint` toolchain;
+ *     overriding a third-party pin is left to that chain / dependabot.
+ *
+ * A new advisory still fails the gate; a fixed one makes the entry stale and it
+ * has to be deleted from this list in the same change that removes the advisory.
  *
  * @type {AcceptedAdvisory[]}
  */
-export const ACCEPTED_ADVISORIES = [];
+export const ACCEPTED_ADVISORIES = [
+  {
+    id: "GHSA-238p-pmpm-9mq7",
+    package: "katex",
+    severity: "low",
+    reason:
+      "affected copy is mermaid's nested katex; the direct katex ^0.18.10 dependency already resolves outside the vulnerable range. Fixing it needs the semver-major mermaid 11 -> 12 bump, out of scope in this maintenance change.",
+  },
+  {
+    id: "GHSA-fc5q-39xc-vjpf",
+    package: "picomatch",
+    severity: "high",
+    reason:
+      "no patched version exists — every released picomatch (<=4.0.7) is affected by this ReDoS. It is a dev-only transitive dependency of vite/vitest/tinyglobby/eslint-config-next and never shipped; npm's only 'fix' is a semver-major vitest downgrade. Accepted until upstream patches it.",
+  },
+  {
+    id: "GHSA-g3hv-75wg-m249",
+    package: "minimatch",
+    severity: "moderate",
+    reason:
+      "dev-only transitive dependency of the @typescript-eslint toolchain (nested under typescript-estree), not part of the shipped app. A patched 11.0.1 exists but sits behind a third-party pinned range; lifting it is left to that chain / dependabot rather than this maintenance change.",
+  },
+];
