@@ -24,7 +24,7 @@
 # Pinned by digest so a rebuilt tag cannot silently change the runtime. The
 # digest is the multi-arch index (linux/amd64 + linux/arm64).
 # Renovate/Dependabot can bump this line without changing anything else.
-FROM node:24.21.0-alpine3.24@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1 AS base
+FROM node:24.22.3-alpine3.24@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS base
 ENV NEXT_TELEMETRY_DISABLED=1
 WORKDIR /app
 # libc6-compat is required by Next's native dependencies; OpenSSL is what
