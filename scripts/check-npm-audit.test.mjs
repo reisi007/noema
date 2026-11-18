@@ -521,7 +521,7 @@ describe("the accepted advisories", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
-  it("record the three pre-existing advisories accepted on 2026-11-18", () => {
+  it("record the two pre-existing advisories accepted on 2026-11-18", () => {
     // The list may only shrink: these entries are the known, accepted
     // advisories from the dependency audit of 2026-11-18. When upstream ships
     // a fix, its entry has to be deleted here in the same change that removes
@@ -529,7 +529,6 @@ describe("the accepted advisories", () => {
     // is what the fixtures above exercise.
     expect(ACCEPTED_ADVISORIES.map((entry) => entry.id).sort()).toEqual([
       "GHSA-238p-pmpm-9mq7",
-      "GHSA-fc5q-39xc-vjpf",
       "GHSA-g3hv-75wg-m249",
     ]);
   });

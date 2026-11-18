@@ -67,16 +67,8 @@
  */
 
 /**
- * Accepted on 2026-11-18. Three pre-existing advisories are present in the
+ * Accepted on 2026-11-18. Two pre-existing advisories are present in the
  * lockfile and cannot be lifted in this ratchet-migration maintenance change:
- *
- *   · GHSA-fc5q-39xc-vjpf (`picomatch`, high) — ReDoS through single-branch
- *     repeated extglobs. `picomatch` is a dev-only transitive dependency of
- *     `vite`, `vitest`, `tinyglobby`, `fdir` and the `@typescript-eslint` /
- *     `eslint-config-next` chain; it is never shipped to users. Every released
- *     `picomatch` version (range `<=4.0.7`) is affected, so there is no patched
- *     version to upgrade to — npm's only "fix" is a semver-major downgrade of
- *     `vitest`. Accepted until upstream publishes a patched release.
  *
  *   · GHSA-238p-pmpm-9mq7 (`katex`, low) — prototype pollution that can bypass
  *     trust restrictions. The affected copy is the nested `katex` under
@@ -103,13 +95,6 @@ export const ACCEPTED_ADVISORIES = [
     severity: "low",
     reason:
       "affected copy is mermaid's nested katex; the direct katex ^0.18.10 dependency already resolves outside the vulnerable range. Fixing it needs the semver-major mermaid 11 -> 12 bump, out of scope in this maintenance change.",
-  },
-  {
-    id: "GHSA-fc5q-39xc-vjpf",
-    package: "picomatch",
-    severity: "high",
-    reason:
-      "no patched version exists — every released picomatch (<=4.0.7) is affected by this ReDoS. It is a dev-only transitive dependency of vite/vitest/tinyglobby/eslint-config-next and never shipped; npm's only 'fix' is a semver-major vitest downgrade. Accepted until upstream patches it.",
   },
   {
     id: "GHSA-g3hv-75wg-m249",
